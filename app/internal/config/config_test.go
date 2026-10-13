@@ -62,7 +62,7 @@ func TestLoadDefaults(t *testing.T) {
 	if c.PollTimeout != 30 || c.Workers != 4 {
 		t.Errorf("PollTimeout/Workers = %d/%d", c.PollTimeout, c.Workers)
 	}
-	if c.AITimeout != 30*time.Second {
+	if c.AITimeout != 60*time.Second {
 		t.Errorf("AITimeout = %s", c.AITimeout)
 	}
 	if c.RetryInterval != 10*time.Second || c.RetryMax != 5 || c.RetryQueue != 500 {
@@ -280,6 +280,32 @@ func TestAIModelCompatSingle(t *testing.T) {
 	got := c.AIEffectiveModels()
 	if len(got) != 1 || got[0] != "only-model" {
 		t.Errorf("effective models = %v", got)
+	}
+}
+
+// Regression: a deployment that sets only BOT_AI_BASE_URL / BOT_AI_API_KEY
+// (typical on a PaaS) must still get the full three-model fallback chain.
+// Before the fix, AIEffectiveModels fell through to the single default model
+// id, silently disabling fallback so one upstream timeout killed the
+// judgment outright.
+func TestAIEffectiveModelsDefaultsToFullChain(t *testing.T) {
+	clearBOT(t)
+	t.Setenv("BOT_AI_BASE_URL", "https://gw.example.com/v1")
+	t.Setenv("BOT_AI_API_KEY", "k")
+	c := Load()
+	got := c.AIEffectiveModels()
+	want := strings.Join(DefaultAIModelChain(), ",")
+	if strings.Join(got, ",") != want {
+		t.Fatalf("default chain = %v, want %v (full fallback chain)", got, want)
+	}
+	if len(got) < 2 {
+		t.Fatalf("chain must contain fallbacks, got %v", got)
+	}
+	// The chain must not depend on BOT_AI_MODEL's own default value leaking in.
+	for _, m := range got {
+		if m == "" {
+			t.Fatalf("empty model id in chain %v", got)
+		}
 	}
 }
 

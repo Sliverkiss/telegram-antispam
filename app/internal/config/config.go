@@ -63,6 +63,7 @@ type Config struct {
 	AIKey              string
 	AIModels           []string // model fallback chain (BOT_AI_MODELS)
 	AIModel            string   // single-model compat (BOT_AI_MODEL)
+	AIModelSet         bool     // BOT_AI_MODEL was explicitly set in the env
 	AITimeout          time.Duration
 	AIReasoningEffort  string // "none" default; overrides the thinking-off field
 	AIPromptFile       string // BOT_AI_PROMPT_FILE: override the embedded judge prompt
@@ -139,7 +140,8 @@ func Load() Config {
 		AIKey:              os.Getenv("BOT_AI_API_KEY"),
 		AIModels:           models,
 		AIModel:            envOr("BOT_AI_MODEL", "mimo-v2.6-pro-ultraspeed-studio"),
-		AITimeout:          durationEnv("BOT_AI_TIMEOUT", 30*time.Second),
+		AIModelSet:         os.Getenv("BOT_AI_MODEL") != "",
+		AITimeout:          durationEnv("BOT_AI_TIMEOUT", 60*time.Second),
 		AIReasoningEffort:  envOr("BOT_AI_REASONING_EFFORT", "none"),
 		AIPromptFile:       os.Getenv("BOT_AI_PROMPT_FILE"),
 		RetryInterval:      durationEnv("BOT_AI_RETRY_INTERVAL", 10*time.Second),
@@ -208,16 +210,28 @@ func Load() Config {
 	return c
 }
 
-// AIEffectiveModels returns the model fallback chain: BOT_AI_MODELS if set,
-// otherwise the single BOT_AI_MODEL.
+// DefaultAIModelChain is the canonical primary → fallback chain, matching
+// .env.example and the README. It is the default when neither BOT_AI_MODELS
+// nor BOT_AI_MODEL is set.
+func DefaultAIModelChain() []string {
+	return []string{"mimo-v2.6-pro-ultraspeed-studio", "mimo-v2.6-pro", "mimo-v2.6-flash"}
+}
+
+// AIEffectiveModels returns the model fallback chain: BOT_AI_MODELS when set,
+// else the explicitly-set legacy BOT_AI_MODEL, else DefaultAIModelChain.
+//
+// The last branch matters: a deployment that sets only BOT_AI_API_KEY /
+// BOT_AI_BASE_URL (typical on a PaaS UI) must still get the full chain — a
+// single-model chain silently disables fallback, so one upstream timeout
+// becomes an outright failed judgment.
 func (c Config) AIEffectiveModels() []string {
 	if len(c.AIModels) > 0 {
 		return c.AIModels
 	}
-	if c.AIModel != "" {
+	if c.AIModelSet && c.AIModel != "" {
 		return []string{c.AIModel}
 	}
-	return []string{"mimo-v2.6-pro-ultraspeed-studio"}
+	return DefaultAIModelChain()
 }
 
 // RetentionFor returns the TTL to apply to a record category ("suspect" or

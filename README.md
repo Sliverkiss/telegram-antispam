@@ -154,7 +154,7 @@ go run . -prompteval -prompteval.models=mimo-v2.6-pro
 | | `BOT_AI_API_KEY` | 空 | 判定 key；缺则跳过 AI 并 WARN |
 | | `BOT_AI_MODELS` | 三模型逗号链 | 模型回退链 |
 | | `BOT_AI_MODEL` | `mimo-v2.6-pro-ultraspeed-studio` | 兼容旧单模型，`MODELS` 优先 |
-| | `BOT_AI_TIMEOUT` | `30s` | 单次判定超时 |
+| | `BOT_AI_TIMEOUT` | `60s` | 单次判定超时（网关有 30s+ 长尾，勿调小） |
 | | `BOT_AI_REASONING_EFFORT` | `none` | 关思考（网关校验过；绝不发 `max_tokens`） |
 | | `BOT_AI_PROMPT_FILE` | 空 | 覆盖内嵌提示词（调优不发版） |
 | | `BOT_AI_RETRY_INTERVAL` / `_MAX_ATTEMPTS` / `_QUEUE` | `10s` / `5` / `500` | 固定间隔重试（不退避、不熔断） |

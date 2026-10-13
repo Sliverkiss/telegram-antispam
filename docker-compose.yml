@@ -36,7 +36,7 @@ services:
       - BOT_AI_API_KEY=${BOT_AI_API_KEY:-}
       - BOT_AI_MODELS=${BOT_AI_MODELS:-mimo-v2.6-pro-ultraspeed-studio,mimo-v2.6-pro,mimo-v2.6-flash}
       - BOT_AI_MODEL=${BOT_AI_MODEL:-mimo-v2.6-pro-ultraspeed-studio}
-      - BOT_AI_TIMEOUT=${BOT_AI_TIMEOUT:-30s}
+      - BOT_AI_TIMEOUT=${BOT_AI_TIMEOUT:-60s}
       - BOT_AI_RETRY_INTERVAL=${BOT_AI_RETRY_INTERVAL:-10s}
       - BOT_AI_RETRY_MAX_ATTEMPTS=${BOT_AI_RETRY_MAX_ATTEMPTS:-5}
       - BOT_AI_RETRY_QUEUE=${BOT_AI_RETRY_QUEUE:-500}
