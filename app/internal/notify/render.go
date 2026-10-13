@@ -34,7 +34,7 @@ type PunishDetails struct {
 	// Category as delivered by the verdict layer (already mapped to the
 	// controlled vocabulary; "其他" for local-rule fallback).
 	Category string
-	// Source: "signature" | "ai" | "vote" | "local".
+	// Source: "signature" | "ai" | "vote" | "local" | "upstream_sensitive".
 	Source string
 	// Score is the confidence score 0–100 (ai: round(conf*100); vote:
 	// rounded average; signature: 100; local: the rule score).
@@ -60,7 +60,8 @@ func actionVerb(action string) string {
 }
 
 // sourceSuffix implements the "末行后缀" rules: non-AI sources append their
-// marker; the high-risk category (儿童性内容) always appends.
+// marker; the high-risk category (儿童性内容) always appends. The upstream
+// sensitive interception (amend5 A) is the 5th source after AI/签名/投票/兜底.
 func sourceSuffix(d PunishDetails) string {
 	switch d.Source {
 	case "signature":
@@ -72,6 +73,8 @@ func sourceSuffix(d PunishDetails) string {
 		return " · 投票裁决"
 	case "local":
 		return ""
+	case "upstream_sensitive":
+		return " · 上游敏感拦截"
 	default:
 		return "" // ai: keep the line clean
 	}

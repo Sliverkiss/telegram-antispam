@@ -77,9 +77,8 @@
 |---|---|---|
 | `/start` | 任何聊天 | 中文状态卡：`🟢 在线` + 版本 + 运行时长 + 存储后端 + 该聊天是否在保护范围 |
 | `/help` | 任何聊天 | 命令与行为说明 |
-| `/status` | 仅管理员 | 模型链与逐模型成功/总数、回退、复核（含改判）、删除（含失败）、举报、本地兜底、SimHash 命中、待决队列、观察名单 / 签名库 / 处置 / 轮询 / 存储与 TTL / 提示词版本 |
+| `/status` | 仅管理员 | 模型链与逐模型成功/总数、回退、复核（含改判）、删除（含失败）、本地兜底、SimHash 命中、待决队列、观察名单 / 签名库 / 处置 / 轮询 / 存储与 TTL / 提示词版本 |
 | `/check <文本>` | 仅管理员 | 文本直送 AI 并回显 JSON（`is_ad/category/confidence/reason`）+ 耗时，**不触发处置** |
-| `/report` | 群成员（回复广告消息） | 触发 AI 复审该消息；判广告即处置。每人每日限 `BOT_REPORT_DAILY_LIMIT` 次，同消息自动去重 |
 
 「仅管理员」= `BOT_ADMIN_USERS` 白名单用户或群主/管理员。私聊（DM）命令始终可用。
 
@@ -99,14 +98,12 @@
    （满则淘汰最旧并打 ERROR）。5 次用尽后**本地规则引擎自动兜底**（≥阈值处置，否则继续观察）。
 6. **SimHash 防改字**：签名库同时建 64 位字符 trigram simhash 索引，海明距离 ≤
    `BOT_SIMHASH_DISTANCE`（默认 3）的变体（改一个字、插 emoji、加空格）直接命中，零 AI 调用。
-7. **/report**：群成员回复广告消息 `/report` → AI 复审；防滥用：每人每日
-   `BOT_REPORT_DAILY_LIMIT`（默认 3）+ 同一消息去重。
 
 ## 提示词工程
 
-- 提示词是独立文件 `app/internal/ai/prompts/judge_v1.txt`（+ `judge_v1_bio.txt` 简介
+- 提示词是独立文件 `app/internal/ai/prompts/judge_v2.txt`（+ `judge_v1_bio.txt` 简介
   追加段），go:embed 编译进二进制；`BOT_AI_PROMPT_FILE` 可用磁盘文件覆盖（调优不发版）。
-- 版本号 `PromptVersion=judge_v1` 打进**每次判定日志**与 `/status`、`/statusz`。
+- 版本号 `PromptVersion=judge_v2` 打进**每次判定日志**与 `/status`、`/statusz`。
 - 只写「必杀特征清单」不写反例（防模型学到 false 范式）；输出契约严格 JSON
   （`is_ad`/`category`/`confidence`/`reason`）；解析宽容但契约违例=失败走重试。
 - `category` 使用受控词表（办证｜色情｜儿童性内容｜赌博｜诈骗｜金融｜兼职｜引流｜违禁品｜
@@ -153,7 +150,7 @@ go run . -prompteval -prompteval.models=mimo-v2.6-pro
 | | `BOT_RETENTION_SLIDING` | `true` | 滑动过期 |
 | | `BOT_SWEEP_INTERVAL` | `10m` | janitor 清扫间隔 |
 | | `BOT_MAX_SUSPECTS` / `BOT_MAX_SIGNATURES` | `50000` | 容量护栏 |
-| AI | `BOT_AI_BASE_URL` | `https://mimo.xn--ug8h.eu.org/v1` | OpenAI 兼容网关 |
+| AI | `BOT_AI_BASE_URL` | `https://api.your-gateway.invalid/v1` | **必填**：OpenAI 兼容网关（留空/占位符会走本地兜底） |
 | | `BOT_AI_API_KEY` | 空 | 判定 key；缺则跳过 AI 并 WARN |
 | | `BOT_AI_MODELS` | 三模型逗号链 | 模型回退链 |
 | | `BOT_AI_MODEL` | `mimo-v2.6-pro-ultraspeed-studio` | 兼容旧单模型，`MODELS` 优先 |
@@ -166,7 +163,6 @@ go run . -prompteval -prompteval.models=mimo-v2.6-pro
 | | `BOT_AI_FALLBACK_BASE_URL` / `_API_KEY` / `_MODELS` | 空 | 备用 provider（可选） |
 | | `BOT_SIMHASH_DISTANCE` | `3` | 相似度匹配（防改字绕过） |
 | | `BOT_LOCAL_RULES_ENABLED` / `_THRESHOLD` / `_KEYWORDS` | `true` / `3` / 空 | 本地规则兜底（5 次重试用尽后） |
-| | `BOT_REPORT_DAILY_LIMIT` | `3` | `/report` 每人每日上限（防滥用） |
 | 运行 | `BOT_POLL_TIMEOUT` / `BOT_WORKERS` | `30` / `4` | 轮询与并发 |
 | | `BOT_LOG_LEVEL` / `BOT_LOG_FORMAT` | `info` / `text` | 日志 |
 | | `BOT_ADMIN_TOKEN` | 空 | 非空开放 `/admin/*` |
@@ -182,7 +178,7 @@ go run . -prompteval -prompteval.models=mimo-v2.6-pro
 - `/statusz` → JSON 状态快照：版本、uptime、轮询/处置/删除计数、AI 调用与失败、
   各类记录条数、`store_backend`、`retention*`、`sweep_interval`、`dry_run`、`started_at`，
   以及 amend3 项：`ai_models` / `ai_model_stats`（逐模型 calls/oks）、`ai_fallbacks`、
-  `ai_verify_rounds` / `ai_verify_flipped`、`report_count`、`local_fallback_count`、
+  `ai_verify_rounds` / `ai_verify_flipped`、`local_fallback_count`、
   `simhash_hits`、`pending_queue`、`prompt_version`、`last_sweep` / `next_sweep_in`
   （janitor 跑过才出现）
 - `/admin/signatures` → 需要 `BOT_ADMIN_TOKEN`（`Authorization: Bearer`），
@@ -190,13 +186,44 @@ go run . -prompteval -prompteval.models=mimo-v2.6-pro
 
 ## belmo 部署
 
-1. 导入仓库到 belmo，build pack 选 **Nixpacks**（`app/nixpacks.toml` 已固定：`go build -o app .`）。
-   依赖只有 `github.com/go-telegram/bot`，`go mod download` 走默认即可。
-2. **Base Directory: `app`**（关键——留空则检测不到 Go 项目）。
-3. Build / Start 命令**留空**。
-4. **端口 `3000`**（`BOT_ADDR` 默认 `:3000`）。
-5. 配置环境变量：至少 `BOT_TOKEN`、`BOT_CHATS`、`BOT_ADMIN_USERS`，以及 `BOT_AI_API_KEY`
-   （可选 `BOT_ADMIN_TOKEN`；`BOT_STORE` 默认 `memory` 即可，belmo 文件系统疑似只读、外网 Redis 不通）。
+belmo 用 **Nixpacks** 构建，且部署引擎固定扫描仓库的 **`app/` 子目录**——所以 Go 源码放在
+`app/`，仓库根只留 `Dockerfile` / `docker-compose.yml` / `README.md` 供本地与容器使用。
+
+**平台参数（逐项对应 belmo 表单）：**
+
+| 项 | 值 |
+|---|---|
+| Build Pack | **Nixpacks** |
+| Base Directory | **`app`** ← 关键，留空会检测不到 Go 项目 |
+| Build Command | **留空**（`app/nixpacks.toml` 已固定 `go build -o app .`） |
+| Start Command | **留空**（`app/nixpacks.toml` 已固定 `./app`） |
+| Port | **3000** |
+| Health Check | `/healthz`（就绪探针用 `/readyz`） |
+
+**环境变量（按需填）：**
+
+| 变量 | 必填 | 填什么 |
+|---|---|---|
+| `BOT_TOKEN` | ✅ | BotFather 发的 bot token |
+| `BOT_CHATS` | ✅ | 授权群 id（`-100` 开头），多个逗号分隔；留空等于不保护任何群 |
+| `BOT_AI_BASE_URL` | ✅ | 你的 OpenAI 兼容网关地址，形如 `https://your-gateway.example.com/v1` |
+| `BOT_AI_API_KEY` | ✅ | 上面网关的 key |
+| `BOT_ADMIN_USERS` | 建议 | 你的 Telegram user id，可用 `/status`、`/check` |
+| `BOT_LOG_CHAT` | 可选 | 处置/报错通知的频道 id，`0` = 关闭；启动时会自检可达性与发帖权限 |
+| `BOT_DRY_RUN` | 建议 | 首次部署填 `true`（只判定不处置），观察日志确认无误后改 `false` |
+| `BOT_ACTION` | 可选 | `kick`（默认，封后即解=踢出）/ `ban`（永久） |
+
+其余变量都有合理默认值，完整清单见 `app/.env.example`（64 个变量与代码契约一一对应）。
+
+**部署后自检：**
+
+- `GET /statusz` → 看 `store_backend`、`prompt_version`、`ai_models`、`notify.target_ok`、`dry_run`
+- 群里发一句广告文本（或用管理员的 `/check <文本>`）验证 AI 链路
+- `BOT_DRY_RUN=false` 后，处置会推到 `BOT_LOG_CHAT`（⏱️/💬/👤/✅ 四行模板）
+
+**注意：`BOT_STORE` 保持默认 `memory`** —— belmo 容器文件系统只读、平台 Redis 外网不通，
+内存模式是唯一可用后端。重启会丢观察名单/签名库/统计；**已封禁的号不会因重启恢复**
+（封禁在 Telegram 服务端生效）。
 
 ## 自检 CLI（连通性验收）
 
@@ -268,7 +295,7 @@ cd app && go build ./... && go vet ./... && go test ./... -race -count=1
     ├── prompteval.go       # -prompteval 标注集评估（唯一外呼路径）
     ├── testdata/           # prompt_eval.jsonl（29 条标注样本）
     └── internal/
-        ├── ai/             # go-openai 判定：回退链/投票/多模态/prompts(judge_v1)
+        ├── ai/             # go-openai 判定：回退链/投票/多模态/prompts(judge_v2)
         ├── bot/            # 决策核心：命令/入群/发言/AI/签名命中/处置/白名单
         ├── config/         # 环境变量加载、脱敏、未识别变量告警
         ├── logx/           # 结构化日志（text/json）

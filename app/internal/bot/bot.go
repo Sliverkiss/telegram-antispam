@@ -2,10 +2,9 @@
 // in-group message screening (text + photo multimodal), signature-library
 // direct hits (sha1 exact + simhash near-duplicate), AI chain classification
 // with confidence-triggered concurrent vote verification, the fixed-interval
-// background retry queue, the local rule engine terminal fallback, the
-// /report AI review flow, group whitelisting + auto-leave, the slash commands,
-// and the shared punishment flow (delete only the triggering message →
-// ban/kick → record → notify).
+// background retry queue, the local rule engine terminal fallback, group
+// whitelisting + auto-leave, the slash commands, and the shared punishment
+// flow (delete only the triggering message → ban/kick → record → notify).
 //
 // Hardening contract (amend3 B): every update is dispatched under a recover
 // guard (one panicking message must never kill the process); deleteMessage
@@ -103,8 +102,6 @@ type Bot struct {
 	deleteFails  atomic.Int64
 	aiCalls      atomic.Int64
 	aiFails      atomic.Int64
-	reportCount  atomic.Int64
-	reportDedup  atomic.Int64
 	localRuleCnt atomic.Int64 // local rule terminal decisions
 	simhashHits  atomic.Int64
 }
@@ -147,8 +144,8 @@ func (b *Bot) DeleteStats() (deleted, failed int64) {
 }
 
 // ExtraStats returns the amend3 counters for /status and /statusz.
-func (b *Bot) ExtraStats() (reports, localFallback, simhashHits int64) {
-	return b.reportCount.Load(), b.localRuleCnt.Load(), b.simhashHits.Load()
+func (b *Bot) ExtraStats() (localFallback, simhashHits int64) {
+	return b.localRuleCnt.Load(), b.simhashHits.Load()
 }
 
 // NotifySnapshotRaw is kept (see serverstats.go); the public NotifySnapshot
@@ -429,8 +426,14 @@ func (b *Bot) HandleMessage(ctx context.Context, m telegram.Message) {
 
 	text, imageFileID, fileUniqueID := b.mediaContent(m)
 
-	// Service messages (no text, no caption, no media) — nothing to judge.
-	if strings.TrimSpace(text) == "" && imageFileID == "" {
+	// Judgeability (amend5 D.3): only "judgeable content" counts as the first
+	// message — text (incl. caption) that leaves real content after
+	// normalization, or an image. Pure emoji / sticker / voice / join-leave
+	// system messages carry nothing to judge: no AI call, no watchlist
+	// consumption — the user's first-message opportunity stays intact until
+	// they post something judgeable.
+	norm := normalize.Normalize(text)
+	if norm == "" && imageFileID == "" {
 		return
 	}
 
@@ -439,23 +442,22 @@ func (b *Bot) HandleMessage(ctx context.Context, m telegram.Message) {
 		b.Log.Error("suspect_lookup_error", "uid", uid, "err", err.Error())
 	}
 
-	// Signature check on the text part (exact + simhash).
-	if strings.TrimSpace(text) != "" {
-		norm := normalize.Normalize(text)
-		if norm != "" {
-			if hit := b.searchMessageSignature(ctx, norm); hit {
-				b.Log.Info("signature_hit", "chat", chatID, "uid", uid, "kind", "msg", "near", "simhash")
-				b.punishAndClear(ctx, punishInfo{
-					chatID:    chatID,
-					uid:       uid,
-					username:  m.From.Username,
-					firstName: m.From.FirstName,
-					msgID:     m.MessageID,
-					text:      text,
-					writeSig:  true,
-				}, b.Cfg.Action, "signature", "广告签名命中", notifyDetails{source: "signature", score: 100})
-				return
-			}
+	// Signature check on the text part (exact + simhash) — applies to ALL
+	// users, watchlist or not (the only old-user defense left after watchlist
+	// removal, at zero AI cost).
+	if norm != "" {
+		if hit := b.searchMessageSignature(ctx, norm); hit {
+			b.Log.Info("signature_hit", "chat", chatID, "uid", uid, "kind", "msg", "near", "simhash")
+			b.punishAndClear(ctx, punishInfo{
+				chatID:    chatID,
+				uid:       uid,
+				username:  m.From.Username,
+				firstName: m.From.FirstName,
+				msgID:     m.MessageID,
+				text:      text,
+				writeSig:  true,
+			}, b.Cfg.Action, "signature", "广告签名命中", notifyDetails{source: "signature", score: 100})
+			return
 		}
 	}
 
@@ -482,162 +484,6 @@ func (b *Bot) HandleMessage(ctx context.Context, m telegram.Message) {
 }
 
 // ---------------------------------------------------------------------------
-// /report flow
-// ---------------------------------------------------------------------------
-
-// HandleReport processes a /report command: the reported message goes through
-// the same AI review; judged as ad → delete that message + punishment.
-// Anti-abuse: per-reporter daily limit + same-message dedup.
-func (b *Bot) HandleReport(ctx context.Context, m telegram.Message, args string) {
-	// Identify the reported message: reply target, or "<message_id>", or
-	// admin "<chat_id> <message_id>".
-	var targetChat int64
-	var targetMsg int64
-	var target *telegram.Message
-	if m.ReplyToMessage != nil {
-		target = m.ReplyToMessage
-		targetChat = target.Chat.ID
-		targetMsg = target.MessageID
-	} else {
-		fields := strings.Fields(args)
-		switch len(fields) {
-		case 1:
-			id, err := parseInt64(fields[0])
-			if err != nil {
-				b.replyHelpful(ctx, m, "用法：回复要举报的消息发送 /report，或 /report <message_id>")
-				return
-			}
-			targetChat = m.Chat.ID
-			targetMsg = id
-		case 2:
-			// Private-chat admin form: /report <chat_id> <message_id>.
-			chatID, err1 := parseInt64(fields[0])
-			msgID, err2 := parseInt64(fields[1])
-			if err1 != nil || err2 != nil {
-				b.replyHelpful(ctx, m, "用法：/report <chat_id> <message_id>（管理员私聊）")
-				return
-			}
-			targetChat, targetMsg = chatID, msgID
-		default:
-			b.replyHelpful(ctx, m, "用法：回复要举报的消息发送 /report，或 /report <message_id>")
-			return
-		}
-	}
-
-	// The bot cannot fetch arbitrary messages by id; a /report without a
-	// reply must refuse unless tests inject the target (admin path fetches
-	// nothing today — Bot API has no getMessage).
-	if target == nil {
-		b.replyHelpful(ctx, m, "请直接回复要举报的消息发送 /report（暂不支持仅凭 id 举报）")
-		return
-	}
-	if !b.Cfg.AuthorizedChat(targetChat) && targetChat != m.Chat.ID {
-		b.replyHelpful(ctx, m, "只能举报受保护群内的消息")
-		return
-	}
-
-	// Anti-abuse: same-message dedup first (a spam wave of /report on one
-	// message must not multiply AI calls).
-	mem, ok := b.Store.(*store.Memory)
-	if ok {
-		if !mem.MarkReported(targetChat, targetMsg) {
-			b.reportDedup.Add(1)
-			b.Log.Debug("report_dedup", "chat", targetChat, "message_id", targetMsg)
-			b.replyHelpful(ctx, m, "该消息已在处理中/已处理")
-			return
-		}
-	}
-	// Per-reporter daily limit.
-	day := time.Now().Format("2006-01-02")
-	if ok {
-		limit := b.Cfg.ReportDailyLimit
-		if limit <= 0 {
-			limit = 3 // config default (BOT_REPORT_DAILY_LIMIT) when unset
-		}
-		if n := mem.BumpReportUsage(day, m.From.ID); n > limit {
-			b.Log.Warn("report_limit", "uid", m.From.ID, "count", n, "limit", b.Cfg.ReportDailyLimit)
-			b.replyHelpful(ctx, m, "今日举报次数已达上限")
-			return
-		}
-	}
-	b.reportCount.Add(1)
-	b.AIStats.NoteReport()
-
-	// The reporter's own admin status does not matter; the reported message's
-	// author might be an admin → do not punish admins (consistent with
-	// BOT_IGNORE_ADMINS).
-	if target.From != nil && b.Cfg.IgnoreAdmins && b.isAdmin(ctx, targetChat, target.From.ID) {
-		b.Log.Debug("report_skip_admin", "chat", targetChat, "uid", target.From.ID)
-		b.replyHelpful(ctx, m, "举报的对象是管理员，跳过")
-		return
-	}
-
-	text, imageFileID, fileUniqueID := b.mediaContent(*target)
-	if strings.TrimSpace(text) == "" && imageFileID == "" {
-		b.replyHelpful(ctx, m, "被举报消息没有可判定内容")
-		return
-	}
-
-	// Signature fast-path.
-	if strings.TrimSpace(text) != "" {
-		norm := normalize.Normalize(text)
-		if norm != "" && b.searchMessageSignature(ctx, norm) {
-			b.Log.Info("signature_hit", "chat", targetChat, "message_id", targetMsg, "kind", "report")
-			b.replyHelpful(ctx, m, "已确认：签名命中，正在处置")
-			var username, firstName string
-			if target.From != nil {
-				username, firstName = target.From.Username, target.From.FirstName
-			}
-			b.punishAndClear(ctx, punishInfo{
-				chatID:    targetChat,
-				uid:       targetUID(target.From),
-				username:  username,
-				firstName: firstName,
-				msgID:     targetMsg,
-				text:      text,
-				writeSig:  false,
-			}, b.Cfg.Action, "signature", "举报签名命中", notifyDetails{source: "signature", score: 100})
-			return
-		}
-	}
-
-	var repUsername, repFirstName string
-	if target.From != nil {
-		repUsername, repFirstName = target.From.Username, target.From.FirstName
-	}
-	b.judge(ctx, judgmentInput{
-		key:          reportKey(targetChat, targetMsg),
-		kind:         "report",
-		chatID:       targetChat,
-		messageID:    targetMsg,
-		uid:          targetUID(target.From),
-		username:     repUsername,
-		firstName:    repFirstName,
-		text:         text,
-		imageFileID:  imageFileID,
-		fileUniqueID: fileUniqueID,
-		mode:         "message",
-		punish:       true,
-		writeMsg:     true,
-		replyTo:      m.Chat.ID,
-	})
-}
-
-func parseInt64(s string) (int64, error) {
-	var n int64
-	_, err := fmt.Sscanf(strings.TrimSpace(s), "%d", &n)
-	return n, err
-}
-
-// targetUID returns the reported author's id (0 when unknown).
-func targetUID(u *telegram.User) int64 {
-	if u == nil {
-		return 0
-	}
-	return u.ID
-}
-
-// ---------------------------------------------------------------------------
 // Judgment pipeline: AI chain → (low confidence) vote → retry queue → local rules
 // ---------------------------------------------------------------------------
 
@@ -645,7 +491,7 @@ func targetUID(u *telegram.User) int64 {
 // the retry worker.
 type judgmentInput struct {
 	key       string
-	kind      string // message | join | report
+	kind      string // message | join
 	chatID    int64
 	messageID int64 // the triggering message to delete
 	uid       int64
@@ -659,7 +505,6 @@ type judgmentInput struct {
 	punish       bool   // run the punishment flow on an ad verdict
 	writeMsg     bool   // write the message signature on an ad verdict
 	writeBio     bool   // write the bio signature on an ad verdict
-	replyTo      int64  // report path: chat to send the review result to
 	retries      int    // AI retry rounds already consumed (🔁 line)
 }
 
@@ -669,10 +514,6 @@ func msgKey(chatID, messageID int64) string {
 
 func joinKey(uid int64) string {
 	return fmt.Sprintf("join:%d", uid)
-}
-
-func reportKey(chatID, messageID int64) string {
-	return fmt.Sprintf("report:%d:%d", chatID, messageID)
 }
 
 // judge runs the primary judgment; failures and unresolved votes go to the
@@ -767,13 +608,17 @@ func (b *Bot) finishJudgment(ctx context.Context, in judgmentInput, verdict ai.V
 		"is_ad", verdict.IsAd,
 		"category", verdict.Category,
 		"confidence", verdict.Confidence,
+		"basis", verdictBasis(verdict),
 		"model", model,
 		"prompt_version", ai.PromptVersion)
 
 	if !verdict.IsAd {
-		if in.kind == "report" && in.replyTo != 0 {
-			b.replyChat(ctx, in.replyTo, "未判定为广告（该消息保留）")
-		}
+		// One judgment = one consumption (amend5 D): a completed non-ad verdict
+		// removes the user from the watchlist. Vote-unresolved and retrying
+		// judgments keep observing (the verdict is not final yet). Join-bio
+		// judgments never consume the slot (amend5 D.2: bio is an independent
+		// screen; the first-message opportunity stays intact).
+		b.consumeWatchlist(ctx, in)
 		return
 	}
 
@@ -810,9 +655,9 @@ func (b *Bot) finishJudgment(ctx context.Context, in judgmentInput, verdict ai.V
 		b.commitAd(ctx, in, verdict, elapsed, in.retries)
 	case "not_ad":
 		b.AIStats.NoteVerify(true) // vote overrode the primary verdict
-		if in.kind == "report" && in.replyTo != 0 {
-			b.replyChat(ctx, in.replyTo, "复核后未判定为广告（该消息保留）")
-		}
+		// Vote concluded "not ad": the judgment is final, so the one-shot
+		// watchlist slot is consumed (amend5 D; join/bio excluded per D.2).
+		b.consumeWatchlist(ctx, in)
 	default:
 		// Short of majority / tie / too many abstentions → not released:
 		// re-enqueue for another round after the fixed interval.
@@ -825,9 +670,6 @@ func (b *Bot) finishJudgment(ctx context.Context, in judgmentInput, verdict ai.V
 // → signature write → watchlist removal → record + notify).
 func (b *Bot) commitAd(ctx context.Context, in judgmentInput, verdict ai.Verdict, elapsed time.Duration, retries int) {
 	category := verdict.ControlledCategory()
-	if in.kind == "report" && in.replyTo != 0 {
-		b.replyChat(ctx, in.replyTo, fmt.Sprintf("已判定为广告（%s，置信度 %.2f），正在处置", category, verdict.Confidence))
-	}
 	b.punishAndClear(ctx, punishInfo{
 		chatID:    in.chatID,
 		uid:       in.uid,
@@ -838,7 +680,17 @@ func (b *Bot) commitAd(ctx context.Context, in judgmentInput, verdict ai.Verdict
 		writeSig:  in.writeMsg || in.writeBio,
 		bioKind:   in.kind == "join",
 	}, b.Cfg.Action, category, verdict.Reason,
-		notifyDetails{source: "ai", score: notify.ConfidenceScore(verdict.Confidence), elapsed: elapsed, retries: retries})
+		notifyDetails{source: verdictSource(verdict), score: notify.ConfidenceScore(verdict.Confidence), elapsed: elapsed, retries: retries})
+}
+
+// verdictSource maps an ad verdict to the disposition-notice source: the
+// upstream sensitive interception is its own basis (amend5 A.4, "· 上游敏感
+// 拦截" suffix on the last line); everything else is the ordinary AI path.
+func verdictSource(verdict ai.Verdict) string {
+	if verdict == ai.SensitiveVerdict {
+		return "upstream_sensitive"
+	}
+	return "ai"
 }
 
 // enqueueRetry pushes a judgment into the pending queue (dedup by key).
@@ -846,9 +698,6 @@ func (b *Bot) enqueueRetry(in judgmentInput, reason string) {
 	if b.RetryQ == nil {
 		b.Log.Error("ai_unresolved", "key", in.key, "reason", reason, "summary", "重试队列未接线（测试/自检模式），本次放弃")
 		return
-	}
-	if in.kind == "report" && in.replyTo != 0 {
-		b.replyChat(context.Background(), in.replyTo, "AI 暂不可用，已进入重试队列")
 	}
 	b.RetryQ.Enqueue(retryq.Item{
 		Key:       in.key,
@@ -880,9 +729,8 @@ func (b *Bot) RetryRound(ctx context.Context, it retryq.Item) (bool, string) {
 		text:      it.Text,
 		mode:      it.Mode,
 		punish:    true,
-		writeMsg:  it.Kind == "message" || it.Kind == "report",
+		writeMsg:  it.Kind == "message",
 		writeBio:  it.Kind == "join",
-		replyTo:   0,
 		retries:   it.Attempts,
 	}
 	verdict, model, ok, _ := b.runAI(ctx, in)
@@ -974,16 +822,17 @@ func (b *Bot) localFallback(ctx context.Context, in judgmentInput, lastErr strin
 			notifyDetails{source: "local", score: res.Score, retries: in.retries})
 		return
 	}
-	// Below threshold: no punishment, user stays on the watchlist (observed).
+	// Below threshold: no punishment. The one-shot watchlist semantics (amend5 D)
+	// still consume the opportunity: a first message that reached the local
+	// fallback has completed its judgment, so the user leaves the watchlist
+	// (join/bio judgments excluded per D.2).
 	b.Log.Error("local_fallback_pass",
 		"key", in.key,
 		"score", res.Score,
 		"threshold", res.Threshold,
 		"hits", strings.Join(res.Hits, ","),
 		"last_error", lastErr)
-	if in.kind == "report" && in.replyTo != 0 {
-		b.replyChat(ctx, in.replyTo, "AI 多次不可达且本地规则未达阈值，该消息保留观察")
-	}
+	b.consumeWatchlist(ctx, in)
 }
 
 // ---------------------------------------------------------------------------
@@ -1010,11 +859,6 @@ func parseCommand(text string) (cmd string, args string, ok bool) {
 // HandleCommand routes a slash command.
 func (b *Bot) HandleCommand(ctx context.Context, m telegram.Message, cmd, args string) {
 	uid := m.From.ID
-	// /report is available to every group member (anti-abuse inside).
-	if cmd == "/report" && m.Chat.Type != "private" {
-		b.HandleReport(ctx, m, args)
-		return
-	}
 	// /start and /help are available to everyone, in any chat.
 	switch cmd {
 	case "/start":
@@ -1058,7 +902,7 @@ func (b *Bot) cmdStart(ctx context.Context, m telegram.Message) {
 }
 
 func (b *Bot) cmdHelp(ctx context.Context, m telegram.Message) {
-	text := "/start 查看状态 · /help 帮助 · /report 回复消息举报 · /status 管理状态 · /check <文本> AI 判定测试\n" +
+	text := "/start 查看状态 · /help 帮助 · /status 管理状态 · /check <文本> AI 判定测试\n" +
 		"本机器人只服务白名单群，检测广告号（简介/发言/图片）并删除触发消息、封禁/踢出。"
 	b.reply(ctx, m, text)
 }
@@ -1071,7 +915,7 @@ func (b *Bot) cmdStatus(ctx context.Context, m telegram.Message) {
 	punished, _ := b.Store.Punished(ctxb)
 	poll, _, aiCalls, aiFails := b.Stats()
 	deleted, deleteFails := b.DeleteStats()
-	reports, localFB, simHits := b.ExtraStats()
+	localFB, simHits := b.ExtraStats()
 	sn := b.AIStats.Snapshot()
 	pending := b.PendingQueueLen()
 
@@ -1082,14 +926,14 @@ func (b *Bot) cmdStatus(ctx context.Context, m telegram.Message) {
 	text := fmt.Sprintf("📊 状态\n版本 %s · 运行 %s · 提示词 %s\n后端 %s · TTL %s（滑窗 %v）\n"+
 		"模型链 %s\n模型调用 %s（成功/总）· 回退 %d\n"+
 		"复核 %d 次（改判 %d）· 删除 %d（失败 %d）· 处置 %d\n"+
-		"AI 调用 %d / 失败 %d · 举报 %d · 兜底 %d · SimHash 命中 %d · 待决队列 %d\n"+
+		"AI 调用 %d / 失败 %d · 兜底 %d · SimHash 命中 %d · 待决队列 %d\n"+
 		"观察名单 %d · 签名库 bio %d / msg %d · 轮询 %d\n模式 %s",
 		b.Cfg.Version, b.Uptime().Round(time.Second).String(), ai.PromptVersion,
 		b.Cfg.Store, b.Cfg.Retention.String(), b.Cfg.RetentionSliding,
 		strings.Join(b.Cfg.AIEffectiveModels(), "→"),
 		strings.Join(modelLines, " · "), sn.Fallbacks,
 		sn.VerifyRounds, sn.VerifyFlipped, deleted, deleteFails, punished,
-		aiCalls, aiFails, reports, localFB, simHits, pending,
+		aiCalls, aiFails, localFB, simHits, pending,
 		suspects, bioSigs, msgSigs, poll,
 		map[bool]string{true: "干跑", false: "正常"}[b.Cfg.DryRun])
 	b.reply(ctx, m, text)
@@ -1168,12 +1012,6 @@ func (b *Bot) replyHelpful(ctx context.Context, m telegram.Message, text string)
 	b.reply(ctx, m, text)
 }
 
-func (b *Bot) replyChat(ctx context.Context, chatID int64, text string) {
-	if _, err := b.TG.SendMessage(ctx, chatID, text); err != nil {
-		b.Log.Warn("reply_error", "chat", chatID, "err", err.Error())
-	}
-}
-
 // ---------------------------------------------------------------------------
 // Decision helpers
 // ---------------------------------------------------------------------------
@@ -1204,6 +1042,42 @@ func (b *Bot) endJudge(start time.Time) time.Duration {
 		return 0
 	}
 	return elapsed
+}
+
+// consumeWatchlist consumes the one-shot watchlist slot (amend5 D):
+// "one judgment = one consumption". A message judgment that reached a
+// terminal not-ad/below-threshold outcome removes the user, so later
+// messages no longer hit the AI (the signature library still screens
+// everyone). Join-bio judgments never consume the slot (amend5 D.2: bio is
+// an independent screen; the first-message opportunity stays intact). It is
+// a no-op when the user is not on the watchlist (e.g. the /check command or
+// a second message after removal).
+func (b *Bot) consumeWatchlist(ctx context.Context, in judgmentInput) {
+	if in.kind != "message" {
+		return
+	}
+	b.RemoveSuspectIfJoined(ctx, in.uid)
+}
+
+// RemoveSuspectIfJoined deletes the uid from the watchlist when present.
+func (b *Bot) RemoveSuspectIfJoined(ctx context.Context, uid int64) {
+	if ok, _ := b.Store.IsSuspect(ctx, uid); !ok {
+		return
+	}
+	if err := b.Store.RemoveSuspect(ctx, uid); err != nil {
+		b.Log.Error("remove_suspect_error", "uid", uid, "err", err.Error())
+		return
+	}
+	b.Log.Debug("watchlist_consumed", "uid", uid, "summary", "一次判定=一次消费：观察名额已释放")
+}
+
+// verdictBasis labels the ai_verdict log with the decision source: the
+// upstream sensitive interception is the 5th basis after AI/签名/投票/兜底.
+func verdictBasis(verdict ai.Verdict) string {
+	if verdict == ai.SensitiveVerdict {
+		return "upstream_sensitive"
+	}
+	return "ai"
 }
 
 // searchBioSignature: exact sha1 then simhash near-match (bio library).

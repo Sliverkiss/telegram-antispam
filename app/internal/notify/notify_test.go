@@ -218,11 +218,11 @@ func TestRenderPunishTextExcerpt(t *testing.T) {
 
 func TestRenderErrorTelegramWrite(t *testing.T) {
 	e := ErrorEvent{
-		Kind: "telegram_write", Level: logx.Error, ChatID: -1003888828164,
+		Kind: "telegram_write", Level: logx.Error, ChatID: -1001234567890,
 		MessageID: 12345, Method: "deleteMessage", Detail: "400 message can't be deleted",
 	}
 	got := RenderError(e, FormatOptions{MaxLen: 1024})
-	want := "📵 Telegram 写入失败\ndeleteMessage 400 message can't be deleted\n📍 -1003888828164 · msg 12345"
+	want := "📵 Telegram 写入失败\ndeleteMessage 400 message can't be deleted\n📍 -1001234567890 · msg 12345"
 	if got != want {
 		t.Fatalf("render mismatch\n got: %q\nwant: %q", got, want)
 	}
@@ -230,11 +230,11 @@ func TestRenderErrorTelegramWrite(t *testing.T) {
 
 func TestRenderErrorAIChain(t *testing.T) {
 	ev := ErrorEvent{
-		Kind: "ai_chain", Level: logx.Error, ChatID: -1003888828164, MessageID: 12346,
+		Kind: "ai_chain", Level: logx.Error, ChatID: -1001234567890, MessageID: 12346,
 		Attempts: 5, Method: "🔁 已重试 5 次 · 52s · 转本地兜底", Detail: "pool_parked",
 	}
 	got := RenderError(ev, FormatOptions{MaxLen: 1024})
-	if got != "⚠️ AI 连续 5 次失败 · 🧊 pool_parked\n🔁 已重试 5 次 · 52s · 转本地兜底\n📍 -1003888828164 · msg 12346" {
+	if got != "⚠️ AI 连续 5 次失败 · 🧊 pool_parked\n🔁 已重试 5 次 · 52s · 转本地兜底\n📍 -1001234567890 · msg 12346" {
 		t.Fatalf("ai chain render: %q", got)
 	}
 }

@@ -3,9 +3,13 @@ package bot
 import (
 	"context"
 	"errors"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -547,8 +551,10 @@ func TestMessageNormalNoop(t *testing.T) {
 	if len(tg.bans) != 0 {
 		t.Fatalf("non-ad must not dispose: %v", tg.bans)
 	}
-	if sus, _ := b.Store.IsSuspect(ctx, 7); !sus {
-		t.Fatal("non-ad suspect should stay on watchlist")
+	// amend5 D: one judgment = one consumption — a completed not-ad verdict
+	// removes the user from the watchlist.
+	if sus, _ := b.Store.IsSuspect(ctx, 7); sus {
+		t.Fatal("not-ad verdict must consume the watchlist slot")
 	}
 }
 
@@ -771,8 +777,9 @@ func TestLowConfidenceVoteNotAdReleases(t *testing.T) {
 	if len(tg.bans) != 0 {
 		t.Fatalf("vote not_ad must release: %v", tg.bans)
 	}
-	if sus, _ := b.Store.IsSuspect(ctx, 31); !sus {
-		t.Fatal("released user stays on the watchlist")
+	// amend5 D: the vote concluded — the watchlist slot is consumed.
+	if sus, _ := b.Store.IsSuspect(ctx, 31); sus {
+		t.Fatal("vote not_ad must consume the watchlist slot")
 	}
 }
 
@@ -882,14 +889,15 @@ func TestRetryExhaustedLocalFallbackPassesBelowThreshold(t *testing.T) {
 		item.Attempts = round + 1
 		item.LastErrCode = code
 		if ok && code == "local_fallback" {
-			// Below threshold → keep observing, no punishment.
+			// Below threshold → no punishment, but amend5 D: the judgment is
+			// complete, so the watchlist slot is consumed.
 			if len(tg.bans) != 0 {
 				t.Fatalf("below-threshold text must not punish: %v", tg.bans)
 			}
-			if sus, _ := b.Store.IsSuspect(ctx, 41); !sus {
-				t.Fatal("user must stay on the watchlist")
+			if sus, _ := b.Store.IsSuspect(ctx, 41); sus {
+				t.Fatal("below-threshold fallback must consume the watchlist slot")
 			}
-			_, localFB, _ := b.ExtraStats()
+			localFB, _ := b.ExtraStats()
 			if localFB == 0 {
 				t.Fatal("local fallback count must increment")
 			}
@@ -1004,122 +1012,6 @@ func TestDelete403LoggedNotRetried(t *testing.T) {
 	}
 }
 
-// --- /report flow (A.8) --------------------------------------------------------
-
-func reportUpdate(m telegram.Message) telegram.Update {
-	return telegram.Update{UpdateID: m.MessageID, Message: &m}
-}
-
-func TestReportAdPunishes(t *testing.T) {
-	tg := newFakeTG()
-	fa := &fakeAI{verdict: fakeVerdict(true, "诈骗", 0.95)}
-	b := testBot(t, tg, fa, defaultCfg())
-	ctx := context.Background()
-	// Suspect 60 sent the ad; user 70 reports it via reply.
-	b.Store.AddSuspect(ctx, store.Suspect{UID: 60, ChatID: -700})
-	ad := adMsg(-700, 60, 70, "高回报理财 加V:12345")
-	report := adMsg(-700, 70, 71, "/report")
-	report.ReplyToMessage = &ad
-
-	b.HandleUpdate(ctx, reportUpdate(report))
-
-	if fa.callCount() != 1 {
-		t.Fatalf("report must run exactly one AI review: %d", fa.callCount())
-	}
-	if len(tg.bans) != 1 {
-		t.Fatalf("ad report must punish: %v", tg.bans)
-	}
-	if len(tg.deletes) != 1 || tg.deletes[0] != "70" {
-		t.Fatalf("only the reported message is deleted: %v", tg.deletes)
-	}
-	// The reporter got a disposition reply.
-	if len(tg.sends) == 0 || !strings.Contains(strings.Join(tg.sends, "|"), "已判定为广告") {
-		t.Fatalf("reporter must be notified: %v", tg.sends)
-	}
-}
-
-func TestReportNotAdRepliesAndKeeps(t *testing.T) {
-	tg := newFakeTG()
-	fa := &fakeAI{verdict: fakeVerdict(false, "无", 0.9)}
-	b := testBot(t, tg, fa, defaultCfg())
-	ctx := context.Background()
-	msg := adMsg(-700, 60, 72, "正常聊天内容")
-	report := adMsg(-700, 70, 73, "/report")
-	report.ReplyToMessage = &msg
-
-	b.HandleUpdate(ctx, reportUpdate(report))
-
-	if len(tg.bans) != 0 {
-		t.Fatalf("non-ad report must not punish: %v", tg.bans)
-	}
-	if len(tg.sends) == 0 || !strings.Contains(strings.Join(tg.sends, "|"), "未判定为广告") {
-		t.Fatalf("reporter must be told the message stays: %v", tg.sends)
-	}
-}
-
-func TestReportDedupSameMessage(t *testing.T) {
-	tg := newFakeTG()
-	fa := &fakeAI{verdict: fakeVerdict(false, "无", 0.9)}
-	b := testBot(t, tg, fa, defaultCfg())
-	ctx := context.Background()
-	msg := adMsg(-700, 60, 74, "可疑内容")
-	report := adMsg(-700, 70, 75, "/report")
-	report.ReplyToMessage = &msg
-
-	b.HandleUpdate(ctx, reportUpdate(report))
-	b.HandleUpdate(ctx, reportUpdate(report)) // duplicate /report on the same message
-
-	if fa.callCount() != 1 {
-		t.Fatalf("same-message report must be deduped: AI calls = %d", fa.callCount())
-	}
-	if len(tg.sends) < 2 || !strings.Contains(strings.Join(tg.sends, "|"), "已处理") {
-		t.Fatalf("second report must be told it is deduped: %v", tg.sends)
-	}
-}
-
-func TestReportDailyLimit(t *testing.T) {
-	tg := newFakeTG()
-	fa := &fakeAI{verdict: fakeVerdict(false, "无", 0.9)}
-	cfg := defaultCfg()
-	cfg.ReportDailyLimit = 2
-	b := testBot(t, tg, fa, cfg)
-	ctx := context.Background()
-
-	// Three distinct messages reported by the same user: the third exceeds
-	// the daily limit of 2.
-	for i := int64(1); i <= 3; i++ {
-		msg := adMsg(-700, 60, 80+i, "消息内容")
-		report := adMsg(-700, 70, 90+i, "/report")
-		report.ReplyToMessage = &msg
-		b.HandleUpdate(ctx, reportUpdate(report))
-	}
-	if fa.callCount() != 2 {
-		t.Fatalf("daily limit must cap AI reviews: calls = %d", fa.callCount())
-	}
-	last := tg.sends[len(tg.sends)-1]
-	if !strings.Contains(last, "上限") {
-		t.Fatalf("limit-exceeded reply = %q", last)
-	}
-}
-
-func TestReportAdminTargetSkipped(t *testing.T) {
-	tg := newFakeTG()
-	tg.member[fkey(-700, 60)] = telegram.ChatMember{Status: "administrator"}
-	fa := &fakeAI{}
-	b := testBot(t, tg, fa, defaultCfg())
-	ctx := context.Background()
-	msg := adMsg(-700, 60, 100, "管理员发的")
-	report := adMsg(-700, 70, 101, "/report")
-	report.ReplyToMessage = &msg
-	b.HandleUpdate(ctx, reportUpdate(report))
-	if fa.callCount() != 0 {
-		t.Fatalf("admin target must not be AI-judged: %d", fa.callCount())
-	}
-	if len(tg.bans) != 0 {
-		t.Fatalf("admin target must not be punished: %v", tg.bans)
-	}
-}
-
 // --- Whitelist / auto-leave ----------------------------------------------------
 
 func TestMyChatMemberLeaveForeignChat(t *testing.T) {
@@ -1208,7 +1100,7 @@ func TestCommandSkippedFromAdJudgment(t *testing.T) {
 	b := testBot(t, tg, fa, defaultCfg())
 	ctx := context.Background()
 	b.Store.AddSuspect(ctx, store.Suspect{UID: 5, ChatID: -500})
-	b.HandleUpdate(ctx, reportUpdate(adMsg(-500, 5, 1, "/start")))
+	b.HandleUpdate(ctx, cmdUpdate(adMsg(-500, 5, 1, "/start")))
 	if fa.callCount() != 0 {
 		t.Fatalf("command must not trigger AI: %d", fa.callCount())
 	}
@@ -1217,7 +1109,7 @@ func TestCommandSkippedFromAdJudgment(t *testing.T) {
 func TestStartCommandReplies(t *testing.T) {
 	tg := newFakeTG()
 	b := testBot(t, tg, &fakeAI{}, defaultCfg())
-	b.HandleUpdate(context.Background(), reportUpdate(adMsg(-500, 5, 1, "/start")))
+	b.HandleUpdate(context.Background(), cmdUpdate(adMsg(-500, 5, 1, "/start")))
 	if len(tg.sends) != 1 || !strings.Contains(tg.sends[0], "🟢 在线") {
 		t.Fatalf("start reply = %v", tg.sends)
 	}
@@ -1226,7 +1118,7 @@ func TestStartCommandReplies(t *testing.T) {
 func TestStatusAdminOnly(t *testing.T) {
 	tg := newFakeTG()
 	b := testBot(t, tg, &fakeAI{}, defaultCfg())
-	b.HandleUpdate(context.Background(), reportUpdate(adMsg(-500, 5, 1, "/status")))
+	b.HandleUpdate(context.Background(), cmdUpdate(adMsg(-500, 5, 1, "/status")))
 	if len(tg.sends) != 1 || !strings.Contains(tg.sends[0], "仅管理员") {
 		t.Fatalf("non-admin /status = %v", tg.sends)
 	}
@@ -1237,13 +1129,14 @@ func TestStatusAdminUserAllowedShowsExtendedStats(t *testing.T) {
 	cfg := defaultCfg()
 	cfg.AdminUsers = map[int64]bool{42: true}
 	b := testBot(t, tg, &fakeAI{}, cfg)
-	b.HandleUpdate(context.Background(), reportUpdate(adMsg(-500, 42, 1, "/status")))
+	b.HandleUpdate(context.Background(), cmdUpdate(adMsg(-500, 42, 1, "/status")))
 	if len(tg.sends) != 1 {
 		t.Fatalf("admin user /status = %v", tg.sends)
 	}
-	// Amend3 /status extensions: prompt version, model chain, reports, queue.
+	// Amend3 /status extensions: prompt version, model chain, queue
+	// (/report and its 举报 counter were removed in the amend5 round).
 	s := tg.sends[0]
-	for _, want := range []string{"提示词", "模型链", "举报", "待决队列", ai.PromptVersion} {
+	for _, want := range []string{"提示词", "模型链", "待决队列", ai.PromptVersion} {
 		if !strings.Contains(s, want) {
 			t.Errorf("/status missing %q", want)
 		}
@@ -1256,7 +1149,7 @@ func TestCheckRunsAIOnlyNoDisposal(t *testing.T) {
 	cfg.AdminUsers = map[int64]bool{42: true}
 	fa := &fakeAI{verdict: fakeVerdict(true, "诈骗", 0.9)}
 	b := testBot(t, tg, fa, cfg)
-	b.HandleUpdate(context.Background(), reportUpdate(adMsg(-500, 42, 1, "/check 广告")))
+	b.HandleUpdate(context.Background(), cmdUpdate(adMsg(-500, 42, 1, "/check 广告")))
 	if len(tg.bans) != 0 {
 		t.Fatalf("/check must not dispose: %v", tg.bans)
 	}
@@ -1310,7 +1203,7 @@ func TestPanicInUpdateIsolated(t *testing.T) {
 		Message:  &telegram.Message{MessageID: 1, Chat: telegram.Chat{ID: -500, Type: "supergroup"}, Text: "/start"},
 	})
 	// The process survived and a later update still flows.
-	b.HandleUpdate(context.Background(), reportUpdate(adMsg(-500, 5, 3, "/start")))
+	b.HandleUpdate(context.Background(), cmdUpdate(adMsg(-500, 5, 3, "/start")))
 	if len(tg.sends) == 0 {
 		t.Fatal("bot must keep processing updates after a panic")
 	}
@@ -1318,29 +1211,416 @@ func TestPanicInUpdateIsolated(t *testing.T) {
 
 // --- edited_message re-screening (B) ---------------------------------------------
 
-func TestEditedMessageRescreened(t *testing.T) {
+// TestEditedMessageAfterConsumptionNoAI: amend5 D — the first (not-ad)
+// judgment consumed the one-shot watchlist slot, so the edited ad version no
+// longer reaches the AI and is not punished.
+func TestEditedMessageAfterConsumptionNoAI(t *testing.T) {
 	tg := newFakeTG()
 	fa := &fakeAI{verdict: fakeVerdict(false, "无", 0.9)} // first version: not ad
 	b := testBot(t, tg, fa, defaultCfg())
 	ctx := context.Background()
 	b.Store.AddSuspect(ctx, store.Suspect{UID: 44, ChatID: -800})
 
-	// First version: normal.
+	// First version: normal → judgment completes → slot consumed.
 	b.HandleUpdate(ctx, telegram.Update{UpdateID: 1, Message: ptr(adMsg(-800, 44, 80, "正常"))})
 	if len(tg.bans) != 0 {
 		t.Fatalf("normal first message: %v", tg.bans)
 	}
-	// The user edits it into an ad → the edited_message is re-screened.
+	if sus, _ := b.Store.IsSuspect(ctx, 44); sus {
+		t.Fatal("first not-ad judgment must consume the watchlist slot")
+	}
+	if fa.callCount() != 1 {
+		t.Fatalf("first message must be judged exactly once: %d", fa.callCount())
+	}
+
+	// The user edits it into an ad → no AI call, no punishment (the user is no
+	// longer on the watchlist; only a signature hit could still dispose).
 	fa.mu.Lock()
 	fa.verdict = fakeVerdict(true, "诈骗", 0.95)
 	fa.mu.Unlock()
 	b.HandleUpdate(ctx, telegram.Update{UpdateID: 2, EditedMessage: ptr(adMsg(-800, 44, 80, "高回报理财 加V:999"))})
-	if len(tg.bans) != 1 {
-		t.Fatalf("edited ad must be punished: %v", tg.bans)
+	if fa.callCount() != 1 {
+		t.Fatalf("edited message after slot consumption must not hit AI: %d", fa.callCount())
 	}
-	if fa.callCount() != 2 {
-		t.Fatalf("both versions must be judged: %d", fa.callCount())
+	if len(tg.bans) != 0 {
+		t.Fatalf("edited message after slot consumption must not punish: %v", tg.bans)
+	}
+}
+
+// TestEditedMessageSignatureStillDisposes: after slot consumption, signature
+// matching remains for ALL users — an edit matching a known ad signature is
+// still disposed without any AI call.
+func TestEditedMessageSignatureStillDisposes(t *testing.T) {
+	tg := newFakeTG()
+	fa := &fakeAI{verdict: fakeVerdict(false, "无", 0.9)}
+	b := testBot(t, tg, fa, defaultCfg())
+	ctx := context.Background()
+	b.Store.AddSuspect(ctx, store.Suspect{UID: 45, ChatID: -800})
+
+	// First version: normal → slot consumed.
+	b.HandleUpdate(ctx, telegram.Update{UpdateID: 1, Message: ptr(adMsg(-800, 45, 81, "正常"))})
+	if sus, _ := b.Store.IsSuspect(ctx, 45); sus {
+		t.Fatal("first not-ad judgment must consume the watchlist slot")
+	}
+
+	// Seed a message signature for the ad text; the edited version matches it.
+	const adText = "高回报理财 加V:999"
+	norm := normalize.Normalize(adText)
+	if err := b.Store.AddMessageSignature(ctx, normalize.SignatureOf(norm), norm); err != nil {
+		t.Fatal(err)
+	}
+	b.HandleUpdate(ctx, telegram.Update{UpdateID: 2, EditedMessage: ptr(adMsg(-800, 45, 82, adText))})
+	if fa.callCount() != 1 {
+		t.Fatalf("signature hit must not call AI: %d", fa.callCount())
+	}
+	if len(tg.bans) != 1 {
+		t.Fatalf("signature hit after slot consumption must dispose: %v", tg.bans)
 	}
 }
 
 func ptr[T any](v T) *T { return &v }
+
+// cmdUpdate wraps a command message as an update (named for the command flow,
+// not the removed /report feature).
+func cmdUpdate(m telegram.Message) telegram.Update {
+	return telegram.Update{UpdateID: m.MessageID, Message: &m}
+}
+
+// --- Upstream sensitive disposal chain (amend5 A, bot level) ------------------
+// A httptest gateway returns the 400 sensitive envelope; the bot runs the FULL
+// disposal chain on the synthesized verdict (delete → ban → signature write →
+// notify with the · 上游敏感拦截 suffix), and a repeat of the same text hits the
+// signature library with zero AI calls.
+
+// sensitiveGatewayAI is a bot.AIClassifier backed by a real ai.Client pointed
+// at a httptest server that answers the 400 sensitive envelope. HTTP request
+// counting proves "no next model / no retry" at the transport level.
+type sensitiveGatewayAI struct {
+	client *ai.Client
+	mu     sync.Mutex
+	reqs   int
+}
+
+func (s *sensitiveGatewayAI) Classify(ctx context.Context, content ai.Content, mode string) (ai.ClassifyResult, bool) {
+	s.mu.Lock()
+	s.reqs++
+	s.mu.Unlock()
+	return s.client.ClassifyText(ctx, content.Text, mode)
+}
+
+func (s *sensitiveGatewayAI) requestCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.reqs
+}
+
+func TestUpstreamSensitiveFullDisposalChain(t *testing.T) {
+	var httpReqs int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&httpReqs, 1)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		fmt.Fprintf(w, `{"error":{"message":%s,"code":"content_filter"}}`,
+			`"content filtered by upstream (sensitive words detected)"`)
+	}))
+	defer srv.Close()
+
+	sg := &sensitiveGatewayAI{client: ai.NewClient(ai.ClientConfig{
+		BaseURL: srv.URL, APIKey: "k", Models: []string{"m1", "m2", "m2b"}, Timeout: 2 * time.Second,
+	})}
+	tg := newFakeTG()
+	cfg := defaultCfg()
+	cfg.LogChat = 999
+	b := testBot(t, tg, sg, cfg)
+	rec := wireTestNotifier(t, b, cfg)
+	ctx := context.Background()
+	const text = "跑分 日结 加V接单"
+	b.Store.AddSuspect(ctx, store.Suspect{UID: 60, ChatID: -500})
+
+	b.HandleMessage(ctx, adMsg(-500, 60, 61, text))
+
+	if len(tg.bans) != 1 || tg.bans[0] != "ban" {
+		t.Fatalf("sensitive kill must ban: %v", tg.bans)
+	}
+	if len(tg.deletes) != 1 || tg.deletes[0] != "61" {
+		t.Fatalf("exactly the triggering message must be deleted: %v", tg.deletes)
+	}
+	if got := atomic.LoadInt32(&httpReqs); got != 1 {
+		t.Fatalf("exactly 1 HTTP request (chain terminated, no retry): %d", got)
+	}
+	if sg.requestCount() != 1 {
+		t.Fatalf("exactly 1 classifier call: %d", sg.requestCount())
+	}
+	// Signature written → the same text again is a signature hit (no AI).
+	norm := normalize.Normalize(text)
+	sig := normalize.SignatureOf(norm)
+	if hit, _ := b.Store.HasMessageSignature(ctx, sig); !hit {
+		t.Fatal("sensitive kill must write the message signature")
+	}
+	b.HandleMessage(ctx, adMsg(-500, 61, 62, text))
+	if sg.requestCount() != 1 {
+		t.Fatalf("signature hit must not call AI: %d", sg.requestCount())
+	}
+	if len(tg.bans) != 2 {
+		t.Fatalf("signature hit must dispose: %v", tg.bans)
+	}
+	// Notify: the disposition notice must end its last line with the suffix.
+	waitFor(t, func() bool { return len(rec.texts()) >= 1 }, "disposition notification")
+	if n := len(rec.texts()); n < 1 {
+		t.Fatalf("notifications = %d", n)
+	}
+	last := rec.texts()[len(rec.texts())-1]
+	if !strings.Contains(last, "上游敏感拦截") {
+		t.Fatalf("notify text must mention 上游敏感拦截: %q", last)
+	}
+	if !strings.Contains(last, "· 上游敏感拦截") {
+		t.Fatalf("notify last line must carry the suffix: %q", last)
+	}
+}
+
+// --- One judgment = one consumption (amend5 D) ---------------------------------
+
+// TestOneShotFirstNotAdRemovesAndSkipsAI: the first not-ad judgment removes
+// the user; their SECOND message triggers no AI call (request-count assertion).
+func TestOneShotFirstNotAdRemovesAndSkipsAI(t *testing.T) {
+	tg := newFakeTG()
+	fa := &fakeAI{verdict: fakeVerdict(false, "无", 0.9)}
+	b := testBot(t, tg, fa, defaultCfg())
+	ctx := context.Background()
+	b.Store.AddSuspect(ctx, store.Suspect{UID: 61, ChatID: -500})
+
+	b.HandleMessage(ctx, adMsg(-500, 61, 62, "今天天气不错"))
+	if sus, _ := b.Store.IsSuspect(ctx, 61); sus {
+		t.Fatal("first not-ad judgment must remove the user from the watchlist")
+	}
+	if fa.callCount() != 1 {
+		t.Fatalf("first message must be judged once: %d", fa.callCount())
+	}
+
+	// Second message: user no longer on the watchlist → no AI call.
+	b.HandleMessage(ctx, adMsg(-500, 61, 63, "又发了一条普通消息"))
+	if fa.callCount() != 1 {
+		t.Fatalf("second message after consumption must not hit AI: %d", fa.callCount())
+	}
+}
+
+// TestOneShotFirstIsAdStillDisposes: regression — an ad first message disposes
+// and removes (the pre-amend5 behavior is unchanged).
+func TestOneShotFirstIsAdStillDisposes(t *testing.T) {
+	tg := newFakeTG()
+	fa := &fakeAI{verdict: fakeVerdict(true, "诈骗", 0.95)}
+	b := testBot(t, tg, fa, defaultCfg())
+	ctx := context.Background()
+	b.Store.AddSuspect(ctx, store.Suspect{UID: 62, ChatID: -500})
+
+	b.HandleMessage(ctx, adMsg(-500, 62, 64, "高回报理财 加V:999"))
+	if len(tg.bans) != 1 {
+		t.Fatalf("ad first message must dispose: %v", tg.bans)
+	}
+	if sus, _ := b.Store.IsSuspect(ctx, 62); sus {
+		t.Fatal("punished ad user must be removed from the watchlist")
+	}
+}
+
+// TestOneShotVoteNotAdRemoves: vote-flip to not_ad also consumes the slot.
+func TestOneShotVoteNotAdRemoves(t *testing.T) {
+	tg := newFakeTG()
+	fa := &fakeAI{verdict: fakeVerdict(true, "赌博", 0.5)} // low confidence → vote
+	verify := func(ctx context.Context, content ai.Content) ai.VerifyResult {
+		return ai.VerifyResult{VotesTotal: 3, VotesNo: 3, Final: "not_ad"}
+	}
+	b := voteBot(t, tg, fa, verify, defaultCfg())
+	ctx := context.Background()
+	b.Store.AddSuspect(ctx, store.Suspect{UID: 63, ChatID: -500})
+
+	b.HandleMessage(ctx, adMsg(-500, 63, 65, "聊聊而已"))
+	if len(tg.bans) != 0 {
+		t.Fatalf("vote not_ad must not punish: %v", tg.bans)
+	}
+	if sus, _ := b.Store.IsSuspect(ctx, 63); sus {
+		t.Fatal("vote not_ad must consume the watchlist slot")
+	}
+
+	// A later message from the same user: no AI (slot consumed).
+	b.HandleMessage(ctx, adMsg(-500, 63, 66, "再来一句"))
+	if fa.callCount() != 1 {
+		t.Fatalf("post-consumption message must not hit AI: %d", fa.callCount())
+	}
+}
+
+// TestOneShotVoteUnresolvedKeepsWatching: an unresolved vote re-enqueues and
+// keeps the user on the watchlist.
+func TestOneShotVoteUnresolvedKeepsWatching(t *testing.T) {
+	tg := newFakeTG()
+	fa := &fakeAI{verdict: fakeVerdict(true, "赌博", 0.5)}
+	verify := func(ctx context.Context, content ai.Content) ai.VerifyResult {
+		return ai.VerifyResult{VotesTotal: 3, VotesAd: 1, VotesNo: 1, Abstentions: 1, Final: "unresolved"}
+	}
+	b := voteBot(t, tg, fa, verify, defaultCfg())
+	ctx := context.Background()
+	b.Store.AddSuspect(ctx, store.Suspect{UID: 64, ChatID: -500})
+
+	b.HandleMessage(ctx, adMsg(-500, 64, 67, "待定内容"))
+	if len(tg.bans) != 0 {
+		t.Fatalf("unresolved vote must not punish: %v", tg.bans)
+	}
+	if sus, _ := b.Store.IsSuspect(ctx, 64); !sus {
+		t.Fatal("unresolved vote must keep the user on the watchlist")
+	}
+}
+
+// TestOneShotEmojiFirstDoesNotConsume: a pure emoji/sticker first message is
+// not judgeable — no AI, no consumption — so a follow-up text IS judged.
+func TestOneShotEmojiFirstDoesNotConsume(t *testing.T) {
+	tg := newFakeTG()
+	fa := &fakeAI{verdict: fakeVerdict(false, "无", 0.9)}
+	b := testBot(t, tg, fa, defaultCfg())
+	ctx := context.Background()
+	b.Store.AddSuspect(ctx, store.Suspect{UID: 65, ChatID: -500})
+
+	// Pure emoji: text is non-blank so it passes the service-message filter,
+	// but the emoji-only rule must keep it un-judged and un-consumed.
+	b.HandleMessage(ctx, adMsg(-500, 65, 68, "😊😊😊"))
+	if fa.callCount() != 0 {
+		t.Fatalf("emoji-only first message must not hit AI: %d", fa.callCount())
+	}
+	if sus, _ := b.Store.IsSuspect(ctx, 65); !sus {
+		t.Fatal("emoji-only message must not consume the watchlist slot")
+	}
+
+	// The next real text message is judged normally (slot still available).
+	b.HandleMessage(ctx, adMsg(-500, 65, 69, "正常发言"))
+	if fa.callCount() != 1 {
+		t.Fatalf("follow-up text must be judged: %d", fa.callCount())
+	}
+}
+
+// TestOneShotJoinBioDoesNotConsume: a join-bio not-ad judgment leaves the
+// first-message opportunity intact (D.2: bio is an independent screen).
+func TestOneShotJoinBioDoesNotConsume(t *testing.T) {
+	tg := newFakeTG()
+	tg.chat[65] = telegram.ChatInfo{ID: 65, Bio: "爱读书爱旅行"}
+	fa := &fakeAI{verdict: fakeVerdict(false, "无", 0.9)}
+	b := testBot(t, tg, fa, defaultCfg())
+	ctx := context.Background()
+	b.HandleNewMembers(ctx, -500, []telegram.User{u(65, false, "reader", "Reader")}, 0)
+	if sus, _ := b.Store.IsSuspect(ctx, 65); !sus {
+		t.Fatal("join-bio not-ad must keep the watchlist entry")
+	}
+	if fa.callCount() != 1 {
+		t.Fatalf("bio must be judged once: %d", fa.callCount())
+	}
+
+	// First message afterwards is still judged (opportunity not consumed).
+	b.HandleMessage(ctx, adMsg(-500, 65, 70, "大家好"))
+	if fa.callCount() != 2 {
+		t.Fatalf("first message after join must still be judged: %d", fa.callCount())
+	}
+	if sus, _ := b.Store.IsSuspect(ctx, 65); sus {
+		t.Fatal("first message not-ad must consume the slot")
+	}
+}
+
+// TestOneShotSignatureStillScreensEveryone: after slot consumption, signature
+// matching remains for ALL users (second ad message = signature hit).
+func TestOneShotSignatureStillScreensEveryone(t *testing.T) {
+	tg := newFakeTG()
+	fa := &fakeAI{verdict: fakeVerdict(false, "无", 0.9)}
+	b := testBot(t, tg, fa, defaultCfg())
+	ctx := context.Background()
+	b.Store.AddSuspect(ctx, store.Suspect{UID: 66, ChatID: -500})
+
+	// First message not-ad → slot consumed.
+	b.HandleMessage(ctx, adMsg(-500, 66, 71, "正常"))
+	if fa.callCount() != 1 {
+		t.Fatalf("first message must be judged once: %d", fa.callCount())
+	}
+
+	// Seed the ad text into the message signature library.
+	const adText = "兼职日结 加V:123"
+	norm := normalize.Normalize(adText)
+	if err := b.Store.AddMessageSignature(ctx, normalize.SignatureOf(norm), norm); err != nil {
+		t.Fatal(err)
+	}
+	b.HandleMessage(ctx, adMsg(-500, 66, 72, adText))
+	if fa.callCount() != 1 {
+		t.Fatalf("signature hit must not call AI (post-consumption): %d", fa.callCount())
+	}
+	if len(tg.bans) != 1 {
+		t.Fatalf("signature hit must still dispose: %v", tg.bans)
+	}
+}
+
+// TestOneShotLocalFallbackBelowThresholdConsumes: a first message whose
+// judgment falls to the local fallback below threshold consumes the slot.
+func TestOneShotLocalFallbackBelowThresholdConsumes(t *testing.T) {
+	tg := newFakeTG()
+	fa := &fakeAI{fail: true}
+	b := testBot(t, tg, fa, defaultCfg())
+	ctx := context.Background()
+	b.Store.AddSuspect(ctx, store.Suspect{UID: 67, ChatID: -500})
+
+	b.HandleMessage(ctx, adMsg(-500, 67, 73, "随便聊聊"))
+	cfg := defaultCfg()
+	// Jump straight to the last round (the queue's exhaustion round).
+	item := retryq.Item{Key: "msg:-500:73", Kind: "message", ChatID: -500, MessageID: 73, UID: 67,
+		Text: "随便聊聊", Mode: "message", EnqueuedAt: time.Now(), Attempts: cfg.RetryMax - 1}
+	ok, code := b.RetryRound(ctx, item)
+	if !ok || code != "local_fallback" {
+		t.Fatalf("last round must run local fallback: ok=%v code=%q", ok, code)
+	}
+	if sus, _ := b.Store.IsSuspect(ctx, 67); sus {
+		t.Fatal("below-threshold local fallback must consume the watchlist slot")
+	}
+
+	// A later message triggers no AI (slot consumed).
+	b.HandleMessage(ctx, adMsg(-500, 67, 74, "再来一句"))
+	if fa.callCount() != 2 {
+		t.Fatalf("post-consumption message must not hit AI: %d", fa.callCount())
+	}
+}
+
+// --- /report removal (amend5 B, E.6) -------------------------------------------
+
+// TestReportCommandIsGone: sending the removed /report command (with a reply,
+// the old entry shape) triggers NO AI call, NO notification, NO stats, and no
+// error reply — the dispatch simply does not exist anymore.
+func TestReportCommandIsGone(t *testing.T) {
+	tg := newFakeTG()
+	fa := &fakeAI{verdict: fakeVerdict(true, "诈骗", 0.95)}
+	cfg := defaultCfg()
+	cfg.LogChat = 999
+	b := testBot(t, tg, fa, cfg)
+	rec := wireTestNotifier(t, b, cfg)
+	ctx := context.Background()
+
+	// Old entry shape: /report as a reply to an ad message, sent by an
+	// admin-listed user (so it cannot bounce off the admin gate reply).
+	m := adMsg(-500, 42, 80, "/report")
+	m.ReplyToMessage = ptr(adMsg(-500, 60, 81, "高回报理财 加V:999"))
+	b.Cfg.AdminUsers = map[int64]bool{42: true}
+	b.HandleUpdate(ctx, cmdUpdate(m))
+
+	if fa.callCount() != 0 {
+		t.Fatalf("/report must not trigger AI: %d", fa.callCount())
+	}
+	if len(tg.bans) != 0 {
+		t.Fatalf("/report must not dispose: %v", tg.bans)
+	}
+	if len(tg.sends) != 0 {
+		t.Fatalf("/report must not send a reply: %v", tg.sends)
+	}
+	// No notification of any kind (punish or error).
+	if texts := rec.texts(); len(texts) != 0 {
+		t.Fatalf("/report must not notify: %v", texts)
+	}
+	// No stats movement: local fallback / simhash counters stay zero.
+	localFB, simHits := b.ExtraStats()
+	if localFB != 0 || simHits != 0 {
+		t.Fatalf("/report must not move stats: local=%d simhash=%d", localFB, simHits)
+	}
+	// The replied-to user stays untracked (no report record was created).
+	if n, _ := b.Store.SuspectCount(ctx); n != 0 {
+		t.Fatalf("/report must not create watchlist entries: %d", n)
+	}
+}

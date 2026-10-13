@@ -16,7 +16,6 @@ type Stats struct {
 	fallbacks     int64            // chain advanced to a later model
 	verifyRounds  int64            // confidence-triggered vote rounds
 	verifyFlipped int64            // vote rounds that overrode the primary verdict
-	reports       int64            // /report AI reviews
 	localFallback int64            // local rule engine final decisions
 }
 
@@ -49,9 +48,6 @@ func (s *Stats) NoteVerify(flipped bool) {
 	s.mu.Unlock()
 }
 
-// NoteReport records one /report AI review.
-func (s *Stats) NoteReport() { s.inc(&s.reports, 1) }
-
 // NoteLocalFallback records one local-rule-engine terminal decision.
 func (s *Stats) NoteLocalFallback() { s.inc(&s.localFallback, 1) }
 
@@ -68,7 +64,6 @@ type StatsSnapshot struct {
 	Fallbacks     int64
 	VerifyRounds  int64
 	VerifyFlipped int64
-	Reports       int64
 	LocalFallback int64
 }
 
@@ -82,7 +77,6 @@ func (s *Stats) Snapshot() StatsSnapshot {
 		Fallbacks:     s.fallbacks,
 		VerifyRounds:  s.verifyRounds,
 		VerifyFlipped: s.verifyFlipped,
-		Reports:       s.reports,
 		LocalFallback: s.localFallback,
 	}
 }

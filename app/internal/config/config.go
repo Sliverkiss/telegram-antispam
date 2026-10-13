@@ -6,7 +6,7 @@
 // The environment-variable contract is the single authority: TASK_antispam_amend1.md
 // §6 (minus the deletions the user requested — no BOT_DELETE_QPS, no tracked
 // message id cap/retention, no observation-message id tracking — and no
-// BOT_REPORT_*, which belong to amend2's report flow and are not in this round).
+// BOT_REPORT_*; the /report flow was removed in the amend5 round).
 // See app/.env.example for the annotated list.
 package config
 
@@ -80,7 +80,6 @@ type Config struct {
 	LocalRulesEnabled  bool
 	LocalRuleThreshold int
 	LocalKeywords      []string // appended keyword list (BOT_LOCAL_KEYWORDS)
-	ReportDailyLimit   int      // BOT_REPORT_DAILY_LIMIT (default 3)
 
 	// Runtime / logging / admin ----------------------------------------------
 	PollTimeout int
@@ -135,7 +134,7 @@ func Load() Config {
 		MaxSuspects:      intEnv("BOT_MAX_SUSPECTS", 50000),
 		MaxSignatures:    intEnv("BOT_MAX_SIGNATURES", 50000),
 
-		AIBaseURL:          envOr("BOT_AI_BASE_URL", "https://mimo.xn--ug8h.eu.org/v1"),
+		AIBaseURL:          envOr("BOT_AI_BASE_URL", "https://api.your-gateway.invalid/v1"),
 		AIKey:              os.Getenv("BOT_AI_API_KEY"),
 		AIModels:           models,
 		AIModel:            envOr("BOT_AI_MODEL", "mimo-v2.6-pro-ultraspeed-studio"),
@@ -157,7 +156,6 @@ func Load() Config {
 		LocalRulesEnabled:  boolEnv("BOT_LOCAL_RULES_ENABLED", true),
 		LocalRuleThreshold: intEnv("BOT_LOCAL_RULE_THRESHOLD", 3),
 		LocalKeywords:      csvList(os.Getenv("BOT_LOCAL_KEYWORDS")),
-		ReportDailyLimit:   intEnv("BOT_REPORT_DAILY_LIMIT", 3),
 
 		PollTimeout: intEnv("BOT_POLL_TIMEOUT", 30),
 		Workers:     intEnv("BOT_WORKERS", 4),
@@ -307,7 +305,6 @@ func (c Config) Redacted() map[string]string {
 		"BOT_LOCAL_RULES_ENABLED":   strconv.FormatBool(c.LocalRulesEnabled),
 		"BOT_LOCAL_RULE_THRESHOLD":  strconv.Itoa(c.LocalRuleThreshold),
 		"BOT_LOCAL_KEYWORDS":        strings.Join(c.LocalKeywords, ","),
-		"BOT_REPORT_DAILY_LIMIT":    strconv.Itoa(c.ReportDailyLimit),
 		"BOT_POLL_TIMEOUT":          strconv.Itoa(c.PollTimeout),
 		"BOT_WORKERS":               strconv.Itoa(c.Workers),
 		"BOT_LOG_LEVEL":             c.LogLevel,
@@ -365,8 +362,8 @@ func UnrecognizedBotVars() []string {
 		"BOT_AI_FALLBACK_BASE_URL": true, "BOT_AI_FALLBACK_API_KEY": true,
 		"BOT_AI_FALLBACK_MODELS": true, "BOT_SIMHASH_DISTANCE": true,
 		"BOT_LOCAL_RULES_ENABLED": true, "BOT_LOCAL_RULE_THRESHOLD": true,
-		"BOT_LOCAL_KEYWORDS": true, "BOT_REPORT_DAILY_LIMIT": true,
-		"BOT_POLL_TIMEOUT": true, "BOT_WORKERS": true,
+		"BOT_LOCAL_KEYWORDS": true,
+		"BOT_POLL_TIMEOUT":   true, "BOT_WORKERS": true,
 		"BOT_LOG_LEVEL": true, "BOT_LOG_FORMAT": true,
 		"BOT_ADMIN_TOKEN": true, "BOT_VERSION": true,
 		// amend4 (notify + admin cache)
@@ -481,7 +478,7 @@ func csvList(s string) []string {
 	return out
 }
 
-// parseIntSet parses a comma-separated list of int64 ids (e.g. "-1003888828164").
+// parseIntSet parses a comma-separated list of int64 ids (e.g. "-1001234567890").
 // Unparseable items are skipped; want all-or-nothing semantics for the warning
 // is not required — the set is simply best-effort.
 func parseIntSet(s string) map[int64]bool {

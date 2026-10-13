@@ -16,7 +16,6 @@ func (b *Bot) AIStatsSnapshot() server.AISnapshot {
 		Fallbacks:     sn.Fallbacks,
 		VerifyRounds:  sn.VerifyRounds,
 		VerifyFlipped: sn.VerifyFlipped,
-		Reports:       sn.Reports,
 		LocalFallback: sn.LocalFallback,
 	}
 }

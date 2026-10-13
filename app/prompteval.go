@@ -3,9 +3,11 @@ package main
 // -prompteval: runs the labeled sample set (testdata/prompt_eval.jsonl)
 // against the real gateway — the ONLY code path allowed to make outbound AI
 // calls, and only when the flag is passed explicitly. It reports per-model
-// accuracy / FN / FP / parse-failure rate / median latency plus a per-sample
-// misjudgment table, so prompt tuning becomes a data loop:
-// edit prompt → bump PromptVersion → rerun → compare FN.
+// accuracy / FN / FP / parse-failure rate / sensitive kills / median latency
+// plus a per-sample misjudgment table, so prompt tuning becomes a data loop:
+// edit prompt → bump PromptVersion → rerun → compare FN. Upstream sensitive
+// interceptions count as kills (SENSITIVE_KILL → TP), never parse failures
+// (amend5 A.6).
 
 import (
 	"bufio"
@@ -37,6 +39,7 @@ type promptEvalRow struct {
 	errCode   string
 	verdict   ai.Verdict
 	latencyMS int64
+	sensitive bool // upstream content filter rejected the text (amend5 A)
 }
 
 func runPromptEval(cfg config.Config, models []string, samplePath string) int {
@@ -75,6 +78,10 @@ func runPromptEval(cfg config.Config, models []string, samplePath string) int {
 			} else {
 				row.verdict = res.Verdict
 				row.gotAd = res.Verdict.IsAd
+				// Sensitive interception is a kill (amend5 A.6): the upstream
+				// content filter rejected the text, which counts as a TP-style
+				// kill — not a parse failure.
+				row.sensitive = res.Verdict == ai.SensitiveVerdict
 			}
 			rows = append(rows, row)
 		}
@@ -87,13 +94,22 @@ func runPromptEval(cfg config.Config, models []string, samplePath string) int {
 }
 
 func printPromptEvalModel(model string, rows []promptEvalRow) bool {
-	var tp, tn, fp, fn, parseFail int
+	var tp, tn, fp, fn, parseFail, sensitiveKill int
 	latencies := make([]int64, 0, len(rows))
 	var misjudged []promptEvalRow
 	for _, r := range rows {
 		if !r.ok {
 			parseFail++
 			misjudged = append(misjudged, r)
+			continue
+		}
+		if r.sensitive {
+			// Upstream filter rejected the text (amend5 A.6): a SENSITIVE_KILL
+			// counts as a kill (TP), never as a parse failure. Latency is
+			// included — the round trip did happen.
+			sensitiveKill++
+			tp++
+			latencies = append(latencies, r.latencyMS)
 			continue
 		}
 		latencies = append(latencies, r.latencyMS)
@@ -116,8 +132,10 @@ func printPromptEvalModel(model string, rows []promptEvalRow) bool {
 		accuracy = float64(tp+tn) / float64(decided)
 	}
 	fmt.Printf("\n--- model %s (prompt %s) ---\n", model, ai.PromptVersion)
-	fmt.Printf("samples=%d decided=%d parse_failed=%d\n", len(rows), decided, parseFail)
-	fmt.Printf("accuracy=%.2f  TP=%d TN=%d FP=%d FN=%d\n", accuracy, tp, tn, fp, fn)
+	fmt.Printf("samples=%d decided=%d parse_failed=%d sensitive_kill=%d\n",
+		len(rows), decided, parseFail, sensitiveKill)
+	fmt.Printf("accuracy=%.2f  TP=%d(含敏感杀%d) TN=%d FP=%d FN=%d\n",
+		accuracy, tp, sensitiveKill, tn, fp, fn)
 	if len(latencies) > 0 {
 		sort.Slice(latencies, func(i, j int) bool { return latencies[i] < latencies[j] })
 		fmt.Printf("median_latency_ms=%d max_latency_ms=%d\n",
@@ -130,6 +148,8 @@ func printPromptEvalModel(model string, rows []promptEvalRow) bool {
 		outcome := "FP(误伤)"
 		if !r.ok {
 			outcome = "PARSE_FAIL(违反输出契约)"
+		} else if r.sensitive {
+			outcome = "SENSITIVE_KILL(上游敏感拦截)"
 		} else if r.sample.Want {
 			outcome = "FN(漏杀)"
 		}

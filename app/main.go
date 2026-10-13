@@ -99,6 +99,10 @@ func main() {
 	if cfg.AIKey == "" {
 		log.Warn("ai_key_missing", "summary", "BOT_AI_API_KEY 未配置：将跳过 AI 判定，绝不误封")
 	}
+	if cfg.AIBaseURL == "" || strings.Contains(cfg.AIBaseURL, ".invalid") {
+		log.Warn("ai_base_url_missing",
+			"summary", "BOT_AI_BASE_URL 未配置（仍是占位符）：AI 判定会全部失败并走本地规则兜底，请在环境变量里填入你的 OpenAI 兼容网关")
+	}
 
 	// AI provider chain: primary + optional fallback provider.
 	primary := ai.NewClient(ai.ClientConfig{
@@ -329,14 +333,13 @@ func openStore(cfg config.Config, log *logx.Logger) (store.Store, string, error)
 	}
 }
 
-// registerCommands registers /start /help /status /check /report with Telegram.
+// registerCommands registers /start /help /status /check with Telegram.
 func registerCommands(tg *telegram.Client, log *logx.Logger) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	cmds := []telegram.BotCommand{
 		{Command: "start", Description: "查看在线状态与运行信息"},
 		{Command: "help", Description: "命令与行为说明"},
-		{Command: "report", Description: "回复消息举报，AI 审核处置"},
 		{Command: "status", Description: "管理状态（仅管理员）"},
 		{Command: "check", Description: "AI 判定测试（仅管理员）"},
 	}

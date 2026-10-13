@@ -22,7 +22,7 @@ type Inspector interface {
 	DeleteStats() (deleted, failed int64)
 	Uptime() time.Duration
 	// Amend3 additions (all optional-capable via the narrow interface).
-	ExtraStats() (reports, localFallback, simhashHits int64)
+	ExtraStats() (localFallback, simhashHits int64)
 	PendingQueueLen() int
 	AIStatsSnapshot() AISnapshot
 	// Amend4: notification subsystem counters (notify.target_ok etc.).
@@ -50,7 +50,6 @@ type AISnapshot struct {
 	Fallbacks     int64
 	VerifyRounds  int64
 	VerifyFlipped int64
-	Reports       int64
 	LocalFallback int64
 }
 
@@ -149,7 +148,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	punished, _ := s.Store.Punished(ctx)
 	poll, _, aiCalls, aiFails := s.Bot.Stats()
 	deleted, deleteFails := s.Bot.DeleteStats()
-	reports, localFallback, simhashHits := s.Bot.ExtraStats()
+	localFallback, simhashHits := s.Bot.ExtraStats()
 	pending := s.Bot.PendingQueueLen()
 	aiSnap := s.Bot.AIStatsSnapshot()
 
@@ -187,7 +186,6 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		"ai_fallbacks":         aiSnap.Fallbacks,
 		"ai_verify_rounds":     aiSnap.VerifyRounds,
 		"ai_verify_flipped":    aiSnap.VerifyFlipped,
-		"report_count":         reports,
 		"local_fallback_count": localFallback,
 		"simhash_hits":         simhashHits,
 		"pending_queue":        pending,

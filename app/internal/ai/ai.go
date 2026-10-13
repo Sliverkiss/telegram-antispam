@@ -14,6 +14,12 @@
 //     never "not ad".
 //   - category is free Chinese text: no enum validation; out-of-vocabulary
 //     values are kept verbatim (display-side maps to "其他").
+//   - An upstream content-filter rejection (amend5 A) is NOT an error: HTTP 400
+//     with "content filtered by upstream" / "sensitive" in the error envelope
+//     is the filter refusing to judge exactly the content we most want to
+//     kill. classifyOnce converts it into SensitiveVerdict so the model chain
+//     stops immediately, nothing retries, and downstream needs zero
+//     special-casing. Any OTHER 400 keeps the ordinary failure semantics.
 package ai
 
 import (
@@ -36,11 +42,11 @@ import (
 )
 
 // PromptVersion identifies the embedded prompt revision. Bump it whenever
-// prompts/judge_v1.txt changes so misjudgments can be traced to a prompt
+// prompts/judge_v2.txt changes so misjudgments can be traced to a prompt
 // version in the logs and /status.
-const PromptVersion = "judge_v1"
+const PromptVersion = "judge_v2"
 
-//go:embed prompts/judge_v1.txt
+//go:embed prompts/judge_v2.txt
 var promptJudge string
 
 //go:embed prompts/judge_v1_bio.txt
@@ -60,6 +66,16 @@ type Verdict struct {
 	Category   string  `json:"category"`
 	Confidence float64 `json:"confidence"`
 	Reason     string  `json:"reason"`
+}
+
+// SensitiveVerdict is the verdict synthesized when the upstream content filter
+// refuses to judge (amend5 A.3): the filter only trips on the content we most
+// want killed, so the rejection itself is treated as the kill decision.
+var SensitiveVerdict = Verdict{
+	IsAd:       true,
+	Category:   "上游敏感",
+	Confidence: 0.99,
+	Reason:     "upstream content filter rejected the text",
 }
 
 // controlledCategories is the prompt's controlled vocabulary for category.
@@ -197,7 +213,7 @@ func (c *Client) lastBodyErrorCode() string {
 
 // ClientConfig configures one provider.
 type ClientConfig struct {
-	BaseURL string        // e.g. https://mimo.xn--ug8h.eu.org/v1
+	BaseURL string        // e.g. https://your-gateway.example.com/v1
 	APIKey  string        // Bearer token
 	Models  []string      // ordered fallback chain
 	Timeout time.Duration // per-attempt timeout (default 30s)
@@ -282,6 +298,9 @@ func WrapInput(text string) string {
 // Classify walks the model fallback chain once and returns the verdict.
 // ok=false means the whole chain failed (network/5xx/parse contract broken) —
 // callers must enqueue for retry, never treat it as "not ad".
+// An upstream content-filter rejection (amend5 A) returns SensitiveVerdict
+// with ok=true immediately: no model switch (the next model would be filtered
+// the same way), no retry (it is a verdict, not an error).
 func (c *Client) Classify(ctx context.Context, content Content, mode string) (ClassifyResult, bool) {
 	start := time.Now()
 	sys := BuildSystemPrompt(mode)
@@ -297,6 +316,25 @@ func (c *Client) Classify(ctx context.Context, content Content, mode string) (Cl
 		at.MS = time.Since(t0).Milliseconds()
 		at.Status = status
 		res.Attempts = append(res.Attempts, at)
+		if status == "upstream_sensitive" && err == nil {
+			// The filter rejected the text: we already hold the answer, so the
+			// chain terminates at this model (no fallback, no retry).
+			res.Verdict = v
+			res.Model = model
+			if c.cfg.Logger != nil {
+				c.cfg.Logger.Info("ai_judge",
+					"model_used", model,
+					"fallback", res.Fallback,
+					"attempts", formatAttempts(res.Attempts),
+					"is_ad", v.IsAd,
+					"confidence", v.Confidence,
+					"category", v.Category,
+					"basis", "upstream_sensitive",
+					"latency_ms", time.Since(start).Milliseconds(),
+					"prompt_version", PromptVersion)
+			}
+			return res, true
+		}
 		if err == nil {
 			res.Verdict = v
 			res.Model = model
@@ -350,6 +388,24 @@ func (c *Client) ClassifyWithModel(ctx context.Context, model string, content Co
 	res.Model = model
 	v, status, err := c.classifyOnce(ctx, model, msgs)
 	res.Attempts = append(res.Attempts, attempt{Model: model, Status: status, MS: time.Since(start).Milliseconds()})
+	if status == "upstream_sensitive" && err == nil {
+		// Same semantics as the chained path: the sensitive rejection is a
+		// verdict, not a failure.
+		res.Verdict = v
+		if c.cfg.Logger != nil {
+			c.cfg.Logger.Info("ai_judge",
+				"model_used", model,
+				"fallback", false,
+				"attempts", formatAttempts(res.Attempts),
+				"is_ad", v.IsAd,
+				"confidence", v.Confidence,
+				"category", v.Category,
+				"basis", "upstream_sensitive",
+				"latency_ms", time.Since(start).Milliseconds(),
+				"prompt_version", PromptVersion)
+		}
+		return res, true
+	}
 	if err == nil {
 		res.Verdict = v
 		if c.cfg.Logger != nil {
@@ -423,6 +479,14 @@ func (c *Client) classifyOnce(ctx context.Context, model string, msgs []openai.C
 
 	resp, err := c.client.CreateChatCompletion(ctxT, req)
 	if err != nil {
+		// Upstream content filter rejection (amend5 A): the filter refuses
+		// exactly the content we most want killed. This single 400 shape is a
+		// VERDICT, not an error — the chain stops here (the next model would be
+		// filtered identically), nothing retries, downstream needs no
+		// special-casing. Every other error keeps the ordinary failure path.
+		if isUpstreamSensitive(err) {
+			return SensitiveVerdict, "upstream_sensitive", nil
+		}
 		code, status := classifyError(err)
 		return Verdict{}, status, &callError{code: code, status: status, err: err}
 	}
@@ -485,6 +549,12 @@ func fallbackEligible(err error) bool {
 func classifyError(err error) (string, string) {
 	var apiErr *openai.APIError
 	if errors.As(err, &apiErr) {
+		// A.2: HTTP 400 + sensitive content-filter markers is classified as
+		// "upstream_sensitive" (classifyOnce turns that into SensitiveVerdict).
+		// Only this one shape is special; every other 400 stays a failure.
+		if apiErr.HTTPStatusCode == 400 && sensitiveAPIError(apiErr) {
+			return "upstream_sensitive", "upstream_sensitive"
+		}
 		switch {
 		case apiErr.HTTPStatusCode == 429:
 			return "http_429", "http_429"
@@ -541,6 +611,30 @@ func isPoolCode(s string) bool {
 		return true
 	}
 	return false
+}
+
+// isUpstreamSensitive reports whether err is the upstream content-filter
+// rejection: HTTP 400 whose error envelope carries "content filtered by
+// upstream" or a code/message containing "sensitive" (case-insensitive).
+// It inspects both the go-openai APIError and RequestError shapes; only the
+// APIError form can carry the parsed envelope, so a body-unparsable 400
+// (RequestError) is never treated as sensitive.
+func isUpstreamSensitive(err error) bool {
+	var apiErr *openai.APIError
+	if errors.As(err, &apiErr) {
+		return apiErr.HTTPStatusCode == 400 && sensitiveAPIError(apiErr)
+	}
+	return false
+}
+
+// sensitiveAPIError matches the filter's markers in the error code and message.
+func sensitiveAPIError(e *openai.APIError) bool {
+	if s, ok := e.Code.(string); ok && strings.Contains(strings.ToLower(s), "sensitive") {
+		return true
+	}
+	msg := strings.ToLower(e.Message)
+	return strings.Contains(msg, "content filtered by upstream") ||
+		strings.Contains(msg, "sensitive")
 }
 
 func itoa(n int) string { return fmt.Sprintf("%d", n) }

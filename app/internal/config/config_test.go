@@ -47,8 +47,8 @@ func TestLoadDefaults(t *testing.T) {
 	if c.MaxSuspects != 50000 || c.MaxSignatures != 50000 {
 		t.Errorf("capacity guards = %d/%d, want 50000/50000", c.MaxSuspects, c.MaxSignatures)
 	}
-	if c.AIBaseURL != "https://mimo.xn--ug8h.eu.org/v1" {
-		t.Errorf("AIBaseURL = %q", c.AIBaseURL)
+	if c.AIBaseURL != "https://api.your-gateway.invalid/v1" {
+		t.Errorf("default AI base URL = %q", c.AIBaseURL)
 	}
 	if c.MinConfidence != 0.85 {
 		t.Errorf("MinConfidence = %f", c.MinConfidence)
@@ -74,8 +74,11 @@ func TestLoadDefaults(t *testing.T) {
 	if c.AIReasoningEffort != "none" {
 		t.Errorf("AIReasoningEffort = %q, want none", c.AIReasoningEffort)
 	}
-	if c.ReportDailyLimit != 3 {
-		t.Errorf("ReportDailyLimit = %d, want 3", c.ReportDailyLimit)
+	// amend5 B: BOT_REPORT_DAILY_LIMIT is gone from the contract entirely —
+	// a leftover variable must surface as unrecognized.
+	t.Setenv("BOT_REPORT_DAILY_LIMIT", "3")
+	if got := UnrecognizedBotVars(); len(got) != 1 || got[0] != "BOT_REPORT_DAILY_LIMIT" {
+		t.Errorf("BOT_REPORT_DAILY_LIMIT must be unrecognized after removal: %v", got)
 	}
 	if c.SimhashDistance != 3 {
 		t.Errorf("SimhashDistance = %d", c.SimhashDistance)
@@ -187,14 +190,14 @@ func TestLoadEnv(t *testing.T) {
 
 func TestChatsNegativeIDsAndList(t *testing.T) {
 	clearBOT(t)
-	t.Setenv("BOT_CHATS", "-1003888828164,-100200300,")
-	t.Setenv("BOT_ADMIN_USERS", "5232284790,100")
+	t.Setenv("BOT_CHATS", "-1001234567890,-100200300,")
+	t.Setenv("BOT_ADMIN_USERS", "123456789,100")
 	c := Load()
 	if !c.ChatsSet {
 		t.Error("ChatsSet should be true")
 	}
-	if !c.Chats[-1003888828164] {
-		t.Error("-1003888828164 should be in the whitelist")
+	if !c.Chats[-1001234567890] {
+		t.Error("-1001234567890 should be in the whitelist")
 	}
 	if c.Chats[-100200300] != true {
 		t.Error("-100200300 should be in the whitelist")
@@ -202,10 +205,10 @@ func TestChatsNegativeIDsAndList(t *testing.T) {
 	if len(c.Chats) != 2 {
 		t.Errorf("Chats = %v", c.Chats)
 	}
-	if !c.AdminUsers[5232284790] {
+	if !c.AdminUsers[123456789] {
 		t.Error("admin user should be parsed")
 	}
-	if c.AuthorizedChat(-1003888828164) != true {
+	if c.AuthorizedChat(-1001234567890) != true {
 		t.Error("AuthorizedChat should agree with whitelist")
 	}
 	if c.AuthorizedChat(-999999) != false {
@@ -219,7 +222,7 @@ func TestChatsEmptyMeansNoAuthorization(t *testing.T) {
 	if c.ChatsSet {
 		t.Error("ChatsSet should be false when BOT_CHATS unset")
 	}
-	if c.AuthorizedChat(-1003888828164) {
+	if c.AuthorizedChat(-1001234567890) {
 		t.Error("empty whitelist must authorize nothing")
 	}
 }

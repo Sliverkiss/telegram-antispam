@@ -78,8 +78,7 @@ type Message struct {
 	Photo []PhotoSize
 	// Document is set for file documents (image documents are judged too).
 	Document *Document
-	// ReplyToMessage is set when this message replies to another (used by
-	// /report to identify the reported message).
+	// ReplyToMessage is set when this message replies to another.
 	ReplyToMessage *Message
 	// NewChatMembers lists users that just joined via this service message.
 	NewChatMembers []User

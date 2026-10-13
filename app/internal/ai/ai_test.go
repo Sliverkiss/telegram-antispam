@@ -476,14 +476,13 @@ func TestStatsCounters(t *testing.T) {
 	s.NoteFallback()
 	s.NoteVerify(false)
 	s.NoteVerify(true)
-	s.NoteReport()
 	s.NoteLocalFallback()
 	sn := s.Snapshot()
 	if sn.ModelCalls["a"] != 2 || sn.ModelOKs["a"] != 1 || sn.ModelCalls["b"] != 1 {
 		t.Errorf("model stats = %v/%v", sn.ModelCalls, sn.ModelOKs)
 	}
 	if sn.Fallbacks != 1 || sn.VerifyRounds != 2 || sn.VerifyFlipped != 1 ||
-		sn.Reports != 1 || sn.LocalFallback != 1 {
+		sn.LocalFallback != 1 {
 		t.Errorf("counters = %+v", sn)
 	}
 	if len(sn.SortedModels()) != 2 {
@@ -654,5 +653,153 @@ func TestVerifyFormatRendersLanes(t *testing.T) {
 	out := res.Format()
 	if !strings.Contains(out, "abstain") || !strings.Contains(out, "final=unresolved") {
 		t.Errorf("Format = %q", out)
+	}
+}
+
+// --- Upstream sensitive interception (amend5 A) -------------------------------
+
+// sensitive400 writes the 400 + content-filter envelope the interception rule
+// matches (HTTP 400 AND message contains "content filtered by upstream").
+func sensitive400(w http.ResponseWriter, msg string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusBadRequest)
+	fmt.Fprintf(w, `{"error":{"message":%s,"code":"content_filter"}}`, mustQuote(msg))
+}
+
+// TestUpstreamSensitiveKillsImmediately: a 400 whose message contains
+// "content filtered by upstream" yields SensitiveVerdict, terminates the
+// chain at the FIRST model (no fallback — exactly 1 HTTP request), and
+// returns ok=true so callers treat it as a normal verdict (no retry queue).
+func TestUpstreamSensitiveKillsImmediately(t *testing.T) {
+	fg := &fakeGateway{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		json.NewDecoder(r.Body).Decode(&body)
+		fg.record(fmt.Sprint(body["model"]), body)
+		sensitive400(w, "content filtered by upstream (sensitive words detected)")
+	}))
+	defer srv.Close()
+
+	res, ok := newClient(srv.URL, []string{"a", "b", "c"}, 2*time.Second).
+		ClassifyText(context.Background(), "加V接单", "message")
+	if !ok {
+		t.Fatal("sensitive interception must return ok=true (a verdict, not an error)")
+	}
+	if !res.Verdict.IsAd {
+		t.Fatal("sensitive interception must be a kill (IsAd=true)")
+	}
+	if res.Verdict != SensitiveVerdict {
+		t.Errorf("verdict = %+v, want SensitiveVerdict", res.Verdict)
+	}
+	if fg.totalCalls() != 1 {
+		t.Fatalf("chain must terminate at the first model: %d requests", fg.totalCalls())
+	}
+	if res.Model != "a" {
+		t.Errorf("model = %s, want a (first model)", res.Model)
+	}
+}
+
+// TestUpstreamSensitiveCodeVariant: "sensitive" in the error code (400) is
+// also a hit — case-insensitive.
+func TestUpstreamSensitiveCodeVariant(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write([]byte(`{"error":{"message":"rejected","code":"SENSITIVE_Content"}}`))
+	}))
+	defer srv.Close()
+
+	res, ok := newClient(srv.URL, []string{"a", "b"}, 2*time.Second).
+		ClassifyText(context.Background(), "x", "message")
+	if !ok || res.Verdict != SensitiveVerdict {
+		t.Fatalf("code-variant 400 must be a sensitive kill: ok=%v verdict=%+v", ok, res.Verdict)
+	}
+}
+
+// TestUpstreamSensitiveStopsRetries: the sensitive result must not look like
+// a failure to the retry queue — ClassifyWithModel (the verify-lane shape)
+// also short-circuits.
+func TestUpstreamSensitiveStopsRetries(t *testing.T) {
+	fg := &fakeGateway{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		json.NewDecoder(r.Body).Decode(&body)
+		fg.record(fmt.Sprint(body["model"]), body)
+		sensitive400(w, "this request was content filtered by upstream provider")
+	}))
+	defer srv.Close()
+
+	res, ok := newClient(srv.URL, []string{"only"}, 2*time.Second).
+		ClassifyWithModel(context.Background(), "only", Content{Text: "x"}, "message")
+	if !ok || res.Verdict != SensitiveVerdict {
+		t.Fatalf("single-model sensitive must return the verdict: ok=%v verdict=%+v", ok, res.Verdict)
+	}
+	if fg.totalCalls() != 1 {
+		t.Errorf("exactly one request expected, got %d", fg.totalCalls())
+	}
+}
+
+// TestOther400StillFails: a 400 with a NON-sensitive message (e.g. invalid
+// model) keeps the original failure semantics — not ok, chain walks.
+func TestOther400StillFails(t *testing.T) {
+	fg := &fakeGateway{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		json.NewDecoder(r.Body).Decode(&body)
+		fg.record(fmt.Sprint(body["model"]), body)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write([]byte(`{"error":{"message":"invalid request: model not found","code":"invalid_model"}}`))
+	}))
+	defer srv.Close()
+
+	res, ok := newClient(srv.URL, []string{"a", "b", "c"}, 2*time.Second).
+		ClassifyText(context.Background(), "x", "message")
+	if ok {
+		t.Fatal("non-sensitive 400 must keep failure semantics (ok=false)")
+	}
+	if res.Verdict == SensitiveVerdict {
+		t.Fatal("non-sensitive 400 must not synthesize the sensitive verdict")
+	}
+	if fg.totalCalls() != 1 {
+		t.Errorf("non-sensitive 400 is not fallback-eligible: exactly 1 call expected, got %d", fg.totalCalls())
+	}
+	if res.Attempts[len(res.Attempts)-1].Status != "http_400" {
+		t.Errorf("final attempt status = %q, want http_400", res.Attempts[len(res.Attempts)-1].Status)
+	}
+}
+
+// TestPoolParked429Unchanged: 429 / pool codes keep the retryable failure
+// semantics — regression guard for "ONLY the sensitive 400 shape changes".
+func TestPoolParked429Unchanged(t *testing.T) {
+	fg := &fakeGateway{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		json.NewDecoder(r.Body).Decode(&body)
+		fg.record(fmt.Sprint(body["model"]), body)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(200)
+		w.Write([]byte(`{"error":{"message":"pool is parked","code":"pool_parked"}}`))
+	}))
+	defer srv.Close()
+
+	_, ok := newClient(srv.URL, []string{"a", "b"}, 2*time.Second).
+		ClassifyText(context.Background(), "x", "message")
+	if ok {
+		t.Fatal("pool_parked must keep failure semantics")
+	}
+	if fg.totalCalls() != 2 {
+		t.Errorf("chain walk expected, got %d", fg.totalCalls())
+	}
+}
+
+// TestSensitiveVerdictConstant: the synthesized verdict shape is part of the
+// contract (source label / notify suffix depend on equality).
+func TestSensitiveVerdictConstant(t *testing.T) {
+	if !SensitiveVerdict.IsAd || SensitiveVerdict.Category != "上游敏感" || SensitiveVerdict.Confidence != 0.99 {
+		t.Errorf("SensitiveVerdict = %+v", SensitiveVerdict)
+	}
+	if SensitiveVerdict.Reason == "" {
+		t.Error("reason must be set (feeds notify/logs)")
 	}
 }

@@ -3,7 +3,6 @@ package store
 import (
 	"context"
 	"sort"
-	"strconv"
 	"sync"
 	"time"
 )
@@ -22,11 +21,11 @@ type Memory struct {
 	punished int64
 	closed   bool
 
-	// simhash near-duplicate indexes for the bio/msg signature libraries and
-	// per-day /report usage counters (amend3 round).
+	// simhash near-duplicate indexes for the bio/msg signature libraries
+	// (amend3 round). The per-day /report usage counters were removed with the
+	// /report flow in the amend5 round.
 	bioSim  *SimhashIndex
 	msgSim  *SimhashIndex
-	reports map[string]entry[int] // "day:uid" → count
 	simDist int
 
 	now     func() time.Time
@@ -58,7 +57,6 @@ func NewMemoryWithClock(now func() time.Time) *Memory {
 		bioSigs:  map[string]entry[string]{},
 		msgSigs:  map[string]entry[string]{},
 		tracked:  map[trackKey][]int64{},
-		reports:  map[string]entry[int]{},
 		bioSim:   NewSimhashIndex(3, 50000),
 		msgSim:   NewSimhashIndex(3, 50000),
 		simDist:  3,
@@ -311,12 +309,11 @@ func (m *Memory) Sweep(_ context.Context, so SweepOptions) (SweepResult, error) 
 	msgDropped := sweepSigMap(m.msgSigs, so.SignatureTTL, now)
 	res.DroppedSignatures = bioDropped + msgDropped
 
-	// simhash indexes and report keys share the signature/suspect TTLs.
+	// simhash indexes share the signature TTL.
 	// (SimhashIndex.Sweep takes its own lock — do NOT pre-lock here.)
 	simDropped := m.bioSim.Sweep(so.SignatureTTL, now)
 	simDropped += m.msgSim.Sweep(so.SignatureTTL, now)
 	res.DroppedSignatures += simDropped
-	res.DroppedSuspects += m.sweepReports(so.SuspectTTL, now)
 
 	if so.MaxSignatures > 0 {
 		total := len(m.bioSigs) + len(m.msgSigs)
@@ -502,66 +499,6 @@ func (m *Memory) SearchMessageSignature(_ context.Context, normalized string, ma
 	}
 	return "", false
 }
-
-// ---------------------------------------------------------------------------
-// /report usage counters (per-day per-user + message dedup)
-// ---------------------------------------------------------------------------
-
-// ReportKey identifies one report usage window: day (YYYY-MM-DD) + reporter.
-func ReportKey(day string, reporter int64) string {
-	return day + ":" + strconvInt(reporter)
-}
-
-// ReportKeyForMessage identifies a reported message for dedup.
-func ReportKeyForMessage(chatID, messageID int64) string {
-	return "msg:" + strconvInt(chatID) + ":" + strconvInt(messageID)
-}
-
-// BumpReportUsage increments the per-day counter for a reporter and returns
-// the new count. Keys expire with the suspect TTL sweep.
-func (m *Memory) BumpReportUsage(day string, reporter int64) int {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	k := ReportKey(day, reporter)
-	e, ok := m.reports[k]
-	if !ok {
-		e = entry[int]{val: 0, ts: m.clockLocked()}
-	}
-	e.val++
-	e.ts = m.clockLocked()
-	m.reports[k] = e
-	return e.val
-}
-
-// MarkReported records that (chatID, messageID) was already handled so
-// duplicate reports are deduped; returns true the first time only.
-func (m *Memory) MarkReported(chatID, messageID int64) bool {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	k := ReportKeyForMessage(chatID, messageID)
-	if _, ok := m.reports[k]; ok {
-		return false
-	}
-	m.reports[k] = entry[int]{val: 1, ts: m.clockLocked()}
-	return true
-}
-
-// sweepReports drops expired report keys (shares the suspect TTL).
-func (m *Memory) sweepReports(ttl time.Duration, now time.Time) int64 {
-	if ttl <= 0 {
-		return 0
-	}
-	var dropped int64
-	for k, e := range m.reports {
-		if now.Sub(e.ts) >= ttl {
-			delete(m.reports, k)
-			dropped++
-		}
-	}
-	return dropped
-}
-
-func strconvInt(n int64) string { return strconv.FormatInt(n, 10) }
 
 func cloneMap(in map[string]string) map[string]string {
 	out := make(map[string]string, len(in))

@@ -18,11 +18,11 @@ import (
 	"adbot/internal/logx"
 )
 
-// Item is one pending judgment: a message, a join (bio), or a reported
-// message, with everything the retry round needs.
+// Item is one pending judgment: a message, or a join (bio), with everything
+// the retry round needs.
 type Item struct {
-	Key         string // dedup key ("chat:msg" / "join:uid" / "report:chat:msg")
-	Kind        string // "message" | "join" | "report"
+	Key         string // dedup key ("chat:msg" / "join:uid")
+	Kind        string // "message" | "join"
 	ChatID      int64
 	MessageID   int64 // triggering message to delete (0 for join/bio)
 	UID         int64
