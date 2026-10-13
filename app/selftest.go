@@ -83,6 +83,7 @@ func runSelftest(cfg config.Config) {
 	}
 
 	// 4. Telegram: getMe (single call — safe next to a running poller).
+	var liveTG *telegram.Client
 	if cfg.Token == "" {
 		fmt.Println("[FAIL] telegram: BOT_TOKEN is not set")
 		ok = false
@@ -92,12 +93,35 @@ func runSelftest(cfg config.Config) {
 			fmt.Printf("[FAIL] telegram: init: %v\n", err)
 			ok = false
 		} else {
+			liveTG = tg
 			me, err := tg.GetMe(ctx)
 			if err != nil {
 				fmt.Printf("[FAIL] telegram: getMe: %v\n", err)
 				ok = false
 			} else {
 				fmt.Printf("[PASS] telegram: getMe → @%s (id=%d)\n", me.Username, me.ID)
+			}
+		}
+	}
+
+	// 5. Notification target (amend4 §4): getChat + getChatMember on
+	// BOT_LOG_CHAT when configured; WARN-only (does not flip the exit code —
+	// a misconfigured channel is not a connectivity failure).
+	if cfg.LogChat != 0 {
+		if liveTG == nil {
+			fmt.Printf("[WARN] notify: BOT_LOG_CHAT=%d but no telegram client\n", cfg.LogChat)
+		} else if chat, err := liveTG.GetChat(ctx, cfg.LogChat); err != nil {
+			fmt.Printf("[WARN] notify: getChat(%d) 失败：%v —— 通知目标不可达，notify.target_ok=false\n", cfg.LogChat, err)
+		} else if me, err := liveTG.GetMe(ctx); err != nil {
+			fmt.Printf("[WARN] notify: getMe 失败：%v\n", err)
+		} else if m, err := liveTG.GetChatMember(ctx, cfg.LogChat, me.ID); err != nil {
+			fmt.Printf("[WARN] notify: getChatMember 失败：%v —— notify.target_ok=false\n", err)
+		} else {
+			switch m.Status {
+			case "member", "administrator", "creator":
+				fmt.Printf("[PASS] notify: BOT_LOG_CHAT 可达（id=%d，bot=%s）\n", chat.ID, m.Status)
+			default:
+				fmt.Printf("[WARN] notify: bot 在目标频道的身份是 %q —— 无法发帖，notify.target_ok=false\n", m.Status)
 			}
 		}
 	}

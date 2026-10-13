@@ -86,6 +86,28 @@ func TestLoadDefaults(t *testing.T) {
 	if c.LeaveOtherChats != true || c.LeaveNotice != true {
 		t.Errorf("leave defaults = %v/%v, want true/true", c.LeaveOtherChats, c.LeaveNotice)
 	}
+	// amend4: notify + admin-cache defaults.
+	if c.NotifyOnPunish != true || c.NotifyOnError != true {
+		t.Errorf("notify switches = %v/%v, want on/on", c.NotifyOnPunish, c.NotifyOnError)
+	}
+	if c.NotifyLevel != "error" {
+		t.Errorf("NotifyLevel default = %q, want error", c.NotifyLevel)
+	}
+	if c.NotifyRatePerMin != 20 || c.NotifyQueue != 200 {
+		t.Errorf("notify rate/queue = %d/%d", c.NotifyRatePerMin, c.NotifyQueue)
+	}
+	if c.NotifyDedupeWindow != 5*time.Minute {
+		t.Errorf("NotifyDedupeWindow = %s", c.NotifyDedupeWindow)
+	}
+	if c.NotifyMaxLen != 1024 || c.NotifyTextLen != 120 || !c.NotifyIncludeText {
+		t.Errorf("notify len = %d/%d/%v", c.NotifyMaxLen, c.NotifyTextLen, c.NotifyIncludeText)
+	}
+	if c.NotifyDrain != 5*time.Second {
+		t.Errorf("NotifyDrain = %s", c.NotifyDrain)
+	}
+	if c.AdminCacheTTL != 5*time.Minute || c.AdminCacheMax != 5000 {
+		t.Errorf("admin cache = %s/%d", c.AdminCacheTTL, c.AdminCacheMax)
+	}
 }
 
 func TestLoadEnv(t *testing.T) {
@@ -126,6 +148,40 @@ func TestLoadEnv(t *testing.T) {
 	}
 	if c.CmdAutodeleteSec != 10 {
 		t.Errorf("CmdAutodeleteSec = %d", c.CmdAutodeleteSec)
+	}
+	t.Setenv("BOT_NOTIFY_ON_PUNISH", "false")
+	t.Setenv("BOT_NOTIFY_ON_ERROR", "false")
+	t.Setenv("BOT_NOTIFY_LEVEL", "warn")
+	t.Setenv("BOT_NOTIFY_RATE", "7")
+	t.Setenv("BOT_NOTIFY_QUEUE", "13")
+	t.Setenv("BOT_NOTIFY_DEDUPE_WINDOW", "90s")
+	t.Setenv("BOT_NOTIFY_MAX_LEN", "512")
+	t.Setenv("BOT_NOTIFY_TEXT_LEN", "64")
+	t.Setenv("BOT_NOTIFY_INCLUDE_TEXT", "false")
+	t.Setenv("BOT_NOTIFY_DRAIN", "2s")
+	t.Setenv("BOT_ADMIN_CACHE_TTL", "1m")
+	t.Setenv("BOT_ADMIN_CACHE_MAX", "64")
+	c2 := Load()
+	if c2.NotifyOnPunish || c2.NotifyOnError {
+		t.Errorf("notify switches = %v/%v, want off/off", c2.NotifyOnPunish, c2.NotifyOnError)
+	}
+	if c2.NotifyLevel != "warn" {
+		t.Errorf("NotifyLevel = %q", c2.NotifyLevel)
+	}
+	if c2.NotifyRatePerMin != 7 || c2.NotifyQueue != 13 {
+		t.Errorf("notify rate/queue = %d/%d", c2.NotifyRatePerMin, c2.NotifyQueue)
+	}
+	if c2.NotifyDedupeWindow != 90*time.Second {
+		t.Errorf("NotifyDedupeWindow = %s", c2.NotifyDedupeWindow)
+	}
+	if c2.NotifyMaxLen != 512 || c2.NotifyTextLen != 64 || c2.NotifyIncludeText {
+		t.Errorf("notify len = %d/%d/%v", c2.NotifyMaxLen, c2.NotifyTextLen, c2.NotifyIncludeText)
+	}
+	if c2.NotifyDrain != 2*time.Second {
+		t.Errorf("NotifyDrain = %s", c2.NotifyDrain)
+	}
+	if c2.AdminCacheTTL != time.Minute || c2.AdminCacheMax != 64 {
+		t.Errorf("admin cache = %s/%d", c2.AdminCacheTTL, c2.AdminCacheMax)
 	}
 }
 

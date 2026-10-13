@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"runtime/debug"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -30,6 +31,7 @@ import (
 	"adbot/internal/localrules"
 	"adbot/internal/logx"
 	"adbot/internal/normalize"
+	"adbot/internal/notify"
 	"adbot/internal/retryq"
 	"adbot/internal/store"
 	"adbot/internal/telegram"
@@ -80,6 +82,18 @@ type Bot struct {
 
 	AIStats *ai.Stats
 
+	// Notifier is the amend4 push subsystem; nil (or disabled) → no pushes.
+	// main wires it after New. Every notification goes through it; the old
+	// inline notify() is gone.
+	Notifier *notify.Notifier
+
+	// adminCache caches deterministic getChatMember results (amend4 §4.5);
+	// nil → no caching (direct API call each time).
+	adminCache *adminCache
+
+	// judgeClock is stubbed in tests to control timing-sensitive flows.
+	judgeClock func() time.Time
+
 	startedAt time.Time
 
 	// Stats (atomic for /statusz while the poll loop is running).
@@ -113,6 +127,8 @@ func New(st store.Store, tg TelegramClient, classify AIClassifier, verify Verifi
 		LocalRules: localrules.Engine{Threshold: cfg.LocalRuleThreshold, ExtraKeywords: cfg.LocalKeywords},
 		Images:     store.NewImageCache(5000),
 		AIStats:    ai.NewStats(),
+		adminCache: newAdminCache(cfg.AdminCacheTTL, cfg.AdminCacheMax),
+		judgeClock: time.Now,
 		startedAt:  time.Now(),
 	}
 }
@@ -133,6 +149,17 @@ func (b *Bot) DeleteStats() (deleted, failed int64) {
 // ExtraStats returns the amend3 counters for /status and /statusz.
 func (b *Bot) ExtraStats() (reports, localFallback, simhashHits int64) {
 	return b.reportCount.Load(), b.localRuleCnt.Load(), b.simhashHits.Load()
+}
+
+// NotifySnapshotRaw is kept (see serverstats.go); the public NotifySnapshot
+// name is bound to the server view adapter.
+
+// now returns the judge clock reading (real time unless a test froze it).
+func (b *Bot) now() time.Time {
+	if b.judgeClock == nil {
+		return time.Now()
+	}
+	return b.judgeClock()
 }
 
 // NotePoll bumps the poll counter (called once per getUpdates round).
@@ -248,6 +275,7 @@ func (b *Bot) handleMyChatMember(ctx context.Context, cm *telegram.ChatMemberUpd
 	}
 	if err := b.TG.LeaveChat(ctx, cm.Chat.ID); err != nil {
 		b.Log.Warn("leave_chat_error", "chat", cm.Chat.ID, "err", err.Error())
+		b.notifyTGWriteError(cm.Chat.ID, 0, 0, "leaveChat", apiErrOrNil(err), "")
 	}
 }
 
@@ -306,7 +334,13 @@ func (b *Bot) screenNewMember(ctx context.Context, chatID int64, u telegram.User
 		}
 		if hit := b.searchBioSignature(ctx, norm); hit {
 			b.Log.Info("signature_hit", "chat", chatID, "uid", u.ID, "kind", "bio", "near", "simhash")
-			b.punish(ctx, chatID, u.ID, b.Cfg.Action, "signature", "bio", nil)
+			b.punish(ctx, punishInfo{
+				chatID:    chatID,
+				uid:       u.ID,
+				username:  u.Username,
+				firstName: u.FirstName,
+				text:      bio,
+			}, b.Cfg.Action, "signature", "bio", notifyDetails{source: "signature", score: 100}, nil)
 			if b.Cfg.DeleteJoinMsg && joinMsgID > 0 {
 				b.deleteOne(ctx, chatID, joinMsgID)
 			}
@@ -325,6 +359,8 @@ func (b *Bot) screenNewMember(ctx context.Context, chatID int64, u telegram.User
 		chatID:    chatID,
 		messageID: joinMsgID,
 		uid:       u.ID,
+		username:  u.Username,
+		firstName: u.FirstName,
 		text:      bio,
 		mode:      "bio",
 		punish:    true,
@@ -409,7 +445,15 @@ func (b *Bot) HandleMessage(ctx context.Context, m telegram.Message) {
 		if norm != "" {
 			if hit := b.searchMessageSignature(ctx, norm); hit {
 				b.Log.Info("signature_hit", "chat", chatID, "uid", uid, "kind", "msg", "near", "simhash")
-				b.punishAndClear(ctx, chatID, uid, m.MessageID, b.Cfg.Action, "signature", "广告签名命中", text, true, false)
+				b.punishAndClear(ctx, punishInfo{
+					chatID:    chatID,
+					uid:       uid,
+					username:  m.From.Username,
+					firstName: m.From.FirstName,
+					msgID:     m.MessageID,
+					text:      text,
+					writeSig:  true,
+				}, b.Cfg.Action, "signature", "广告签名命中", notifyDetails{source: "signature", score: 100})
 				return
 			}
 		}
@@ -426,6 +470,8 @@ func (b *Bot) HandleMessage(ctx context.Context, m telegram.Message) {
 		chatID:       chatID,
 		messageID:    m.MessageID,
 		uid:          uid,
+		username:     m.From.Username,
+		firstName:    m.From.FirstName,
 		text:         text,
 		imageFileID:  imageFileID,
 		fileUniqueID: fileUniqueID,
@@ -538,17 +584,35 @@ func (b *Bot) HandleReport(ctx context.Context, m telegram.Message, args string)
 		if norm != "" && b.searchMessageSignature(ctx, norm) {
 			b.Log.Info("signature_hit", "chat", targetChat, "message_id", targetMsg, "kind", "report")
 			b.replyHelpful(ctx, m, "已确认：签名命中，正在处置")
-			b.punishAndClear(ctx, targetChat, targetUID(target.From), targetMsg, b.Cfg.Action, "signature", "举报签名命中", text, false, false)
+			var username, firstName string
+			if target.From != nil {
+				username, firstName = target.From.Username, target.From.FirstName
+			}
+			b.punishAndClear(ctx, punishInfo{
+				chatID:    targetChat,
+				uid:       targetUID(target.From),
+				username:  username,
+				firstName: firstName,
+				msgID:     targetMsg,
+				text:      text,
+				writeSig:  false,
+			}, b.Cfg.Action, "signature", "举报签名命中", notifyDetails{source: "signature", score: 100})
 			return
 		}
 	}
 
+	var repUsername, repFirstName string
+	if target.From != nil {
+		repUsername, repFirstName = target.From.Username, target.From.FirstName
+	}
 	b.judge(ctx, judgmentInput{
 		key:          reportKey(targetChat, targetMsg),
 		kind:         "report",
 		chatID:       targetChat,
 		messageID:    targetMsg,
 		uid:          targetUID(target.From),
+		username:     repUsername,
+		firstName:    repFirstName,
 		text:         text,
 		imageFileID:  imageFileID,
 		fileUniqueID: fileUniqueID,
@@ -580,11 +644,14 @@ func targetUID(u *telegram.User) int64 {
 // judgmentInput is everything one judgment needs, shared by the live path and
 // the retry worker.
 type judgmentInput struct {
-	key          string
-	kind         string // message | join | report
-	chatID       int64
-	messageID    int64 // the triggering message to delete
-	uid          int64
+	key       string
+	kind      string // message | join | report
+	chatID    int64
+	messageID int64 // the triggering message to delete
+	uid       int64
+	// username/firstName feed the 👤 line of the disposition notice.
+	username     string
+	firstName    string
 	text         string
 	imageFileID  string // when set, the image is downloaded and judged multimodally
 	fileUniqueID string
@@ -593,6 +660,7 @@ type judgmentInput struct {
 	writeMsg     bool   // write the message signature on an ad verdict
 	writeBio     bool   // write the bio signature on an ad verdict
 	replyTo      int64  // report path: chat to send the review result to
+	retries      int    // AI retry rounds already consumed (🔁 line)
 }
 
 func msgKey(chatID, messageID int64) string {
@@ -610,13 +678,14 @@ func reportKey(chatID, messageID int64) string {
 // judge runs the primary judgment; failures and unresolved votes go to the
 // retry queue (the poll loop is never blocked).
 func (b *Bot) judge(ctx context.Context, in judgmentInput) {
+	start := b.startJudge()
 	verdict, model, ok, imageURL := b.runAI(ctx, in)
 	if !ok {
 		b.aiFails.Add(1)
 		b.enqueueRetry(in, "chain_failed")
 		return
 	}
-	b.finishJudgment(ctx, in, verdict, model, imageURL)
+	b.finishJudgment(ctx, in, verdict, model, imageURL, b.endJudge(start))
 }
 
 // runAI performs the AI round (with image download + cache) and returns the
@@ -687,8 +756,9 @@ func (b *Bot) imageFor(ctx context.Context, fileID, fileUniqueID string) (du str
 }
 
 // finishJudgment applies the verdict: ad with enough confidence → punish;
-// ad below the threshold → concurrent vote; not ad → done.
-func (b *Bot) finishJudgment(ctx context.Context, in judgmentInput, verdict ai.Verdict, model string, imageURL string) {
+// ad below the threshold → concurrent vote; not ad → done. elapsed is the
+// message→disposal total (⏱️ line of the disposition notice).
+func (b *Bot) finishJudgment(ctx context.Context, in judgmentInput, verdict ai.Verdict, model string, imageURL string, elapsed time.Duration) {
 	b.Log.Info("ai_verdict",
 		"kind", in.kind,
 		"chat", in.chatID,
@@ -715,7 +785,7 @@ func (b *Bot) finishJudgment(ctx context.Context, in judgmentInput, verdict ai.V
 			// "漏杀是严重错误" orientation.
 			b.Log.Warn("verify_unavailable", "uid", in.uid, "confidence", verdict.Confidence)
 		}
-		b.commitAd(ctx, in, verdict)
+		b.commitAd(ctx, in, verdict, elapsed, in.retries)
 		return
 	}
 
@@ -737,7 +807,7 @@ func (b *Bot) finishJudgment(ctx context.Context, in judgmentInput, verdict ai.V
 	switch res.Final {
 	case "ad":
 		b.AIStats.NoteVerify(false)
-		b.commitAd(ctx, in, verdict)
+		b.commitAd(ctx, in, verdict, elapsed, in.retries)
 	case "not_ad":
 		b.AIStats.NoteVerify(true) // vote overrode the primary verdict
 		if in.kind == "report" && in.replyTo != 0 {
@@ -753,12 +823,22 @@ func (b *Bot) finishJudgment(ctx context.Context, in judgmentInput, verdict ai.V
 
 // commitAd punishes the ad verdict (delete the triggering message → ban/kick
 // → signature write → watchlist removal → record + notify).
-func (b *Bot) commitAd(ctx context.Context, in judgmentInput, verdict ai.Verdict) {
+func (b *Bot) commitAd(ctx context.Context, in judgmentInput, verdict ai.Verdict, elapsed time.Duration, retries int) {
 	category := verdict.ControlledCategory()
 	if in.kind == "report" && in.replyTo != 0 {
 		b.replyChat(ctx, in.replyTo, fmt.Sprintf("已判定为广告（%s，置信度 %.2f），正在处置", category, verdict.Confidence))
 	}
-	b.punishAndClear(ctx, in.chatID, in.uid, in.messageID, b.Cfg.Action, category, verdict.Reason, in.text, in.writeMsg || in.writeBio, in.kind == "join")
+	b.punishAndClear(ctx, punishInfo{
+		chatID:    in.chatID,
+		uid:       in.uid,
+		username:  in.username,
+		firstName: in.firstName,
+		msgID:     in.messageID,
+		text:      in.text,
+		writeSig:  in.writeMsg || in.writeBio,
+		bioKind:   in.kind == "join",
+	}, b.Cfg.Action, category, verdict.Reason,
+		notifyDetails{source: "ai", score: notify.ConfidenceScore(verdict.Confidence), elapsed: elapsed, retries: retries})
 }
 
 // enqueueRetry pushes a judgment into the pending queue (dedup by key).
@@ -776,6 +856,8 @@ func (b *Bot) enqueueRetry(in judgmentInput, reason string) {
 		ChatID:    in.chatID,
 		MessageID: in.messageID,
 		UID:       in.uid,
+		Username:  in.username,
+		FirstName: in.firstName,
 		Text:      in.text,
 		Mode:      in.mode,
 		Attempts:  0,
@@ -786,32 +868,82 @@ func (b *Bot) enqueueRetry(in judgmentInput, reason string) {
 // RetryRound is the retryq closure: one full retry round. ok=true means the
 // item reached a terminal state (verdict applied or local fallback decided).
 func (b *Bot) RetryRound(ctx context.Context, it retryq.Item) (bool, string) {
+	start := b.startJudge()
 	in := judgmentInput{
 		key:       it.Key,
 		kind:      it.Kind,
 		chatID:    it.ChatID,
 		messageID: it.MessageID,
 		uid:       it.UID,
+		username:  it.Username,
+		firstName: it.FirstName,
 		text:      it.Text,
 		mode:      it.Mode,
 		punish:    true,
 		writeMsg:  it.Kind == "message" || it.Kind == "report",
 		writeBio:  it.Kind == "join",
 		replyTo:   0,
+		retries:   it.Attempts,
 	}
 	verdict, model, ok, _ := b.runAI(ctx, in)
 	if ok {
-		b.finishJudgment(ctx, in, verdict, model, "")
+		b.finishJudgment(ctx, in, verdict, model, "", b.endJudge(start))
 		return true, ""
 	}
 	// Attempts exhausted (the queue bumps on return) → local rule fallback
 	// decides the terminal state. The queue calls RetryRound once per round;
 	// we detect the last round via it.Attempts == max-1.
 	if it.Attempts >= b.Cfg.RetryMax-1 {
+		b.notifyAIChainFailed(ctx, it, "chain_failed")
 		b.localFallback(ctx, in, it.LastErrCode)
 		return true, "local_fallback"
 	}
 	return false, "chain_failed"
+}
+
+// notifyAIChainFailed pushes the "AI 连续 N 次失败 → 转本地兜底" event.
+func (b *Bot) notifyAIChainFailed(ctx context.Context, it retryq.Item, lastErrCode string) {
+	if b.Notifier == nil {
+		return
+	}
+	elapsed := b.endJudge(b.startJudge())
+	// Approximation note: the retry span is measured from the moment the last
+	// round started; the queue owns the real enqueue→terminal timeline and we
+	// deliberately do not reach into it from here.
+	span := time.Duration(it.Attempts) * b.retryInterval()
+	b.Notifier.Error(notify.ErrorEvent{
+		Kind:      "ai_chain",
+		Level:     logx.Error,
+		Attempts:  it.Attempts,
+		Method:    fmt.Sprintf("🔁 已重试 %d 次 · %s · 转本地兜底", it.Attempts, humanDur(span)),
+		Detail:    lastErrCode,
+		ChatID:    it.ChatID,
+		UID:       it.UID,
+		MessageID: it.MessageID,
+		LastSeen:  lastErrCode,
+	})
+	_ = ctx
+	_ = elapsed
+}
+
+// retryInterval is the fixed retry cadence (guarded against a zero config).
+func (b *Bot) retryInterval() time.Duration {
+	if b.Cfg.RetryInterval <= 0 {
+		return 10 * time.Second
+	}
+	return b.Cfg.RetryInterval
+}
+
+// humanDur renders a duration the way the templates use it ("52s", "3 分钟").
+func humanDur(d time.Duration) string {
+	switch {
+	case d >= time.Minute:
+		return strconv.Itoa(int(d.Minutes())) + " 分钟"
+	case d >= time.Second:
+		return strconv.Itoa(int(d.Seconds())) + "s"
+	default:
+		return strconv.Itoa(int(d.Milliseconds())) + "ms"
+	}
 }
 
 // localFallback is the terminal, fully automatic decision after the retry
@@ -829,7 +961,17 @@ func (b *Bot) localFallback(ctx context.Context, in judgmentInput, lastErr strin
 			"hits", strings.Join(res.Hits, ","),
 			"last_error", lastErr,
 			"category", "其他")
-		b.punishAndClear(ctx, in.chatID, in.uid, in.messageID, b.Cfg.Action, "其他", "本地规则兜底命中", in.text, in.writeMsg || in.writeBio, in.kind == "join")
+		b.punishAndClear(ctx, punishInfo{
+			chatID:    in.chatID,
+			uid:       in.uid,
+			username:  in.username,
+			firstName: in.firstName,
+			msgID:     in.messageID,
+			text:      in.text,
+			writeSig:  in.writeMsg || in.writeBio,
+			bioKind:   in.kind == "join",
+		}, b.Cfg.Action, "其他", "本地规则兜底命中",
+			notifyDetails{source: "local", score: res.Score, retries: in.retries})
 		return
 	}
 	// Below threshold: no punishment, user stays on the watchlist (observed).
@@ -1036,14 +1178,32 @@ func (b *Bot) replyChat(ctx context.Context, chatID int64, text string) {
 // Decision helpers
 // ---------------------------------------------------------------------------
 
-// isAdmin reports whether uid is a group owner/administrator.
+// isAdmin reports whether uid is a group owner/administrator, with a TTL
+// cache in front of the API call (amend4 §4.5: only deterministic results are
+// cached; API errors bypass the cache so a network blip never freezes a
+// member's status).
 func (b *Bot) isAdmin(ctx context.Context, chatID, uid int64) bool {
-	m, err := b.TG.GetChatMember(ctx, chatID, uid)
+	if status := b.adminCache.get(chatID, uid); status != "" {
+		return status == "creator" || status == "administrator"
+	}
+	m, err := b.adminCache.getChatMember(ctx, b.TG, chatID, uid)
 	if err != nil {
 		b.Log.Warn("getchatmember_error", "uid", uid, "err", err.Error())
 		return false
 	}
 	return m.Status == "creator" || m.Status == "administrator"
+}
+
+// startJudge stamps a judgment's start (the ⏱️ total-processing-time base).
+func (b *Bot) startJudge() time.Time { return b.now() }
+
+// endJudge computes the elapsed span since a startJudge stamp.
+func (b *Bot) endJudge(start time.Time) time.Duration {
+	elapsed := b.now().Sub(start)
+	if elapsed < 0 {
+		return 0
+	}
+	return elapsed
 }
 
 // searchBioSignature: exact sha1 then simhash near-match (bio library).
@@ -1094,43 +1254,90 @@ func (b *Bot) simhashNear(ctx context.Context, normalized, kind string) bool {
 	return hit
 }
 
+// punishInfo identifies a punished user for disposal + notification.
+type punishInfo struct {
+	chatID    int64
+	uid       int64
+	username  string
+	firstName string
+	msgID     int64 // triggering message to delete (0 = none, join/bio path)
+	text      string
+	writeSig  bool
+	bioKind   bool
+}
+
+// notifyDetails carries the disposition-notice specifics (score source etc.).
+type notifyDetails struct {
+	source       string // signature | ai | vote | local
+	score        int    // 0–100 (local: rule score)
+	voteFor      int    // vote lane tally
+	voteTotal    int
+	elapsed      time.Duration // message → disposal total
+	retries      int           // AI retry rounds consumed
+	deleteFailed bool          // the triggering message survived
+}
+
 // punish deletes the triggering message (if non-zero) then bans/kicks, records,
 // notifies. It is the join path (no tracked list; caller passes an explicit id).
-func (b *Bot) punish(ctx context.Context, chatID, uid int64, action, category, reason string, msgIDs []int64) {
+func (b *Bot) punish(ctx context.Context, pi punishInfo, action, category, reason string, nd notifyDetails, msgIDs []int64) {
 	for _, id := range msgIDs {
-		b.deleteOne(ctx, chatID, id)
+		b.deleteOne(ctx, pi.chatID, id)
 	}
-	b.ban(ctx, chatID, uid, action)
-	b.Store.RemoveSuspect(ctx, uid)
-	b.recordPunishment(ctx, chatID, uid, action, category, reason)
-	b.notify(ctx, chatID, uid, category)
+	b.ban(ctx, pi.chatID, pi.uid, action)
+	b.Store.RemoveSuspect(ctx, pi.uid)
+	b.recordPunishment(ctx, pi.chatID, pi.uid, action, category, reason)
+	b.pushPunishNotice(pi, action, category, nd)
 }
 
 // punishAndClear deletes only the triggering message (msgID), bans/kicks, writes
 // the message signature (from original text when provided), removes the suspect,
 // records and notifies.
-func (b *Bot) punishAndClear(ctx context.Context, chatID, uid, msgID int64, action, category, reason, original string, writeSig, bioKind bool) {
-	if msgID > 0 {
-		b.deleteOne(ctx, chatID, msgID)
+func (b *Bot) punishAndClear(ctx context.Context, pi punishInfo, action, category, reason string, nd notifyDetails) {
+	if pi.msgID > 0 {
+		b.deleteOne(ctx, pi.chatID, pi.msgID)
 	}
-	b.ban(ctx, chatID, uid, action)
+	b.ban(ctx, pi.chatID, pi.uid, action)
 	if b.Cfg.DryRun {
-		// Dry-run: zero writes — no signature, no watchlist removal, no record.
+		// Dry-run: zero writes — no signature, no watchlist removal, no record,
+		// no notification.
 		return
 	}
-	if writeSig && strings.TrimSpace(original) != "" {
-		sig, norm := normalize.Signature(original), normalize.Normalize(original)
-		if bioKind {
+	if pi.writeSig && strings.TrimSpace(pi.text) != "" {
+		sig, norm := normalize.Signature(pi.text), normalize.Normalize(pi.text)
+		if pi.bioKind {
 			if err := b.Store.AddBioSignature(ctx, sig, norm); err != nil {
-				b.Log.Error("add_biosig_error", "uid", uid, "err", err.Error())
+				b.Log.Error("add_biosig_error", "uid", pi.uid, "err", err.Error())
 			}
 		} else if err := b.Store.AddMessageSignature(ctx, sig, norm); err != nil {
-			b.Log.Error("add_msgsig_error", "uid", uid, "err", err.Error())
+			b.Log.Error("add_msgsig_error", "uid", pi.uid, "err", err.Error())
 		}
 	}
-	b.Store.RemoveSuspect(ctx, uid)
-	b.recordPunishment(ctx, chatID, uid, action, category, reason)
-	b.notify(ctx, chatID, uid, category)
+	b.Store.RemoveSuspect(ctx, pi.uid)
+	b.recordPunishment(ctx, pi.chatID, pi.uid, action, category, reason)
+	b.pushPunishNotice(pi, action, category, nd)
+}
+
+// pushPunishNotice renders and submits the §1.1 disposition notification.
+func (b *Bot) pushPunishNotice(pi punishInfo, action, category string, nd notifyDetails) {
+	if b.Notifier == nil {
+		return
+	}
+	b.Notifier.Punish(notify.PunishDetails{
+		ChatID:       pi.chatID,
+		UID:          pi.uid,
+		Username:     pi.username,
+		FirstName:    pi.firstName,
+		Text:         pi.text,
+		Action:       action,
+		Category:     category,
+		Source:       nd.source,
+		Score:        nd.score,
+		VoteTotal:    nd.voteTotal,
+		VoteFor:      nd.voteFor,
+		Retries:      nd.retries,
+		DeleteFailed: nd.deleteFailed,
+		Elapsed:      nd.elapsed,
+	})
 }
 
 // deleteOne deletes one message with 429 retry_after tolerance (≤3 retries)
@@ -1167,19 +1374,58 @@ func (b *Bot) deleteOne(ctx context.Context, chatID, msgID int64) {
 				// "message can't be deleted": already gone / >48h — noise.
 				b.Log.Warn("delete_message_not_deletable", "chat", chatID, "message_id", msgID, "err", apiErr.Description)
 				b.deleteFails.Add(1)
+				b.notifyTGWriteError(chatID, msgID, 0, "deleteMessage", apiErr, "超 48 小时")
 				return
 			case apiErr.Code == 403:
 				b.Log.Error("delete_forbidden", "chat", chatID, "message_id", msgID, "err", apiErr.Description)
 				b.deleteFails.Add(1)
+				b.notifyTGWriteError(chatID, msgID, 0, "deleteMessage", apiErr, "")
 				return
 			}
 		}
 		b.deleteFails.Add(1)
 		b.Log.Warn("delete_message_error", "chat", chatID, "message_id", msgID, "err", err.Error())
+		b.notifyTGWriteError(chatID, msgID, 0, "deleteMessage", apiErrOrNil(err), "")
 		return
 	}
 	b.deleteFails.Add(1)
 	b.Log.Warn("delete_message_exhausted", "chat", chatID, "message_id", msgID)
+}
+
+// apiErrOrNil extracts *telegram.APIError when err carries one.
+func apiErrOrNil(err error) *telegram.APIError {
+	var apiErr *telegram.APIError
+	if errors.As(err, &apiErr) {
+		return apiErr
+	}
+	return nil
+}
+
+// notifyTGWriteError pushes the 📵 Telegram write failure event (4xx/5xx from
+// deleteMessage / banChatMember / leaveChat / unbanChatMember). APIError-nil
+// (transport error) still notifies with the raw error text.
+func (b *Bot) notifyTGWriteError(chatID, messageID, uid int64, method string, apiErr *telegram.APIError, note string) {
+	if b.Notifier == nil {
+		return
+	}
+	detail := note
+	code := 0
+	if apiErr != nil {
+		code = apiErr.Code
+		if detail == "" {
+			detail = apiErr.Description
+		}
+	}
+	b.Notifier.Error(notify.ErrorEvent{
+		Kind:      "telegram_write",
+		Level:     logx.Error,
+		ChatID:    chatID,
+		UID:       uid,
+		MessageID: messageID,
+		Method:    method,
+		Detail:    strconv.Itoa(code) + " " + detail,
+		LastSeen:  method + " " + detail,
+	})
 }
 
 func (b *Bot) ban(ctx context.Context, chatID, uid int64, action string) {
@@ -1189,11 +1435,13 @@ func (b *Bot) ban(ctx context.Context, chatID, uid int64, action string) {
 	}
 	if err := b.TG.BanChatMember(ctx, chatID, uid); err != nil {
 		b.Log.Error("ban_error", "chat", chatID, "uid", uid, "err", err.Error())
+		b.notifyTGWriteError(chatID, 0, uid, "banChatMember", apiErrOrNil(err), "")
 		return
 	}
 	if action == "kick" {
 		if err := b.TG.UnbanChatMember(ctx, chatID, uid); err != nil {
 			b.Log.Warn("unban_error", "chat", chatID, "uid", uid, "err", err.Error())
+			b.notifyTGWriteError(chatID, 0, uid, "unbanChatMember", apiErrOrNil(err), "")
 		}
 	}
 	b.punishCount.Add(1)
@@ -1204,16 +1452,6 @@ func (b *Bot) recordPunishment(ctx context.Context, chatID, uid int64, action, c
 	p := store.Punishment{UID: uid, ChatID: chatID, Action: action, Category: category, Reason: reason, At: time.Now()}
 	if err := b.Store.RecordPunishment(ctx, p); err != nil {
 		b.Log.Error("record_punishment_error", "uid", uid, "err", err.Error())
-	}
-}
-
-func (b *Bot) notify(ctx context.Context, chatID, uid int64, category string) {
-	if b.Cfg.LogChat == 0 {
-		return
-	}
-	text := fmt.Sprintf("🚫 广告处置：uid=%d chat=%d category=%s", uid, chatID, category)
-	if _, err := b.TG.SendMessage(ctx, b.Cfg.LogChat, text); err != nil {
-		b.Log.Warn("notify_error", "err", err.Error())
 	}
 }
 

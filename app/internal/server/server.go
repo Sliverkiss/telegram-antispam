@@ -25,6 +25,21 @@ type Inspector interface {
 	ExtraStats() (reports, localFallback, simhashHits int64)
 	PendingQueueLen() int
 	AIStatsSnapshot() AISnapshot
+	// Amend4: notification subsystem counters (notify.target_ok etc.).
+	NotifySnapshot() NotifyStatsView
+}
+
+// NotifyStatsView is the notify counters the server renders (plain data so
+// server does not import notify).
+type NotifyStatsView struct {
+	Enabled       bool
+	TargetOK      bool
+	TargetChecked bool
+	Sent          int64
+	Dropped       int64
+	Suppressed    int64
+	QueueLen      int
+	QueueCap      int
 }
 
 // AISnapshot is the AI-side counters the server renders (kept as plain data
@@ -178,6 +193,24 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		"pending_queue":        pending,
 		"prompt_version":       ai.PromptVersion,
 	}
+
+	// amend4: notify subsystem block (always present; enabled=false when the
+	// target chat is not configured).
+	ns := s.Bot.NotifySnapshot()
+	nb := map[string]any{
+		"enabled":        ns.Enabled,
+		"target_ok":      ns.TargetOK,
+		"target_checked": ns.TargetChecked,
+		"sent":           ns.Sent,
+		"dropped":        ns.Dropped,
+		"suppressed":     ns.Suppressed,
+		"queue_len":      ns.QueueLen,
+		"queue_cap":      ns.QueueCap,
+	}
+	if ns.TargetChecked {
+		body["notify.target_ok"] = ns.TargetOK
+	}
+	body["notify"] = nb
 	// The sweeper block only appears when the janitor has run at least once.
 	if s.Sweeper != nil {
 		at, next, droppedSus, droppedSigs, remaining, ran := s.Sweeper.SweepSnapshot()

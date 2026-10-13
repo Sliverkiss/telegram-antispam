@@ -28,6 +28,7 @@ import (
 	"adbot/internal/bot"
 	"adbot/internal/config"
 	"adbot/internal/logx"
+	"adbot/internal/notify"
 	"adbot/internal/retryq"
 	"adbot/internal/server"
 	"adbot/internal/store"
@@ -128,6 +129,28 @@ func main() {
 
 	b := bot.New(st, tg, chain, verify, cfg, log.WithComponent("bot"))
 
+	// Notification subsystem (amend4): async bounded queue + worker; the
+	// sender is the plain-text NotifySender (no parse_mode, preview off).
+	notifier := notify.New(notify.Config{
+		LogChat:      cfg.LogChat,
+		OnPunish:     cfg.NotifyOnPunish,
+		OnError:      cfg.NotifyOnError,
+		Level:        logx.ParseLevel(cfg.NotifyLevel),
+		RatePerMin:   cfg.NotifyRatePerMin,
+		QueueSize:    cfg.NotifyQueue,
+		DedupeWindow: cfg.NotifyDedupeWindow,
+		MaxLen:       cfg.NotifyMaxLen,
+		TextLen:      cfg.NotifyTextLen,
+		IncludeText:  cfg.NotifyIncludeText,
+		Drain:        cfg.NotifyDrain,
+	}, tg, log.WithComponent("notify"))
+	b.Notifier = notifier
+	notifier.Start(context.Background())
+
+	// Startup self-check (§4): getChat + getChatMember(bot) on the target;
+	// failure WARNS (never blocks) and surfaces as notify.target_ok=false.
+	checkNotifyTarget(cfg, tg, notifier, log)
+
 	// Background retry queue: failed AI judgments re-run every 10s (fixed),
 	// max 5 rounds, then the local rule engine concludes. The janitor state is
 	// shared with /statusz.
@@ -152,7 +175,7 @@ func main() {
 	go runPoller(pollCtx, tg, cfg, b, log.WithComponent("poller"))
 
 	// Graceful shutdown: SIGINT/SIGTERM → stop poll, stop retry worker, stop
-	// janitor, close telegram, shutdown http.
+	// janitor, drain the notifier, close telegram, shutdown http.
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
@@ -162,6 +185,7 @@ func main() {
 		stopRetry()
 		retryQ.Stop()
 		janitorStop()
+		notifier.Stop() // drains up to BOT_NOTIFY_DRAIN
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		tg.Close(ctx)
@@ -176,6 +200,46 @@ func main() {
 		os.Exit(1)
 	}
 	log.Info("shutdown_complete")
+}
+
+// checkNotifyTarget runs the §4 startup self-check: the target chat must be
+// reachable (getChat) and the bot must be able to post (getChatMember status
+// member/administrator/creator). Failure WARNS and flips notify.target_ok to
+// false — it never blocks startup. A successful first SendMessage later
+// re-flips the flag (self-healing).
+func checkNotifyTarget(cfg config.Config, tg *telegram.Client, n *notify.Notifier, log *logx.Logger) {
+	if cfg.LogChat == 0 {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	fail := func(event, detail string) {
+		log.Warn(event, "chat", cfg.LogChat, "err", detail,
+			"summary", "通知目标不可用：处置/报错推送可能全部失败；notify.target_ok=false")
+		n.SetTargetOK(false)
+	}
+	if _, err := tg.GetChat(ctx, cfg.LogChat); err != nil {
+		fail("notify_target_unreachable", err.Error())
+		return
+	}
+	me, err := tg.GetMe(ctx)
+	if err != nil {
+		fail("notify_target_getme_error", err.Error())
+		return
+	}
+	member, err := tg.GetChatMember(ctx, cfg.LogChat, me.ID)
+	if err != nil {
+		fail("notify_target_member_error", err.Error())
+		return
+	}
+	switch member.Status {
+	case "member", "administrator", "creator":
+		n.SetTargetOK(true)
+		log.Info("notify_target_ok", "chat", cfg.LogChat, "bot_status", member.Status)
+	default:
+		// left/kicked/restricted: the bot cannot post.
+		fail("notify_target_no_permission", "bot status in target chat: "+member.Status)
+	}
 }
 
 // promptEvalModels resolves which models -prompteval evaluates.

@@ -13,6 +13,7 @@ import (
 	"adbot/internal/config"
 	"adbot/internal/logx"
 	"adbot/internal/normalize"
+	"adbot/internal/notify"
 	"adbot/internal/retryq"
 	"adbot/internal/store"
 	"adbot/internal/telegram"
@@ -148,7 +149,7 @@ func fakeVerdict(isAd bool, category string, conf float64) ai.Verdict {
 	return ai.Verdict{IsAd: isAd, Category: category, Confidence: conf, Reason: "test"}
 }
 
-func testBot(t *testing.T, tg *fakeTG, classify AIClassifier, cfg config.Config) *Bot {
+func testBot(t *testing.T, tg TelegramClient, classify AIClassifier, cfg config.Config) *Bot {
 	t.Helper()
 	st := store.NewMemory()
 	lg := logx.New(nil, logx.Error, "text", "bot")
@@ -156,7 +157,7 @@ func testBot(t *testing.T, tg *fakeTG, classify AIClassifier, cfg config.Config)
 }
 
 // voteBot wires a Verifier into the bot.
-func voteBot(t *testing.T, tg *fakeTG, classify AIClassifier, verify Verifier, cfg config.Config) *Bot {
+func voteBot(t *testing.T, tg TelegramClient, classify AIClassifier, verify Verifier, cfg config.Config) *Bot {
 	t.Helper()
 	st := store.NewMemory()
 	lg := logx.New(nil, logx.Error, "text", "bot")
@@ -180,7 +181,87 @@ func defaultCfg() config.Config {
 		SimhashDistance:    3,
 		RetryInterval:      10 * 1_000_000_000, // 1s in ns (unused unless retryq wired)
 		RetryMax:           5,
+		// amend4: notify defaults (overridden per-test).
+		NotifyOnPunish:     true,
+		NotifyOnError:      true,
+		NotifyLevel:        "error",
+		NotifyRatePerMin:   10000, // effectively unlimited in tests
+		NotifyQueue:        200,
+		NotifyDedupeWindow: 5 * time.Minute,
+		NotifyMaxLen:       1024,
+		NotifyTextLen:      120,
+		NotifyIncludeText:  true,
+		NotifyDrain:        2 * time.Second,
+		AdminCacheTTL:      5 * time.Minute,
+		AdminCacheMax:      5000,
 	}
+}
+
+// notifyRecorder is a thread-safe sink for notifier deliveries: the notifier
+// worker runs on its own goroutine, so tests must read through texts().
+type notifyRecorder struct {
+	mu    sync.Mutex
+	sends []string
+	err   error // when set, every SendMessage returns it (delivery failure)
+}
+
+func (r *notifyRecorder) SendMessage(_ context.Context, _ int64, text string) (int64, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.err != nil {
+		return 0, r.err
+	}
+	r.sends = append(r.sends, text)
+	return 1, nil
+}
+
+// texts returns a copy of the delivered messages.
+func (r *notifyRecorder) texts() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]string(nil), r.sends...)
+}
+
+// wireTestNotifier builds a live notifier around a dedicated recorder (drain
+// on test-end via Stop) and returns the recorder. Only tests that assert on
+// disposition/error notifications need it.
+func wireTestNotifier(t *testing.T, b *Bot, cfg config.Config) *notifyRecorder {
+	t.Helper()
+	return wireTestNotifierSink(t, b, cfg, &notifyRecorder{})
+}
+
+func wireTestNotifierSink(t *testing.T, b *Bot, cfg config.Config, rec *notifyRecorder) *notifyRecorder {
+	t.Helper()
+	n := notify.New(notify.Config{
+		LogChat:      cfg.LogChat,
+		OnPunish:     cfg.NotifyOnPunish,
+		OnError:      cfg.NotifyOnError,
+		Level:        logx.ParseLevel(cfg.NotifyLevel),
+		RatePerMin:   cfg.NotifyRatePerMin,
+		QueueSize:    cfg.NotifyQueue,
+		DedupeWindow: cfg.NotifyDedupeWindow,
+		MaxLen:       cfg.NotifyMaxLen,
+		TextLen:      cfg.NotifyTextLen,
+		IncludeText:  cfg.NotifyIncludeText,
+		Drain:        cfg.NotifyDrain,
+	}, rec, logx.New(nil, logx.Error, "text", "notify"))
+	b.Notifier = n
+	n.Start(context.Background())
+	t.Cleanup(n.Stop)
+	return rec
+}
+
+// waitFor polls cond until it holds or the deadline expires.
+func waitFor(t *testing.T, cond func() bool, what string) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %s", what)
 }
 
 func u(id int64, isBot bool, username, first string) telegram.User {
@@ -363,6 +444,7 @@ func TestMessageAIAdFullSequence(t *testing.T) {
 	fa := &fakeAI{verdict: fakeVerdict(true, "诈骗", 0.9)}
 	b := testBot(t, tg, fa, cfg)
 	ctx := context.Background()
+	rec := wireTestNotifier(t, b, cfg)
 	b.Store.AddSuspect(ctx, store.Suspect{UID: 6, ChatID: -600})
 
 	b.HandleMessage(ctx, adMsg(-600, 6, 22, "加QQ赚钱 日入过万"))
@@ -377,14 +459,81 @@ func TestMessageAIAdFullSequence(t *testing.T) {
 	if len(tg.bans) != 1 {
 		t.Fatalf("bans = %v", tg.bans)
 	}
-	if len(tg.sends) != 1 {
-		t.Fatalf("notify sends = %v", tg.sends)
+	// Disposition notification (async; the worker delivers on its own goroutine).
+	// §1.1 content: uid, action, evidence, score — all present.
+	waitFor(t, func() bool { return len(rec.texts()) == 1 }, "disposition notify")
+	nb := rec.texts()[0]
+	for _, want := range []string{
+		"⏱️ 处理时间:", "💬 加QQ赚钱 日入过万", "👤 无用户名 · 6",
+		"✅ 已封禁 · 90分",
+	} {
+		if !strings.Contains(nb, want) {
+			t.Fatalf("notify text missing %q:\n%s", want, nb)
+		}
 	}
 	if ok, _ := b.Store.HasMessageSignature(ctx, normalize.Signature("加QQ赚钱 日入过万")); !ok {
 		t.Fatal("ad message should persist to message signature library")
 	}
 	if sus, _ := b.Store.IsSuspect(ctx, 6); sus {
 		t.Fatal("suspect should be removed")
+	}
+}
+
+func TestMessageAIAdNoNotifyWhenDisabled(t *testing.T) {
+	tg := newFakeTG()
+	cfg := defaultCfg()
+	cfg.LogChat = -999
+	cfg.NotifyOnPunish = false // BOT_NOTIFY_ON_PUNISH=false → zero pushes
+	fa := &fakeAI{verdict: fakeVerdict(true, "诈骗", 0.9)}
+	b := testBot(t, tg, fa, cfg)
+	ctx := context.Background()
+	rec := wireTestNotifier(t, b, cfg)
+	b.Store.AddSuspect(ctx, store.Suspect{UID: 6, ChatID: -600})
+
+	b.HandleMessage(ctx, adMsg(-600, 6, 23, "加QQ赚钱 日入过万"))
+
+	// Disposal still happens; no notification is pushed.
+	if len(tg.bans) != 1 || len(tg.deletes) != 1 {
+		t.Fatalf("disposal must still run: bans=%v deletes=%v", tg.bans, tg.deletes)
+	}
+	time.Sleep(50 * time.Millisecond)
+	if got := rec.texts(); len(got) != 0 {
+		t.Fatalf("BOT_NOTIFY_ON_PUNISH=false must push nothing: %v", got)
+	}
+}
+
+// TestMessageAIAdNotifySendFailKeepsDisposal — §6: a SendMessage failure in
+// the notifier must never break the disposition flow. The notification channel
+// returns 500; the delete+ban+signature+watchlist removal must still complete.
+func TestMessageAIAdNotifySendFailKeepsDisposal(t *testing.T) {
+	tg := newFakeTG()
+	cfg := defaultCfg()
+	cfg.LogChat = -999
+	fa := &fakeAI{verdict: fakeVerdict(true, "诈骗", 0.9)}
+	b := testBot(t, tg, fa, cfg)
+	ctx := context.Background()
+	rec := &notifyRecorder{err: errors.New("sendMessage 500 upstream")}
+	wireTestNotifierSink(t, b, cfg, rec)
+	b.Store.AddSuspect(ctx, store.Suspect{UID: 6, ChatID: -600})
+
+	b.HandleMessage(ctx, adMsg(-600, 6, 24, "加QQ赚钱 日入过万"))
+
+	// Disposition completes even though the notification send always fails.
+	if len(tg.deletes) != 1 || tg.deletes[0] != "24" {
+		t.Fatalf("deletes = %v, want [24]", tg.deletes)
+	}
+	if len(tg.bans) != 1 {
+		t.Fatalf("bans = %v", tg.bans)
+	}
+	if ok, _ := b.Store.HasMessageSignature(ctx, normalize.Signature("加QQ赚钱 日入过万")); !ok {
+		t.Fatal("signature must still be written despite notify failure")
+	}
+	if sus, _ := b.Store.IsSuspect(ctx, 6); sus {
+		t.Fatal("suspect must still be removed despite notify failure")
+	}
+	// The notifier attempted the send (and failed); nothing is delivered.
+	if got := rec.texts(); len(got) != 0 {
+		t.Fatalf("all sends fail, nothing delivered: %v", got)
 	}
 }
 

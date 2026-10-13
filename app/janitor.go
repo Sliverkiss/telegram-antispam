@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"runtime"
 	"sync"
 	"time"
@@ -9,6 +10,7 @@ import (
 	"adbot/internal/bot"
 	"adbot/internal/config"
 	"adbot/internal/logx"
+	"adbot/internal/notify"
 	"adbot/internal/store"
 )
 
@@ -83,6 +85,16 @@ func startJanitor(b *bot.Bot, cfg config.Config, log *logx.Logger, sweepState *S
 			}
 			if res.EvictedSignatures > 0 {
 				log.Warn("sweep_evict_signatures", "evicted", res.EvictedSignatures)
+			}
+			if b.Notifier != nil && (res.EvictedSuspects > 0 || res.EvictedSignatures > 0) {
+				total := res.EvictedSuspects + res.EvictedSignatures
+				b.Notifier.Error(notify.ErrorEvent{
+					Kind:     "janitor_evict",
+					Level:    logx.Warn,
+					Method:   fmt.Sprintf("观察名单 %d · 签名库 %d", res.EvictedSuspects, res.EvictedSignatures),
+					Detail:   fmt.Sprintf("容量上限淘汰 %d 条（BOT_MAX_SUSPECTS/BOT_MAX_SIGNATURES）", total),
+					LastSeen: fmt.Sprintf("suspects=%d signatures=%d", res.EvictedSuspects, res.EvictedSignatures),
+				})
 			}
 			if sweepState != nil {
 				sweepState.mu.Lock()

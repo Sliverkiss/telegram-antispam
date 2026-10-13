@@ -430,6 +430,27 @@ func (c *Client) SendMessage(ctx context.Context, chatID int64, text string) (in
 	return int64(m.ID), nil
 }
 
+// NotifySender sends one notification message as PLAIN TEXT (amend4 §2.4):
+// no parse_mode is ever set (ad text is full of Markdown/HTML specials), the
+// link preview is explicitly disabled, and the caller is expected to have
+// clipped to Telegram's 4096 limit. disable_notification stays false (the
+// channel push should have a notification sound).
+func (c *Client) NotifySender(ctx context.Context, chatID int64, text string) (int64, error) {
+	previewDisabled := true
+	m, err := c.b.SendMessage(ctx, &tgbot.SendMessageParams{
+		ChatID:             chatID,
+		Text:               text,
+		LinkPreviewOptions: &models.LinkPreviewOptions{IsDisabled: &previewDisabled},
+	})
+	if err != nil {
+		return 0, c.toAPIError("sendMessage", err)
+	}
+	if m == nil {
+		return 0, nil
+	}
+	return int64(m.ID), nil
+}
+
 // LeaveChat makes the bot leave a chat.
 func (c *Client) LeaveChat(ctx context.Context, chatID int64) error {
 	_, err := c.b.LeaveChat(ctx, &tgbot.LeaveChatParams{ChatID: chatID})

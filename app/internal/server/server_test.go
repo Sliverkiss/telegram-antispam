@@ -44,6 +44,9 @@ func (s *stubBot) AIStatsSnapshot() AISnapshot {
 		LocalFallback: 1,
 	}
 }
+func (s *stubBot) NotifySnapshot() NotifyStatsView {
+	return NotifyStatsView{Enabled: true, TargetOK: true, TargetChecked: true, Sent: 7}
+}
 
 // fakeSweep reports a fixed (already-run) sweep for /statusz rendering.
 type fakeSweep struct{}
@@ -193,6 +196,32 @@ func TestStatuszSweepNotYetRun(t *testing.T) {
 	}
 	if _, ok := body["next_sweep_in"]; ok {
 		t.Error("next_sweep_in must be absent before the first sweep")
+	}
+}
+
+// TestStatuszNotifyBlock pins the amend4 /statusz notify block: it is always
+// present, carries the counters, and surfaces notify.target_ok once checked.
+func TestStatuszNotifyBlock(t *testing.T) {
+	_, ts := newTestServer(t, "")
+	resp := get(t, ts.URL+"/statusz")
+	defer resp.Body.Close()
+	var body map[string]any
+	json.NewDecoder(resp.Body).Decode(&body)
+	nb, ok := body["notify"].(map[string]any)
+	if !ok {
+		t.Fatalf("notify block missing: %v", body["notify"])
+	}
+	if nb["enabled"] != true || nb["target_ok"] != true || nb["target_checked"] != true {
+		t.Errorf("notify.target = %v/%v/%v", nb["enabled"], nb["target_ok"], nb["target_checked"])
+	}
+	if nb["sent"] != float64(7) {
+		t.Errorf("notify.sent = %v", nb["sent"])
+	}
+	if nb["queue_cap"] == nil || nb["queue_len"] == nil {
+		t.Errorf("notify queue = %v/%v", nb["queue_len"], nb["queue_cap"])
+	}
+	if body["notify.target_ok"] != true {
+		t.Error("top-level notify.target_ok should be set once checked")
 	}
 }
 

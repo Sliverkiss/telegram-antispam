@@ -3,6 +3,7 @@ package telegram
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -133,6 +134,69 @@ func TestSendMessage(t *testing.T) {
 	}
 	if id != 777 {
 		t.Errorf("message id = %d", id)
+	}
+}
+
+// TestNotifySenderPlainText pins §2.4: the notify sender must be PLAIN TEXT.
+// The library serialises sendMessage as a multipart form, and parse_mode is
+// only present when non-empty — so "no parse_mode in the request body" is
+// asserted exactly, and is a request-content assertion, not a render one.
+func TestNotifySenderPlainText(t *testing.T) {
+	var reqBody string
+	var reqCT string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasSuffix(r.URL.Path, "/sendMessage") {
+			t.Errorf("path = %s", r.URL.Path)
+		}
+		b, _ := io.ReadAll(r.Body)
+		reqBody = string(b)
+		reqCT = r.Header.Get("Content-Type")
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"ok":true,"result":{"message_id":777}}`))
+	}))
+	defer srv.Close()
+	c, err := NewClientWithOptions("123:TEST", Options{ServerURL: srv.URL, SkipGetMe: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.NotifySender(context.Background(), -100, "✅ 已封禁 · 90分\n📍 位置"); err != nil {
+		t.Fatal(err)
+	}
+	// parse_mode must be absent from the multipart fields.
+	if strings.Contains(reqBody, `name="parse_mode"`) {
+		t.Errorf("NotifySender sent parse_mode:\n%s", reqBody)
+	}
+	// It must be multipart form-data (the library's transport).
+	if !strings.Contains(reqCT, "multipart/form-data") {
+		t.Errorf("content-type = %q", reqCT)
+	}
+	// The text itself must be present.
+	if !strings.Contains(reqBody, "已封禁") {
+		t.Errorf("text missing from request body:\n%s", reqBody)
+	}
+}
+
+// TestNotifySenderNoPreview pins §2.4 link preview explicitly disabled: the
+// multipart form must carry is_disabled=true for link_preview_options.
+func TestNotifySenderNoPreview(t *testing.T) {
+	var reqBody string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		reqBody = string(b)
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"ok":true,"result":{"message_id":1}}`))
+	}))
+	defer srv.Close()
+	c, err := NewClientWithOptions("123:TEST", Options{ServerURL: srv.URL, SkipGetMe: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.NotifySender(context.Background(), -100, "x"); err != nil {
+		t.Fatal(err)
+	}
+	// The LinkPreviewOptions part is a JSON object with is_disabled=true.
+	if !strings.Contains(reqBody, `"is_disabled":true`) {
+		t.Errorf("link preview not disabled:\n%s", reqBody)
 	}
 }
 

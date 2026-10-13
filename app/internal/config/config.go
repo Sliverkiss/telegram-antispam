@@ -89,6 +89,20 @@ type Config struct {
 	LogFormat   string
 	AdminToken  string
 	Version     string
+
+	// Notifications (amend4) ---------------------------------------------------
+	NotifyOnPunish     bool          // BOT_NOTIFY_ON_PUNISH
+	NotifyOnError      bool          // BOT_NOTIFY_ON_ERROR
+	NotifyLevel        string        // BOT_NOTIFY_LEVEL: "error" | "warn"
+	NotifyRatePerMin   int           // BOT_NOTIFY_RATE
+	NotifyQueue        int           // BOT_NOTIFY_QUEUE
+	NotifyDedupeWindow time.Duration // BOT_NOTIFY_DEDUPE_WINDOW
+	NotifyMaxLen       int           // BOT_NOTIFY_MAX_LEN
+	NotifyTextLen      int           // BOT_NOTIFY_TEXT_LEN
+	NotifyIncludeText  bool          // BOT_NOTIFY_INCLUDE_TEXT
+	NotifyDrain        time.Duration // BOT_NOTIFY_DRAIN
+	AdminCacheTTL      time.Duration // BOT_ADMIN_CACHE_TTL
+	AdminCacheMax      int           // BOT_ADMIN_CACHE_MAX
 }
 
 // Load reads the environment into a Config with defaults applied. It is pure
@@ -151,6 +165,19 @@ func Load() Config {
 		LogFormat:   envOr("BOT_LOG_FORMAT", "text"),
 		AdminToken:  os.Getenv("BOT_ADMIN_TOKEN"),
 		Version:     envOr("BOT_VERSION", "dev"),
+
+		NotifyOnPunish:     boolEnv("BOT_NOTIFY_ON_PUNISH", true),
+		NotifyOnError:      boolEnv("BOT_NOTIFY_ON_ERROR", true),
+		NotifyLevel:        envOr("BOT_NOTIFY_LEVEL", "error"),
+		NotifyRatePerMin:   intEnv("BOT_NOTIFY_RATE", 20),
+		NotifyQueue:        intEnv("BOT_NOTIFY_QUEUE", 200),
+		NotifyDedupeWindow: durationEnv("BOT_NOTIFY_DEDUPE_WINDOW", 5*time.Minute),
+		NotifyMaxLen:       intEnv("BOT_NOTIFY_MAX_LEN", 1024),
+		NotifyTextLen:      intEnv("BOT_NOTIFY_TEXT_LEN", 120),
+		NotifyIncludeText:  boolEnv("BOT_NOTIFY_INCLUDE_TEXT", true),
+		NotifyDrain:        durationEnv("BOT_NOTIFY_DRAIN", 5*time.Second),
+		AdminCacheTTL:      durationEnv("BOT_ADMIN_CACHE_TTL", 5*time.Minute),
+		AdminCacheMax:      intEnv("BOT_ADMIN_CACHE_MAX", 5000),
 	}
 	c.Token = os.Getenv("BOT_TOKEN")
 	c.ChatsSet = os.Getenv("BOT_CHATS") != ""
@@ -160,6 +187,11 @@ func Load() Config {
 		if n, err := strconv.ParseInt(strings.TrimSpace(v), 10, 64); err == nil {
 			c.LogChat = n
 		}
+	}
+	// Notify level must be "error" (default) or "warn"; anything else (with
+	// the default "error" itself) stays "error" — fail-quiet over fail-noisy.
+	if c.NotifyLevel != "warn" {
+		c.NotifyLevel = "error"
 	}
 	// Per-category retention: empty/unparsable follows BOT_RETENTION.
 	c.RetentionSuspect = optionalDuraenv("BOT_RETENTION_SUSPECT")
@@ -218,16 +250,29 @@ func (c Config) IsAdminUser(uid int64) bool { return c.AdminUsers[uid] }
 // Redacted renders a credential-safe summary (tokens/passwords → prefix only).
 func (c Config) Redacted() map[string]string {
 	return map[string]string{
-		"BOT_ADDR":                  c.BotAddr,
-		"BOT_CHATS":                 formatIDSet(c.Chats),
-		"BOT_LEAVE_OTHER_CHATS":     strconv.FormatBool(c.LeaveOtherChats),
-		"BOT_LEAVE_NOTICE":          strconv.FormatBool(c.LeaveNotice),
-		"BOT_ADMIN_USERS":           formatIDSet(c.AdminUsers),
-		"BOT_DRY_RUN":               strconv.FormatBool(c.DryRun),
-		"BOT_ACTION":                c.Action,
-		"BOT_IGNORE_ADMINS":         strconv.FormatBool(c.IgnoreAdmins),
-		"BOT_DELETE_JOIN_MSG":       strconv.FormatBool(c.DeleteJoinMsg),
-		"BOT_LOG_CHAT":              strconv.FormatInt(c.LogChat, 10),
+		"BOT_ADDR":              c.BotAddr,
+		"BOT_CHATS":             formatIDSet(c.Chats),
+		"BOT_LEAVE_OTHER_CHATS": strconv.FormatBool(c.LeaveOtherChats),
+		"BOT_LEAVE_NOTICE":      strconv.FormatBool(c.LeaveNotice),
+		"BOT_ADMIN_USERS":       formatIDSet(c.AdminUsers),
+		"BOT_DRY_RUN":           strconv.FormatBool(c.DryRun),
+		"BOT_ACTION":            c.Action,
+		"BOT_IGNORE_ADMINS":     strconv.FormatBool(c.IgnoreAdmins),
+		"BOT_DELETE_JOIN_MSG":   strconv.FormatBool(c.DeleteJoinMsg),
+		"BOT_LOG_CHAT":          strconv.FormatInt(c.LogChat, 10),
+		// amend4 notification + admin-cache contract
+		"BOT_NOTIFY_ON_PUNISH":      strconv.FormatBool(c.NotifyOnPunish),
+		"BOT_NOTIFY_ON_ERROR":       strconv.FormatBool(c.NotifyOnError),
+		"BOT_NOTIFY_LEVEL":          c.NotifyLevel,
+		"BOT_NOTIFY_RATE":           strconv.Itoa(c.NotifyRatePerMin),
+		"BOT_NOTIFY_QUEUE":          strconv.Itoa(c.NotifyQueue),
+		"BOT_NOTIFY_DEDUPE_WINDOW":  c.NotifyDedupeWindow.String(),
+		"BOT_NOTIFY_MAX_LEN":        strconv.Itoa(c.NotifyMaxLen),
+		"BOT_NOTIFY_TEXT_LEN":       strconv.Itoa(c.NotifyTextLen),
+		"BOT_NOTIFY_INCLUDE_TEXT":   strconv.FormatBool(c.NotifyIncludeText),
+		"BOT_NOTIFY_DRAIN":          c.NotifyDrain.String(),
+		"BOT_ADMIN_CACHE_TTL":       c.AdminCacheTTL.String(),
+		"BOT_ADMIN_CACHE_MAX":       strconv.Itoa(c.AdminCacheMax),
 		"BOT_CMD_AUTODELETE_SEC":    strconv.Itoa(c.CmdAutodeleteSec),
 		"BOT_STORE":                 c.Store,
 		"BOT_REDIS_URL":             redactURL(c.RedisURL),
@@ -324,6 +369,13 @@ func UnrecognizedBotVars() []string {
 		"BOT_POLL_TIMEOUT": true, "BOT_WORKERS": true,
 		"BOT_LOG_LEVEL": true, "BOT_LOG_FORMAT": true,
 		"BOT_ADMIN_TOKEN": true, "BOT_VERSION": true,
+		// amend4 (notify + admin cache)
+		"BOT_NOTIFY_ON_PUNISH": true, "BOT_NOTIFY_ON_ERROR": true,
+		"BOT_NOTIFY_LEVEL": true, "BOT_NOTIFY_RATE": true,
+		"BOT_NOTIFY_QUEUE": true, "BOT_NOTIFY_DEDUPE_WINDOW": true,
+		"BOT_NOTIFY_MAX_LEN": true, "BOT_NOTIFY_TEXT_LEN": true,
+		"BOT_NOTIFY_INCLUDE_TEXT": true, "BOT_NOTIFY_DRAIN": true,
+		"BOT_ADMIN_CACHE_TTL": true, "BOT_ADMIN_CACHE_MAX": true,
 	}
 	var out []string
 	for _, kv := range os.Environ() {

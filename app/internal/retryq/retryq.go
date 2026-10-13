@@ -26,6 +26,8 @@ type Item struct {
 	ChatID      int64
 	MessageID   int64 // triggering message to delete (0 for join/bio)
 	UID         int64
+	Username    string // notification identity (amend4 👤 line)
+	FirstName   string
 	Text        string
 	Mode        string // ai prompt mode: "message" or "bio"
 	ImageURL    string // data URL when the message carried a judged image
