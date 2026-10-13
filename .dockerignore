@@ -1,0 +1,7 @@
+.git
+app/.env
+.env
+*.log
+app/adbot
+smoke/
+recon-data/

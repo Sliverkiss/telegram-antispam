@@ -1,0 +1,7 @@
+.env
+accounts.json
+app/adbot
+*.log
+smoke/
+recon-data/
+TASK_*.md

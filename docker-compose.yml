@@ -1,0 +1,24 @@
+services:
+  adbot:
+    build: .
+    ports:
+      - "3000:3000"
+    environment:
+      - BOT_ADDR=:3000
+      - BOT_TOKEN=${BOT_TOKEN:-}
+      - BOT_ACTION=${BOT_ACTION:-ban}
+      - BOT_IGNORE_ADMINS=${BOT_IGNORE_ADMINS:-true}
+      - BOT_DELETE_JOIN_MSG=${BOT_DELETE_JOIN_MSG:-false}
+      - BOT_LOG_CHAT=${BOT_LOG_CHAT:-}
+      - BOT_LOG_LEVEL=${BOT_LOG_LEVEL:-info}
+      - BOT_LOG_FORMAT=${BOT_LOG_FORMAT:-text}
+      - BOT_REDIS_URL=${BOT_REDIS_URL:-}
+      - BOT_REDIS_INSECURE_TLS=${BOT_REDIS_INSECURE_TLS:-false}
+      - BOT_SUSPECT_TTL=${BOT_SUSPECT_TTL:-}
+      - BOT_AI_BASE_URL=${BOT_AI_BASE_URL:-https://mimo.xn--ug8h.eu.org/v1}
+      - BOT_AI_API_KEY=${BOT_AI_API_KEY:-}
+      - BOT_AI_MODEL=${BOT_AI_MODEL:-mimo-v2.6-pro-ultraspeed-studio}
+      - BOT_AI_TIMEOUT=${BOT_AI_TIMEOUT:-30s}
+      - BOT_ADMIN_TOKEN=${BOT_ADMIN_TOKEN:-}
+      - BOT_MAX_TRACKED_MSGS=${BOT_MAX_TRACKED_MSGS:-200}
+    restart: unless-stopped
