@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -14,7 +15,13 @@ import (
 	"adbot/internal/store"
 )
 
-type stubBot struct{ poll, punished, aiCalls, aiFails int64 }
+// stubBot implements the full Inspector contract (amend3: ExtraStats,
+// PendingQueueLen, AIStatsSnapshot on top of the round-2 counters).
+type stubBot struct {
+	poll, punished, aiCalls, aiFails int64
+	reports, localFallback, simhash  int64
+	pending                          int
+}
 
 func (s *stubBot) Stats() (int64, int64, int64, int64) {
 	return s.poll, s.punished, s.aiCalls, s.aiFails
@@ -22,15 +29,54 @@ func (s *stubBot) Stats() (int64, int64, int64, int64) {
 
 func (s *stubBot) DeleteStats() (int64, int64) { return 0, 0 }
 func (s *stubBot) Uptime() time.Duration       { return time.Minute }
+func (s *stubBot) ExtraStats() (int64, int64, int64) {
+	return s.reports, s.localFallback, s.simhash
+}
+func (s *stubBot) PendingQueueLen() int { return s.pending }
+func (s *stubBot) AIStatsSnapshot() AISnapshot {
+	return AISnapshot{
+		ModelCalls:    map[string]int64{"a-model": 4, "b-model": 2},
+		ModelOKs:      map[string]int64{"a-model": 3, "b-model": 1},
+		Fallbacks:     2,
+		VerifyRounds:  1,
+		VerifyFlipped: 1,
+		Reports:       5,
+		LocalFallback: 1,
+	}
+}
+
+// fakeSweep reports a fixed (already-run) sweep for /statusz rendering.
+type fakeSweep struct{}
+
+func (fakeSweep) SweepSnapshot() (time.Time, time.Time, int64, int64, int64, bool) {
+	at := time.Now().Add(-time.Minute)
+	next := time.Now().Add(9 * time.Minute)
+	return at, next, 2, 3, 42, true
+}
+
+// neverSweep reports that the janitor has not run yet.
+type neverSweep struct{}
+
+func (neverSweep) SweepSnapshot() (time.Time, time.Time, int64, int64, int64, bool) {
+	return time.Time{}, time.Time{}, 0, 0, 0, false
+}
 
 func newTestServer(t *testing.T, adminToken string) (*Server, *httptest.Server) {
+	t.Helper()
+	return newTestServerWithSweep(t, adminToken, nil)
+}
+
+func newTestServerWithSweep(t *testing.T, adminToken string, sweep SweepReporter) (*Server, *httptest.Server) {
 	t.Helper()
 	st := store.NewMemory()
 	for i := 0; i < 7; i++ {
 		st.RecordPunishment(context.Background(), store.Punishment{UID: int64(i), Action: "ban"})
 	}
 	cfg := config.Config{Store: "memory", AdminToken: adminToken, Version: "test", Retention: 0}
-	s := New(st, &stubBot{punished: 7, aiCalls: 3}, cfg, logx.New(nil, logx.Error, "text", "http"))
+	// report_count/local_fallback_count come from ExtraStats; the AI-side
+	// snapshot's Reports/LocalFallback are the ai-package view of the same
+	// counters and are not rendered separately.
+	s := New(st, &stubBot{punished: 7, aiCalls: 3, reports: 5, localFallback: 1}, sweep, cfg, logx.New(nil, logx.Error, "text", "http"))
 	ts := httptest.NewServer(s.Handler())
 	t.Cleanup(ts.Close)
 	return s, ts
@@ -74,6 +120,93 @@ func TestStatusz(t *testing.T) {
 	}
 	if _, ok := body["store_backend"]; !ok {
 		t.Error("statusz missing store_backend")
+	}
+	// Without a sweeper the sweep block stays absent.
+	if _, ok := body["last_sweep"]; ok {
+		t.Error("last_sweep must be absent without a sweeper")
+	}
+}
+
+// TestStatuszAmend3Fields pins the round-3 /statusz contract: model chain
+// stats, vote counters, report/local-fallback/simhash counters, pending
+// queue, prompt_version, and the janitor sweep block.
+func TestStatuszAmend3Fields(t *testing.T) {
+	_, ts := newTestServerWithSweep(t, "", fakeSweep{})
+	resp := get(t, ts.URL+"/statusz")
+	defer resp.Body.Close()
+	var body map[string]any
+	json.NewDecoder(resp.Body).Decode(&body)
+	if body["prompt_version"] != "judge_v1" {
+		t.Errorf("prompt_version = %v", body["prompt_version"])
+	}
+	if body["ai_fallbacks"] != float64(2) {
+		t.Errorf("ai_fallbacks = %v", body["ai_fallbacks"])
+	}
+	if body["ai_verify_rounds"] != float64(1) || body["ai_verify_flipped"] != float64(1) {
+		t.Errorf("vote counters = %v/%v", body["ai_verify_rounds"], body["ai_verify_flipped"])
+	}
+	if body["report_count"] != float64(5) {
+		t.Errorf("report_count = %v", body["report_count"])
+	}
+	if body["local_fallback_count"] != float64(1) {
+		t.Errorf("local_fallback_count = %v", body["local_fallback_count"])
+	}
+	if body["simhash_hits"] != float64(0) {
+		t.Errorf("simhash_hits = %v", body["simhash_hits"])
+	}
+	if body["pending_queue"] != float64(0) {
+		t.Errorf("pending_queue = %v", body["pending_queue"])
+	}
+	models, ok := body["ai_model_stats"].(map[string]any)
+	if !ok {
+		t.Fatalf("ai_model_stats missing: %v", body["ai_model_stats"])
+	}
+	calls, ok := models["calls"].(map[string]any)
+	if !ok || calls["a-model"] != float64(4) {
+		t.Errorf("ai_model_stats.calls = %v", models["calls"])
+	}
+	// The sweep block renders once the janitor has run.
+	last, ok := body["last_sweep"].(map[string]any)
+	if !ok {
+		t.Fatalf("last_sweep missing: %v", body["last_sweep"])
+	}
+	if last["dropped_suspects"] != float64(2) || last["dropped_signatures"] != float64(3) {
+		t.Errorf("last_sweep = %v", last)
+	}
+	if last["remaining_total"] != float64(42) {
+		t.Errorf("remaining_total = %v", last["remaining_total"])
+	}
+	if nextIn, ok := body["next_sweep_in"].(string); !ok || nextIn == "" {
+		t.Errorf("next_sweep_in = %v", body["next_sweep_in"])
+	}
+}
+
+// A configured-but-never-run janitor must not render the sweep block.
+func TestStatuszSweepNotYetRun(t *testing.T) {
+	_, ts := newTestServerWithSweep(t, "", neverSweep{})
+	resp := get(t, ts.URL+"/statusz")
+	defer resp.Body.Close()
+	var body map[string]any
+	json.NewDecoder(resp.Body).Decode(&body)
+	if _, ok := body["last_sweep"]; ok {
+		t.Error("last_sweep must be absent before the first sweep")
+	}
+	if _, ok := body["next_sweep_in"]; ok {
+		t.Error("next_sweep_in must be absent before the first sweep")
+	}
+}
+
+// The admin token must never leak into any status payload.
+func TestStatuszNoSecrets(t *testing.T) {
+	_, ts := newTestServerWithSweep(t, "s3cret", fakeSweep{})
+	resp := get(t, ts.URL+"/statusz")
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), "s3cret") {
+		t.Error("statusz leaked the admin token")
 	}
 }
 

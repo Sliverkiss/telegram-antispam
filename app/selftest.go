@@ -14,10 +14,11 @@ import (
 
 // runSelftest executes the belmo connectivity acceptance checks in order:
 // config → storage → AI → Telegram. Each prints [PASS]/[FAIL]; any failure
-// makes the process exit non-zero. Timeouts are bounded.
+// makes the process exit non-zero. It only calls getMe (no polling, no 409
+// conflict with a running instance). Timeouts are bounded.
 func runSelftest(cfg config.Config) {
 	ok := true
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
 
 	fmt.Println("=== adbot selftest ===")
@@ -32,6 +33,7 @@ func runSelftest(cfg config.Config) {
 	// TTL configuration (explicit requirement for -selftest).
 	fmt.Printf("        effective TTL suspect=%s signature=%s sliding=%v\n",
 		cfg.RetentionFor("suspect"), cfg.RetentionFor("signature"), cfg.RetentionSliding)
+	fmt.Printf("        prompt_version=%s models=%s\n", ai.PromptVersion, fmt.Sprint(cfg.AIEffectiveModels()))
 
 	// 2. Storage: report the chosen backend and its record counts.
 	st, backend, err := openStore(cfg, nil)
@@ -56,31 +58,31 @@ func runSelftest(cfg config.Config) {
 		}
 	}
 
-	// 3. AI: canary sentence → JSON verdict + latency.
+	// 3. AI: canary sentence → JSON verdict + latency (full model chain).
 	if cfg.AIKey == "" {
 		fmt.Println("[FAIL] ai: BOT_AI_API_KEY is not set")
 		ok = false
 	} else {
-		aicfg := ai.New(ai.Config{
+		client := ai.NewClient(ai.ClientConfig{
 			BaseURL: cfg.AIBaseURL,
 			APIKey:  cfg.AIKey,
-			Model:   cfg.AIModel,
+			Models:  cfg.AIEffectiveModels(),
 			Timeout: cfg.AITimeout,
-			Retries: 2,
 		})
 		start := time.Now()
-		v, okAI := ai.Classify(ctx, aicfg, "判断这句话是不是广告：专业办理各种证件 加V信 xxx")
+		res, okAI := client.ClassifyText(ctx, "判断这句话是不是广告：专业办理各种证件 加V信 xxx", "message")
 		elapsed := time.Since(start)
 		if !okAI {
-			fmt.Printf("[FAIL] ai: classify failed or undecided (%v)\n", elapsed.Round(time.Millisecond))
+			fmt.Printf("[FAIL] ai: classify failed (chain exhausted, %.0fms)\n", float64(elapsed.Microseconds())/1000)
 			ok = false
 		} else {
-			fmt.Printf("[PASS] ai: is_ad=%v category=%s confidence=%.2f reason=%q (%.0fms)\n",
-				v.IsAd, v.Category, v.Confidence, v.Reason, float64(elapsed.Microseconds())/1000)
+			v := res.Verdict
+			fmt.Printf("[PASS] ai: model=%s fallback=%v is_ad=%v category=%s confidence=%.2f reason=%q (%.0fms)\n",
+				res.Model, res.Fallback, v.IsAd, v.ControlledCategory(), v.Confidence, v.Reason, float64(elapsed.Microseconds())/1000)
 		}
 	}
 
-	// 4. Telegram: getMe.
+	// 4. Telegram: getMe (single call — safe next to a running poller).
 	if cfg.Token == "" {
 		fmt.Println("[FAIL] telegram: BOT_TOKEN is not set")
 		ok = false

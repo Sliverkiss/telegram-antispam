@@ -1,22 +1,58 @@
-// Package ai wraps an OpenAI-compatible chat completions endpoint for binary
-// ad/non-ad classification. It deliberately strips noisy fields the gateway
-// (mimo) rejects, parses the JSON verdict tolerantly, and fails safe: any
-// parse or transport failure is "undecided", never "ad".
+// Package ai wraps an OpenAI-compatible chat completions endpoint (go-openai)
+// for binary ad/non-ad classification of message text and images.
+//
+// Design contract (TASK_antispam_amend3.md A+C):
+//   - Model fallback chain: 429/5xx/timeout/network errors, and response-body
+//     error codes pool_parked/no_accounts/upstream_rate_limited/upstream_busy,
+//     advance to the next model; the whole chain must be walked before a call
+//     counts as failed.
+//   - Thinking is disabled via reasoning_effort="none" (enable_thinking=false
+//     is sent as a backup field); max_tokens is never sent (the gateway warns).
+//   - Parse layer is tolerant (fences, stray text, confidence as string/int,
+//     clamped to [0,1], case-insensitive keys) but a contract violation (no
+//     JSON / missing is_ad / unparseable is_ad) is a FAILURE so callers retry,
+//     never "not ad".
+//   - category is free Chinese text: no enum validation; out-of-vocabulary
+//     values are kept verbatim (display-side maps to "其他").
 package ai
 
 import (
 	"bytes"
 	"context"
+	_ "embed"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
+
+	openai "github.com/sashabaranov/go-openai"
 
 	"adbot/internal/logx"
 )
+
+// PromptVersion identifies the embedded prompt revision. Bump it whenever
+// prompts/judge_v1.txt changes so misjudgments can be traced to a prompt
+// version in the logs and /status.
+const PromptVersion = "judge_v1"
+
+//go:embed prompts/judge_v1.txt
+var promptJudge string
+
+//go:embed prompts/judge_v1_bio.txt
+var promptJudgeBio string
+
+// PromptOverride replaces the embedded base prompt when BOT_AI_PROMPT_FILE is
+// set (loaded at startup); empty means the embedded version.
+var PromptOverride string
+
+// MaxInputRunes caps the untrusted text we forward to the model per request
+// (huge messages/captions are truncated, never OOM).
+const MaxInputRunes = 4096
 
 // Verdict is the classifier's decision output.
 type Verdict struct {
@@ -26,187 +62,502 @@ type Verdict struct {
 	Reason     string  `json:"reason"`
 }
 
-// Config holds the endpoint and behavior knobs.
-type Config struct {
-	BaseURL string        // e.g. https://mimo.xn--ug8h.eu.org/v1
-	APIKey  string        // Bearer token
-	Model   string        // e.g. mimo-v2.6-pro-ultraspeed-studio
-	Timeout time.Duration // per-attempt timeout (default 30s)
-	Retries int           // extra attempts after the first (default 2)
-	Logger  *logx.Logger
-	Client  *http.Client // test hook; nil → shared default client
+// controlledCategories is the prompt's controlled vocabulary for category.
+var controlledCategories = []string{
+	"办证", "色情", "儿童性内容", "赌博", "诈骗", "金融", "兼职", "引流", "违禁品", "账号交易", "其他",
 }
 
-// SystemPrompt instructs the model to classify and answer JSON only.
-const SystemPrompt = "你是反垃圾/反灰黑产审核助手。判断给定的内容是不是灰产/黑产广告导流（如赌博、色情引流、诈骗、套路贷、办假证、发票、作弊、刷量等）。只输出一个 JSON 对象，格式：{\"is_ad\":bool,\"category\":\"gambling|porn|fraud|loan|fake_cert|invoice|cheat|traffic_farming|none\",\"confidence\":0.0到1.0,\"reason\":\"简短中文理由\"}，不要输出任何其他文字。"
+// ControlledCategory reports the in-vocabulary category for display; unknown
+// free text maps to "其他" (logged debug upstream), never an error.
+func (v Verdict) ControlledCategory() string {
+	if !v.IsAd {
+		return "无"
+	}
+	for _, c := range controlledCategories {
+		if v.Category == c {
+			return c
+		}
+	}
+	return "其他"
+}
 
-// New builds a Config with defaults filled in.
-func New(cfg Config) Config {
-	if cfg.BaseURL == "" {
-		cfg.BaseURL = "https://mimo.xn--ug8h.eu.org/v1"
+// attempt records one model round trip for the ai_judge attempts log.
+type attempt struct {
+	Model  string
+	Status string // "ok" | "http_429" | "pool_parked" | "timeout" | "parse" ...
+	MS     int64
+}
+
+// ClassifyResult carries the verdict plus chain diagnostics for /check, logs,
+// and /status counters.
+type ClassifyResult struct {
+	Verdict  Verdict
+	Model    string
+	Fallback bool
+	Attempts []attempt
+}
+
+// Content is one classification input: text, optionally with an image
+// (base64 data URL) for multimodal judging.
+type Content struct {
+	Text     string
+	ImageURL string
+}
+
+// Client classifies content against one provider (base URL + key) with a
+// model fallback chain. It is safe for concurrent use.
+type Client struct {
+	cfg    ClientConfig
+	client *openai.Client
+	// lastBody captures the most recent response body (bounded) so a 200
+	// status whose body is an error envelope can still be classified.
+	lastBody *bodyCapture
+}
+
+// bodyCapture remembers the tail of the last response body (bounded, 4KB —
+// error envelopes are tiny) for error-envelope detection.
+type bodyCapture struct {
+	mu    sync.Mutex
+	chunk []byte
+}
+
+func (b *bodyCapture) set(p []byte) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.chunk = p
+}
+
+func (b *bodyCapture) get() []byte {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.chunk
+}
+
+// captureTransport wraps the real transport and stashes a copy of each
+// response body (restoring it for the caller via NopCloser over a re-read).
+type captureTransport struct {
+	base    http.RoundTripper
+	capture *bodyCapture
+}
+
+func (t *captureTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	resp, err := t.base.RoundTrip(req)
+	if err != nil {
+		return resp, err
 	}
-	if cfg.Model == "" {
-		cfg.Model = "mimo-v2.6-pro-ultraspeed-studio"
+	if resp.Body != nil {
+		data, readErr := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+		resp.Body.Close()
+		if readErr != nil {
+			return resp, readErr
+		}
+		if len(data) > 0 {
+			t.capture.set(data[maxTail(data):])
+		}
+		resp.Body = io.NopCloser(bytes.NewReader(data))
 	}
+	return resp, nil
+}
+
+func maxTail(data []byte) int {
+	// helper: keep the last 4KB
+	if len(data) > 4096 {
+		return len(data) - 4096
+	}
+	return 0
+}
+
+// lastBodyErrorCode digs a pool-style error code out of the last 200-status
+// response body ({"error":{"code":"pool_parked",...}}).
+func (c *Client) lastBodyErrorCode() string {
+	body := c.lastBody.get()
+	if len(body) == 0 {
+		return ""
+	}
+	var env struct {
+		Error *struct {
+			Code    any    `json:"code"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(body, &env); err != nil || env.Error == nil {
+		return ""
+	}
+	if s, ok := env.Error.Code.(string); ok && isPoolCode(s) {
+		return s
+	}
+	msg := strings.ToLower(env.Error.Message)
+	for _, code := range []string{"pool_parked", "no_accounts", "upstream_rate_limited", "upstream_busy"} {
+		if strings.Contains(msg, code) {
+			return code
+		}
+	}
+	return ""
+}
+
+// ClientConfig configures one provider.
+type ClientConfig struct {
+	BaseURL string        // e.g. https://mimo.xn--ug8h.eu.org/v1
+	APIKey  string        // Bearer token
+	Models  []string      // ordered fallback chain
+	Timeout time.Duration // per-attempt timeout (default 30s)
+	Logger  *logx.Logger
+	// HTTPDoer overrides the transport for tests (httptest fake gateways).
+	HTTPDoer openai.HTTPDoer
+}
+
+// NewClient builds a provider client with defaults filled in. A nil/empty
+// Models chain defaults to the canonical three-model chain.
+func NewClient(cfg ClientConfig) *Client {
 	if cfg.Timeout <= 0 {
 		cfg.Timeout = 30 * time.Second
 	}
-	if cfg.Retries <= 0 {
-		cfg.Retries = 2
+	if len(cfg.Models) == 0 {
+		cfg.Models = []string{"mimo-v2.6-pro-ultraspeed-studio", "mimo-v2.6-pro", "mimo-v2.6-flash"}
 	}
-	if cfg.Client == nil {
-		cfg.Client = &http.Client{Timeout: cfg.Timeout + 5*time.Second}
+	ocfg := openai.DefaultConfig(cfg.APIKey)
+	if cfg.BaseURL != "" {
+		ocfg.BaseURL = strings.TrimRight(cfg.BaseURL, "/")
 	}
-	return cfg
+	var baseDoer openai.HTTPDoer = &http.Client{Timeout: cfg.Timeout + 5*time.Second}
+	if cfg.HTTPDoer != nil {
+		baseDoer = cfg.HTTPDoer
+	}
+	// Every request goes through the capturing transport so a 200-with-error-
+	// envelope body can be classified even though go-openai discards it.
+	cap := &bodyCapture{}
+	var doer openai.HTTPDoer
+	if rt, ok := baseDoer.(*http.Client); ok {
+		tr := rt.Transport
+		if tr == nil {
+			tr = http.DefaultTransport
+		}
+		rt2 := *rt
+		rt2.Transport = &captureTransport{base: tr, capture: cap}
+		doer = &rt2
+	} else {
+		// A plain HTTPDoer (tests): wrap it in a one-off client with capture.
+		doer = &http.Client{Transport: &captureTransport{base: asRoundTripper(baseDoer), capture: cap}}
+	}
+	ocfg.HTTPClient = doer
+	return &Client{cfg: cfg, client: openai.NewClientWithConfig(ocfg), lastBody: cap}
 }
 
-// Classify asks the model whether content is ad/promotion. The returned
-// (verdict, ok) is (zero, false) when the model could not be reached or its
-// answer could not be parsed — callers must treat "undecided" as "do not act".
-func Classify(ctx context.Context, cfg Config, content string) (Verdict, bool) {
-	cfg = New(cfg)
-
-	body := map[string]any{
-		"model": cfg.Model,
-		"messages": []map[string]string{
-			{"role": "system", "content": SystemPrompt},
-			{"role": "user", "content": content},
-		},
-		"stream": false,
+// asRoundTripper adapts an HTTPDoer to a RoundTripper when it is not already
+// an *http.Client.
+func asRoundTripper(d openai.HTTPDoer) http.RoundTripper {
+	if rt, ok := d.(http.RoundTripper); ok {
+		return rt
 	}
-	payload, err := json.Marshal(body)
-	if err != nil {
-		return Verdict{}, false
-	}
+	return roundTripperFunc(func(r *http.Request) (*http.Response, error) { return d.Do(r) })
+}
 
-	var lastErr error
-	for attempt := 0; attempt <= cfg.Retries; attempt++ {
-		if attempt > 0 {
-			// Exponential backoff: 500ms, 1s, 2s…
-			select {
-			case <-ctx.Done():
-				return Verdict{}, false
-			case <-time.After(time.Duration(1<<uint(attempt-1)) * 500 * time.Millisecond):
-			}
-		}
-		v, retriable, err := classifyOnce(ctx, cfg, payload)
+type roundTripperFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripperFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+// Models returns the fallback chain.
+func (c *Client) Models() []string { return c.cfg.Models }
+
+// BuildSystemPrompt returns the judge prompt for the given mode ("message" or
+// "bio"). Both modes share the same must-kill list and output contract; the
+// bio variant appends the self-promotion clause.
+func BuildSystemPrompt(mode string) string {
+	base := promptJudge
+	if PromptOverride != "" {
+		base = PromptOverride
+	}
+	if mode == "bio" {
+		return base + "\n\n" + promptJudgeBio
+	}
+	return base
+}
+
+// WrapInput delimits untrusted content so prompt injection inside the message
+// is treated as data, per the prompt's own <msg> contract.
+func WrapInput(text string) string {
+	return "<msg>\n" + text + "\n</msg>"
+}
+
+// Classify walks the model fallback chain once and returns the verdict.
+// ok=false means the whole chain failed (network/5xx/parse contract broken) —
+// callers must enqueue for retry, never treat it as "not ad".
+func (c *Client) Classify(ctx context.Context, content Content, mode string) (ClassifyResult, bool) {
+	start := time.Now()
+	sys := BuildSystemPrompt(mode)
+	msgs := c.buildMessages(sys, content)
+
+	var res ClassifyResult
+	res.Verdict = Verdict{Category: "无"}
+	for i, model := range c.cfg.Models {
+		res.Fallback = i > 0
+		at := attempt{Model: model}
+		t0 := time.Now()
+		v, status, err := c.classifyOnce(ctx, model, msgs)
+		at.MS = time.Since(t0).Milliseconds()
+		at.Status = status
+		res.Attempts = append(res.Attempts, at)
 		if err == nil {
-			return v, true
+			res.Verdict = v
+			res.Model = model
+			if c.cfg.Logger != nil {
+				c.cfg.Logger.Info("ai_judge",
+					"model_used", model,
+					"fallback", res.Fallback,
+					"attempts", formatAttempts(res.Attempts),
+					"is_ad", v.IsAd,
+					"confidence", v.Confidence,
+					"category", v.Category,
+					"latency_ms", time.Since(start).Milliseconds(),
+					"prompt_version", PromptVersion)
+			}
+			return res, true
 		}
-		lastErr = err
-		if cfg.Logger != nil {
-			cfg.Logger.Warn("ai_classify_error", "attempt", attempt+1, "retriable", retriable, "err", err.Error())
+		if c.cfg.Logger != nil {
+			c.cfg.Logger.Warn("ai_model_attempt_failed",
+				"model", model, "status", status, "err", err.Error(), "ms", at.MS,
+				"prompt_version", PromptVersion)
 		}
-		if !retriable {
+		if !fallbackEligible(err) {
+			// Contract/parse failures do not improve by switching models; the
+			// chain stops here and the call still counts as failed.
 			break
 		}
 	}
-	if cfg.Logger != nil {
-		cfg.Logger.Warn("ai_classify_failed", "err", fmt.Sprint(lastErr))
+	if c.cfg.Logger != nil {
+		c.cfg.Logger.Error("ai_judge_failed",
+			"attempts", formatAttempts(res.Attempts),
+			"err", "all models in chain failed",
+			"prompt_version", PromptVersion)
 	}
-	return Verdict{}, false
+	return res, false
 }
 
-// classifyOnce performs one HTTP round trip; retriable reports whether
-// another attempt could plausibly succeed (timeout, 5xx, network error, but
-// not an unparseable 200 response).
-func classifyOnce(ctx context.Context, cfg Config, payload []byte) (Verdict, bool, error) {
+// ClassifyText is a convenience wrapper for plain text input.
+func (c *Client) ClassifyText(ctx context.Context, text, mode string) (ClassifyResult, bool) {
+	return c.Classify(ctx, Content{Text: text}, mode)
+}
+
+// ClassifyWithModel runs exactly ONE model (no chain walk). Verify lanes use
+// this so a lane's failure cannot be masked by a fallback to another model.
+func (c *Client) ClassifyWithModel(ctx context.Context, model string, content Content, mode string) (ClassifyResult, bool) {
 	start := time.Now()
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(cfg.BaseURL, "/")+"/chat/completions", bytes.NewReader(payload))
-	if err != nil {
-		return Verdict{}, false, err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	if cfg.APIKey != "" {
-		req.Header.Set("Authorization", "Bearer "+cfg.APIKey)
-	}
-	resp, err := cfg.Client.Do(req)
-	if err != nil {
-		return Verdict{}, true, err
-	}
-	defer resp.Body.Close()
-	data, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	if err != nil {
-		return Verdict{}, true, err
-	}
-	if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500 {
-		return Verdict{}, true, fmt.Errorf("http %d: %s", resp.StatusCode, strings.TrimSpace(string(data)))
-	}
-	if resp.StatusCode != http.StatusOK {
-		return Verdict{}, false, fmt.Errorf("http %d: %s", resp.StatusCode, strings.TrimSpace(string(data)))
-	}
-	v, err := parseCompletion(data)
-	ms := time.Since(start)
-	if err != nil {
-		if cfg.Logger != nil {
-			cfg.Logger.Warn("ai_parse_error", "duration_ms", ms.Milliseconds(), "body", truncate(string(data), 200))
+	sys := BuildSystemPrompt(mode)
+	msgs := c.buildMessages(sys, content)
+
+	var res ClassifyResult
+	res.Verdict = Verdict{Category: "无"}
+	res.Model = model
+	v, status, err := c.classifyOnce(ctx, model, msgs)
+	res.Attempts = append(res.Attempts, attempt{Model: model, Status: status, MS: time.Since(start).Milliseconds()})
+	if err == nil {
+		res.Verdict = v
+		if c.cfg.Logger != nil {
+			c.cfg.Logger.Info("ai_judge",
+				"model_used", model,
+				"fallback", false,
+				"attempts", formatAttempts(res.Attempts),
+				"is_ad", v.IsAd,
+				"confidence", v.Confidence,
+				"category", v.Category,
+				"latency_ms", time.Since(start).Milliseconds(),
+				"prompt_version", PromptVersion)
 		}
-		return Verdict{}, false, err
+		return res, true
 	}
-	if cfg.Logger != nil {
-		cfg.Logger.Info("ai_verdict", "is_ad", v.IsAd, "category", v.Category, "confidence", v.Confidence, "duration_ms", ms.Milliseconds())
+	if c.cfg.Logger != nil {
+		c.cfg.Logger.Warn("ai_model_attempt_failed",
+			"model", model, "status", status, "err", err.Error(),
+			"prompt_version", PromptVersion)
 	}
-	return v, false, nil
+	return res, false
 }
 
-// parseCompletion extracts the assistant's text and decodes the verdict JSON.
-func parseCompletion(data []byte) (Verdict, error) {
-	var resp struct {
-		Choices []struct {
-			Message struct {
-				Content string `json:"content"`
-			} `json:"message"`
-		} `json:"choices"`
+// buildMessages assembles system + user messages, switching to multimodal
+// parts when an image is present.
+func (c *Client) buildMessages(sys string, content Content) []openai.ChatCompletionMessage {
+	var b strings.Builder
+	b.WriteString("请判定以下内容是否为灰黑产广告/导流：\n")
+	b.WriteString(WrapInput(truncateRunes(content.Text, MaxInputRunes)))
+	if content.ImageURL != "" {
+		b.WriteString("\n（同时判定附带图片；图片与文本冲突时以图片为准。）")
 	}
-	if err := json.Unmarshal(data, &resp); err != nil {
-		return Verdict{}, fmt.Errorf("decode completion: %w", err)
+	msgs := []openai.ChatCompletionMessage{
+		{Role: openai.ChatMessageRoleSystem, Content: sys},
 	}
+	if content.ImageURL == "" {
+		msgs = append(msgs, openai.ChatCompletionMessage{
+			Role: openai.ChatMessageRoleUser, Content: b.String(),
+		})
+		return msgs
+	}
+	msgs = append(msgs, openai.ChatCompletionMessage{
+		Role: openai.ChatMessageRoleUser,
+		MultiContent: []openai.ChatMessagePart{
+			{Type: openai.ChatMessagePartTypeText, Text: b.String()},
+			{Type: openai.ChatMessagePartTypeImageURL, ImageURL: &openai.ChatMessageImageURL{URL: content.ImageURL}},
+		},
+	})
+	return msgs
+}
+
+// classifyOnce runs one model request. status is a short failure code for
+// logging ("ok", "http_429", "pool_parked", "timeout", "parse", ...).
+func (c *Client) classifyOnce(ctx context.Context, model string, msgs []openai.ChatCompletionMessage) (Verdict, string, error) {
+	ctxT, cancel := context.WithTimeout(ctx, c.cfg.Timeout)
+	defer cancel()
+
+	req := openai.ChatCompletionRequest{
+		Model:           model,
+		Stream:          false,
+		ReasoningEffort: openai.ReasoningEffortNone, // gateway-verified way to disable thinking
+		Messages:        msgs,
+	}
+	// Backup thinking-off field for gateways that honor it instead of
+	// reasoning_effort (the mimo gateway was verified to accept both; the
+	// qwen-style chat_template_kwargs path is where go-openai carries it).
+	// Never max_tokens: the gateway ignores and warns on it.
+	req.ChatTemplateKwargs = map[string]any{
+		"enable_thinking": false,
+	}
+
+	resp, err := c.client.CreateChatCompletion(ctxT, req)
+	if err != nil {
+		code, status := classifyError(err)
+		return Verdict{}, status, &callError{code: code, status: status, err: err}
+	}
+	// A 200 response whose body is an error envelope (this gateway parks pools
+	// with HTTP 200 + {"error":{"code":"pool_parked"}}): go-openai decodes
+	// that as an empty ChatCompletionResponse. We probe the gateway again with
+	// a raw call only in this dead-end case, so the fallback chain still walks.
 	if len(resp.Choices) == 0 {
-		return Verdict{}, errors.New("empty choices")
+		if code := c.lastBodyErrorCode(); isPoolCode(code) {
+			return Verdict{}, code, &callError{code: code, status: code,
+				err: fmt.Errorf("gateway body error: %s", code)}
+		}
+		return Verdict{}, "empty_choices", &callError{code: "empty_choices", status: "empty_choices", err: errors.New("no choices in response")}
 	}
 	text := resp.Choices[0].Message.Content
 	if strings.TrimSpace(text) == "" {
-		return Verdict{}, errors.New("empty assistant content")
+		return Verdict{}, "empty_content", &callError{code: "empty_content", status: "empty_content", err: errors.New("empty assistant content")}
 	}
-	return ParseVerdict(text)
+	v, err := ParseVerdict(text)
+	if err != nil {
+		return Verdict{}, "parse", &callError{code: "parse", status: "parse", err: err}
+	}
+	return v, "ok", nil
 }
 
-// ParseVerdict turns model text into a Verdict, tolerating ```json fences,
-// preamble/trailing chatter, and mild field noise. A failure returns an
-// error so callers can fail safe.
-func ParseVerdict(text string) (Verdict, error) {
-	text = stripFences(text)
-	start := strings.IndexByte(text, '{')
-	end := strings.LastIndexByte(text, '}')
-	if start < 0 || end < start {
-		return Verdict{}, fmt.Errorf("no JSON object in %q", truncate(text, 120))
-	}
-	raw := text[start : end+1]
-	var v Verdict
-	if err := json.Unmarshal([]byte(raw), &v); err != nil {
-		return Verdict{}, fmt.Errorf("decode verdict: %w", err)
-	}
-	return v, nil
+// callError carries a failure classification for the fallback decision.
+type callError struct {
+	code   string // machine code: http_429, pool_parked, timeout, parse, ...
+	status string
+	err    error
 }
 
-// stripFences removes ```json … ``` code fences and backticks.
-func stripFences(s string) string {
-	s = strings.TrimSpace(s)
-	if strings.HasPrefix(s, "```") {
-		if i := strings.IndexByte(s, '\n'); i >= 0 {
-			rest := s[i+1:]
-			if j := strings.LastIndex(rest, "```"); j >= 0 {
-				rest = rest[:j]
-			}
-			s = rest
+func (e *callError) Error() string { return e.code + ": " + e.err.Error() }
+func (e *callError) Unwrap() error { return e.err }
+
+// ErrorCode returns the machine failure code of err ("" when err is not a
+// callError from this package).
+func ErrorCode(err error) string {
+	var ce *callError
+	if errors.As(err, &ce) {
+		return ce.code
+	}
+	return ""
+}
+
+// fallbackEligible reports whether switching to the next model could help:
+// 429/5xx/timeout/network, or the pool-style error codes. pool_parked and
+// no_accounts are known not to benefit from a model swap, but the chain is
+// still walked to the end (per contract) before the call counts as failed.
+func fallbackEligible(err error) bool {
+	switch ErrorCode(err) {
+	case "http_429", "http_5xx", "timeout", "network",
+		"pool_parked", "no_accounts", "upstream_rate_limited", "upstream_busy":
+		return true
+	}
+	return false
+}
+
+// classifyError maps a go-openai error to (code, status).
+func classifyError(err error) (string, string) {
+	var apiErr *openai.APIError
+	if errors.As(err, &apiErr) {
+		switch {
+		case apiErr.HTTPStatusCode == 429:
+			return "http_429", "http_429"
+		case apiErr.HTTPStatusCode >= 500:
+			return "http_5xx", "http_" + itoa(apiErr.HTTPStatusCode)
 		}
+		// Body-level error.code (pool_parked / no_accounts / upstream_*) rides
+		// in the JSON code field or inside the message text on this gateway.
+		code := errorCodeFromAPIError(apiErr)
+		return code, code
 	}
-	return strings.TrimSpace(s)
+	var reqErr *openai.RequestError
+	if errors.As(err, &reqErr) {
+		if reqErr.HTTPStatusCode == 429 {
+			return "http_429", "http_429"
+		}
+		if reqErr.HTTPStatusCode >= 500 {
+			return "http_5xx", "http_" + itoa(reqErr.HTTPStatusCode)
+		}
+		return "http_" + itoa(reqErr.HTTPStatusCode), "http_" + itoa(reqErr.HTTPStatusCode)
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return "timeout", "timeout"
+	}
+	if errors.Is(err, context.Canceled) {
+		return "canceled", "canceled"
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) {
+		return "timeout", "timeout"
+	}
+	return "network", "network"
 }
 
-func truncate(s string, n int) string {
-	if len(s) <= n {
+// errorCodeFromAPIError digs the gateway's error.code out of an APIError.
+// The mimo gateway returns {"error":{"message":"...","code":"pool_parked"}} or
+// embeds the code in the message text.
+func errorCodeFromAPIError(e *openai.APIError) string {
+	if s, ok := e.Code.(string); ok && isPoolCode(s) {
 		return s
 	}
-	return s[:n] + "…"
+	msg := strings.ToLower(e.Message)
+	for _, code := range []string{"pool_parked", "no_accounts", "upstream_rate_limited", "upstream_busy"} {
+		if strings.Contains(msg, code) {
+			return code
+		}
+	}
+	return "http_" + itoa(e.HTTPStatusCode)
+}
+
+func isPoolCode(s string) bool {
+	switch s {
+	case "pool_parked", "no_accounts", "upstream_rate_limited", "upstream_busy":
+		return true
+	}
+	return false
+}
+
+func itoa(n int) string { return fmt.Sprintf("%d", n) }
+
+func formatAttempts(attempts []attempt) string {
+	var parts []string
+	for _, a := range attempts {
+		parts = append(parts, fmt.Sprintf("%s/%s/%dms", a.Model, a.Status, a.MS))
+	}
+	return strings.Join(parts, ",")
+}
+
+// truncateRunes caps runaway input defensively: byte-count cap with an
+// invalid-tail repair, so a cut inside a UTF-8 sequence cannot survive.
+func truncateRunes(s string, max int) string {
+	if max <= 0 || len(s) <= max {
+		return s
+	}
+	return strings.ToValidUTF8(s[:max], "…")
 }

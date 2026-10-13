@@ -1,9 +1,15 @@
 // adbot is a Telegram anti-spam/promotion bot: it screens member-join bios
-// and in-group messages, keeps a watchlist, maintains sha1 signature libraries
-// (bio + message), and enforces ban/kick — deleting only the triggering ad
-// message. State persists in memory by default (BOT_STORE=memory) with a
-// TTL janitor; Redis/file backends are opt-in. The Telegram client is
-// github.com/go-telegram/bot v1.27.0 wrapped behind a thin internal interface.
+// and in-group messages (text + photo multimodal), keeps a watchlist,
+// maintains sha1 signature libraries (bio + message) with SimHash
+// near-duplicate matching, and enforces ban/kick — deleting only the
+// triggering ad message. AI judgment runs a model fallback chain with
+// fixed-interval background retries and a local rule engine terminal
+// fallback. State persists in memory by default (BOT_STORE=memory) with a
+// TTL janitor; Redis backends are opt-in (file is explicitly not implemented
+// and falls back to memory with a WARN). The Telegram client is
+// github.com/go-telegram/bot v1.27.0 and the AI client
+// github.com/sashabaranov/go-openai v1.43.0, both behind thin internal
+// interfaces.
 package main
 
 import (
@@ -14,6 +20,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -21,17 +28,24 @@ import (
 	"adbot/internal/bot"
 	"adbot/internal/config"
 	"adbot/internal/logx"
+	"adbot/internal/retryq"
 	"adbot/internal/server"
 	"adbot/internal/store"
 	"adbot/internal/telegram"
 )
 
 func main() {
-	selftest := flag.Bool("selftest", false, "run connectivity acceptance checks and exit")
+	selftest := flag.Bool("selftest", false, "run connectivity acceptance checks (getMe only, no polling) and exit")
+	promptEval := registerPromptEvalFlags(flag.CommandLine)
 	flag.Parse()
 
 	cfg := config.Load()
 	log := cfg.Logger()
+
+	// -prompteval is the only explicitly-outbound path; run it and exit.
+	if promptEval.enabled {
+		os.Exit(runPromptEval(cfg, promptEvalModels(cfg, promptEval), promptEval.samples))
+	}
 
 	if *selftest {
 		runSelftest(cfg)
@@ -44,11 +58,25 @@ func main() {
 	}
 
 	// Startup summary (redacted).
-	log.Info("startup", "version", cfg.Version, "store", cfg.Store, "dry_run", cfg.DryRun)
+	log.Info("startup", "version", cfg.Version, "store", cfg.Store, "dry_run", cfg.DryRun,
+		"prompt_version", ai.PromptVersion)
 
 	if err := cfg.Validate(); err != nil {
 		log.Error("config_invalid", "err", err.Error())
 		os.Exit(2)
+	}
+
+	// BOT_AI_PROMPT_FILE overrides the embedded judge prompt (versioned).
+	if cfg.AIPromptFile != "" {
+		data, err := os.ReadFile(cfg.AIPromptFile)
+		if err != nil {
+			log.Warn("prompt_file_error", "path", cfg.AIPromptFile, "err", err.Error(),
+				"summary", "继续使用内嵌提示词")
+		} else if len(data) > 0 {
+			ai.PromptOverride = strings.TrimSpace(string(data))
+			log.Warn("prompt_file_loaded", "path", cfg.AIPromptFile,
+				"summary", "内嵌提示词已被文件覆盖；注意版本追踪由文件自行维护")
+		}
 	}
 
 	// BOT_CHATS whitelist warning (all groups will be left when empty).
@@ -56,7 +84,8 @@ func main() {
 		log.Warn("chats_not_configured", "hint", "BOT_CHATS 未配置，将退出所有群，只应答私聊命令")
 	}
 
-	// Store: default memory; redis/file only when explicitly requested.
+	// Store: default memory; redis only when explicitly requested. The file
+	// backend is explicitly NOT implemented (memory is the final choice).
 	st, storeName, err := openStore(cfg, log)
 	if err != nil {
 		log.Error("store_open_error", "err", err.Error())
@@ -70,16 +99,24 @@ func main() {
 		log.Warn("ai_key_missing", "summary", "BOT_AI_API_KEY 未配置：将跳过 AI 判定，绝不误封")
 	}
 
-	// AI classifier.
-	classify := func(ctx context.Context, content string) (ai.Verdict, bool) {
-		return ai.Classify(ctx, ai.Config{
-			BaseURL: cfg.AIBaseURL,
-			APIKey:  cfg.AIKey,
-			Model:   cfg.AIModel,
-			Timeout: cfg.AITimeout,
-			Retries: 2,
-			Logger:  log.WithComponent("ai"),
-		}, content)
+	// AI provider chain: primary + optional fallback provider.
+	primary := ai.NewClient(ai.ClientConfig{
+		BaseURL: cfg.AIBaseURL,
+		APIKey:  cfg.AIKey,
+		Models:  cfg.AIEffectiveModels(),
+		Timeout: cfg.AITimeout,
+		Logger:  log.WithComponent("ai"),
+	})
+	chain := providerChain{primary: primary, cfg: cfg, log: log.WithComponent("ai")}
+
+	// Verify closure: 3 concurrent lanes on the verify models, per-lane timeout.
+	verify := func(ctx context.Context, content ai.Content) ai.VerifyResult {
+		return ai.Verify(ctx, primary, ai.VerifyConfig{
+			Votes:    cfg.VerifyVotes,
+			Models:   cfg.VerifyModels,
+			Majority: cfg.VerifyMajority,
+			Timeout:  cfg.VerifyTimeout,
+		}, nil, content)
 	}
 
 	// Telegram client (library-backed; real endpoint unless tests override).
@@ -89,13 +126,22 @@ func main() {
 		os.Exit(1)
 	}
 
-	b := bot.New(st, tg, classify, cfg, log.WithComponent("bot"))
+	b := bot.New(st, tg, chain, verify, cfg, log.WithComponent("bot"))
+
+	// Background retry queue: failed AI judgments re-run every 10s (fixed),
+	// max 5 rounds, then the local rule engine concludes. The janitor state is
+	// shared with /statusz.
+	sweepState := &SweepState{}
+	retryQ := retryq.New(b.RetryRound, cfg.RetryInterval, cfg.RetryMax, cfg.RetryQueue, log.WithComponent("retryq"))
+	b.RetryQ = retryQ
+	retryCtx, stopRetry := context.WithCancel(context.Background())
+	retryQ.Start(retryCtx)
 
 	// Janitor goroutine (TTL sweep + capacity caps), stop on shutdown.
-	janitorStop := startJanitor(b, cfg, log.WithComponent("janitor"))
+	janitorStop := startJanitor(b, cfg, log.WithComponent("janitor"), sweepState)
 
 	// HTTP server (port 3000 for belmo health checks).
-	srv := server.New(st, b, cfg, log.WithComponent("http"))
+	srv := server.New(st, b, sweepState, cfg, log.WithComponent("http"))
 	httpSrv := &http.Server{Addr: cfg.BotAddr, Handler: srv.Handler()}
 
 	// Register commands with Telegram + dispatch long-poll via the library.
@@ -105,13 +151,16 @@ func main() {
 	pollCtx, stopPoll := context.WithCancel(context.Background())
 	go runPoller(pollCtx, tg, cfg, b, log.WithComponent("poller"))
 
-	// Graceful shutdown: SIGINT/SIGTERM → stop poll, close store, shutdown http.
+	// Graceful shutdown: SIGINT/SIGTERM → stop poll, stop retry worker, stop
+	// janitor, close telegram, shutdown http.
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
 		<-sigCh
 		log.Info("shutdown_signal")
 		stopPoll()
+		stopRetry()
+		retryQ.Stop()
 		janitorStop()
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
@@ -129,9 +178,63 @@ func main() {
 	log.Info("shutdown_complete")
 }
 
+// promptEvalModels resolves which models -prompteval evaluates.
+func promptEvalModels(cfg config.Config, p *promptEvalFlags) []string {
+	if p.models != "" {
+		var out []string
+		for _, m := range strings.Split(p.models, ",") {
+			if m = strings.TrimSpace(m); m != "" {
+				out = append(out, m)
+			}
+		}
+		if len(out) > 0 {
+			return out
+		}
+	}
+	return cfg.AIEffectiveModels()
+}
+
+// providerChain routes classification through the primary provider's model
+// chain, then the fallback provider's chain when configured
+// (BOT_AI_FALLBACK_*). It implements bot.AIClassifier.
+type providerChain struct {
+	primary *ai.Client
+	cfg     config.Config
+	log     *logx.Logger
+}
+
+func (c providerChain) Classify(ctx context.Context, content ai.Content, mode string) (ai.ClassifyResult, bool) {
+	res, ok := c.primary.Classify(ctx, content, mode)
+	if ok {
+		return res, true
+	}
+	// Fallback provider (optional): same client shape, its own model chain.
+	if c.cfg.FallbackBaseURL != "" && c.cfg.FallbackAPIKey != "" {
+		models := c.cfg.FallbackModels
+		if len(models) == 0 {
+			models = c.primary.Models()
+		}
+		fb := ai.NewClient(ai.ClientConfig{
+			BaseURL: c.cfg.FallbackBaseURL,
+			APIKey:  c.cfg.FallbackAPIKey,
+			Models:  models,
+			Timeout: c.cfg.AITimeout,
+			Logger:  c.log,
+		})
+		c.log.Warn("ai_fallback_provider", "base_url", c.cfg.FallbackBaseURL)
+		res2, ok2 := fb.Classify(ctx, content, mode)
+		if ok2 {
+			res2.Model = "fallback:" + res2.Model
+			return res2, true
+		}
+	}
+	return res, false
+}
+
 // openStore wires memory (default) or explicitly-configured redis backends.
-// The file backend (BOT_STORE=file) is not implemented in this round; it falls
-// back to memory with a warning so the process still starts safely.
+// The file backend (BOT_STORE=file) is deliberately NOT implemented (belmo
+// has no writable filesystem; memory is the final choice): it WARNS and falls
+// back to memory so the process still starts safely.
 func openStore(cfg config.Config, log *logx.Logger) (store.Store, string, error) {
 	switch cfg.Store {
 	case "redis":
@@ -153,27 +256,32 @@ func openStore(cfg config.Config, log *logx.Logger) (store.Store, string, error)
 		}
 		return store.NewMemory(), "memory", nil
 	case "file":
-		log.Warn("file_store_unimplemented", "summary", "BOT_STORE=file 后端本轮未实现，回落到内存模式")
+		// Explicit non-implementation (design decision, not a bug): memory is
+		// the final choice; restart loses watchlist/signatures/stats.
+		log.Warn("file_store_unimplemented", "summary", "BOT_STORE=file 后端明确不实现（内存模式是最终选择），已回落到内存模式；重启会丢失观察名单/签名库/统计")
 		return store.NewMemory(), "memory", nil
 	default: // "memory"
 		return store.NewMemory(), "memory", nil
 	}
 }
 
-// registerCommands registers /start /help /status /check with Telegram.
+// registerCommands registers /start /help /status /check /report with Telegram.
 func registerCommands(tg *telegram.Client, log *logx.Logger) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	cmds := []telegram.BotCommand{
 		{Command: "start", Description: "查看在线状态与运行信息"},
 		{Command: "help", Description: "命令与行为说明"},
+		{Command: "report", Description: "回复消息举报，AI 审核处置"},
 		{Command: "status", Description: "管理状态（仅管理员）"},
 		{Command: "check", Description: "AI 判定测试（仅管理员）"},
 	}
 	return tg.SetMyCommands(ctx, cmds)
 }
 
-// runPoller drives the library's long-poll loop and forwards updates to the bot.
+// runPoller drives the library's long-poll loop and forwards updates to the
+// bot. Network errors are retried by the library with backoff (it never
+// exits on transient errors); the loop exits on ctx cancel.
 func runPoller(ctx context.Context, tg *telegram.Client, cfg config.Config, b *bot.Bot, log *logx.Logger) {
 	tg.RegisterDefaultHandler(func(ctx context.Context, u telegram.Update) {
 		b.NotePoll()

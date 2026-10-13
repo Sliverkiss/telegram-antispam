@@ -35,11 +35,16 @@ func Normalize(s string) string {
 // Signature returns the hex sha1 of the normalized string. Empty normalized
 // input yields "" (no signature for empty content).
 func Signature(s string) string {
-	n := Normalize(s)
-	if n == "" {
+	return SignatureOf(Normalize(s))
+}
+
+// SignatureOf hashes already-normalized text (callers that normalized once
+// and need the sha1 key without re-normalizing).
+func SignatureOf(normalized string) string {
+	if normalized == "" {
 		return ""
 	}
-	sum := sha1.Sum([]byte(n))
+	sum := sha1.Sum([]byte(normalized))
 	return hex.EncodeToString(sum[:])
 }
 

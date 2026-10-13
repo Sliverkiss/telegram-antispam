@@ -63,6 +63,8 @@ type Config struct {
 	AIModels           []string // model fallback chain (BOT_AI_MODELS)
 	AIModel            string   // single-model compat (BOT_AI_MODEL)
 	AITimeout          time.Duration
+	AIReasoningEffort  string // "none" default; overrides the thinking-off field
+	AIPromptFile       string // BOT_AI_PROMPT_FILE: override the embedded judge prompt
 	RetryInterval      time.Duration
 	RetryMax           int
 	RetryQueue         int
@@ -78,6 +80,7 @@ type Config struct {
 	LocalRulesEnabled  bool
 	LocalRuleThreshold int
 	LocalKeywords      []string // appended keyword list (BOT_LOCAL_KEYWORDS)
+	ReportDailyLimit   int      // BOT_REPORT_DAILY_LIMIT (default 3)
 
 	// Runtime / logging / admin ----------------------------------------------
 	PollTimeout int
@@ -123,6 +126,8 @@ func Load() Config {
 		AIModels:           models,
 		AIModel:            envOr("BOT_AI_MODEL", "mimo-v2.6-pro-ultraspeed-studio"),
 		AITimeout:          durationEnv("BOT_AI_TIMEOUT", 30*time.Second),
+		AIReasoningEffort:  envOr("BOT_AI_REASONING_EFFORT", "none"),
+		AIPromptFile:       os.Getenv("BOT_AI_PROMPT_FILE"),
 		RetryInterval:      durationEnv("BOT_AI_RETRY_INTERVAL", 10*time.Second),
 		RetryMax:           intEnv("BOT_AI_RETRY_MAX_ATTEMPTS", 5),
 		RetryQueue:         intEnv("BOT_AI_RETRY_QUEUE", 500),
@@ -130,7 +135,7 @@ func Load() Config {
 		VerifyVotes:        intEnv("BOT_AI_VERIFY_VOTES", 3),
 		VerifyModels:       csvList(envOr("BOT_AI_VERIFY_MODELS", "mimo-v2.6-flash")),
 		VerifyMajority:     intEnv("BOT_AI_VERIFY_MAJORITY", 2),
-		VerifyTimeout:      durationEnv("BOT_AI_VERIFY_TIMEOUT", 20*time.Second),
+		VerifyTimeout:      durationEnv("BOT_AI_VERIFY_TIMEOUT", 45*time.Second), // flash measured up to 23.5s; 20s misfires
 		FallbackBaseURL:    os.Getenv("BOT_AI_FALLBACK_BASE_URL"),
 		FallbackAPIKey:     os.Getenv("BOT_AI_FALLBACK_API_KEY"),
 		FallbackModels:     csvList(os.Getenv("BOT_AI_FALLBACK_MODELS")),
@@ -138,6 +143,7 @@ func Load() Config {
 		LocalRulesEnabled:  boolEnv("BOT_LOCAL_RULES_ENABLED", true),
 		LocalRuleThreshold: intEnv("BOT_LOCAL_RULE_THRESHOLD", 3),
 		LocalKeywords:      csvList(os.Getenv("BOT_LOCAL_KEYWORDS")),
+		ReportDailyLimit:   intEnv("BOT_REPORT_DAILY_LIMIT", 3),
 
 		PollTimeout: intEnv("BOT_POLL_TIMEOUT", 30),
 		Workers:     intEnv("BOT_WORKERS", 4),
@@ -239,6 +245,8 @@ func (c Config) Redacted() map[string]string {
 		"BOT_AI_API_KEY":            redactToken(c.AIKey),
 		"BOT_AI_MODELS":             strings.Join(c.AIEffectiveModels(), ","),
 		"BOT_AI_TIMEOUT":            c.AITimeout.String(),
+		"BOT_AI_REASONING_EFFORT":   c.AIReasoningEffort,
+		"BOT_AI_PROMPT_FILE":        c.AIPromptFile,
 		"BOT_AI_RETRY_INTERVAL":     c.RetryInterval.String(),
 		"BOT_AI_RETRY_MAX_ATTEMPTS": strconv.Itoa(c.RetryMax),
 		"BOT_AI_RETRY_QUEUE":        strconv.Itoa(c.RetryQueue),
@@ -254,6 +262,7 @@ func (c Config) Redacted() map[string]string {
 		"BOT_LOCAL_RULES_ENABLED":   strconv.FormatBool(c.LocalRulesEnabled),
 		"BOT_LOCAL_RULE_THRESHOLD":  strconv.Itoa(c.LocalRuleThreshold),
 		"BOT_LOCAL_KEYWORDS":        strings.Join(c.LocalKeywords, ","),
+		"BOT_REPORT_DAILY_LIMIT":    strconv.Itoa(c.ReportDailyLimit),
 		"BOT_POLL_TIMEOUT":          strconv.Itoa(c.PollTimeout),
 		"BOT_WORKERS":               strconv.Itoa(c.Workers),
 		"BOT_LOG_LEVEL":             c.LogLevel,
@@ -303,6 +312,7 @@ func UnrecognizedBotVars() []string {
 		"BOT_MAX_SUSPECTS": true, "BOT_MAX_SIGNATURES": true,
 		"BOT_AI_BASE_URL": true, "BOT_AI_API_KEY": true,
 		"BOT_AI_MODELS": true, "BOT_AI_MODEL": true, "BOT_AI_TIMEOUT": true,
+		"BOT_AI_REASONING_EFFORT": true, "BOT_AI_PROMPT_FILE": true,
 		"BOT_AI_RETRY_INTERVAL": true, "BOT_AI_RETRY_MAX_ATTEMPTS": true,
 		"BOT_AI_RETRY_QUEUE": true, "BOT_AI_MIN_CONFIDENCE": true,
 		"BOT_AI_VERIFY_VOTES": true, "BOT_AI_VERIFY_MODELS": true,
@@ -310,8 +320,8 @@ func UnrecognizedBotVars() []string {
 		"BOT_AI_FALLBACK_BASE_URL": true, "BOT_AI_FALLBACK_API_KEY": true,
 		"BOT_AI_FALLBACK_MODELS": true, "BOT_SIMHASH_DISTANCE": true,
 		"BOT_LOCAL_RULES_ENABLED": true, "BOT_LOCAL_RULE_THRESHOLD": true,
-		"BOT_LOCAL_KEYWORDS": true,
-		"BOT_POLL_TIMEOUT":   true, "BOT_WORKERS": true,
+		"BOT_LOCAL_KEYWORDS": true, "BOT_REPORT_DAILY_LIMIT": true,
+		"BOT_POLL_TIMEOUT": true, "BOT_WORKERS": true,
 		"BOT_LOG_LEVEL": true, "BOT_LOG_FORMAT": true,
 		"BOT_ADMIN_TOKEN": true, "BOT_VERSION": true,
 	}

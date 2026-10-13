@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"time"
 
+	"adbot/internal/ai"
 	"adbot/internal/config"
 	"adbot/internal/logx"
 	"adbot/internal/normalize"
@@ -20,12 +21,34 @@ type Inspector interface {
 	Stats() (poll, punished, aiCalls, aiFails int64)
 	DeleteStats() (deleted, failed int64)
 	Uptime() time.Duration
+	// Amend3 additions (all optional-capable via the narrow interface).
+	ExtraStats() (reports, localFallback, simhashHits int64)
+	PendingQueueLen() int
+	AIStatsSnapshot() AISnapshot
+}
+
+// AISnapshot is the AI-side counters the server renders (kept as plain data
+// so server does not import ai).
+type AISnapshot struct {
+	ModelCalls    map[string]int64
+	ModelOKs      map[string]int64
+	Fallbacks     int64
+	VerifyRounds  int64
+	VerifyFlipped int64
+	Reports       int64
+	LocalFallback int64
+}
+
+// SweepReporter feeds the janitor's last/next sweep into /statusz.
+type SweepReporter interface {
+	SweepSnapshot() (at time.Time, next time.Time, droppedSuspects, droppedSigs, remaining int64, ran bool)
 }
 
 // Server carries dependencies for building the mux.
 type Server struct {
 	Store      store.Store
 	Bot        Inspector
+	Sweeper    SweepReporter // nil = no janitor wired
 	Cfg        config.Config
 	AdminToken string
 	Version    string
@@ -34,13 +57,14 @@ type Server struct {
 }
 
 // New builds a Server from the full config.
-func New(st store.Store, bot Inspector, cfg config.Config, log *logx.Logger) *Server {
+func New(st store.Store, bot Inspector, sweep SweepReporter, cfg config.Config, log *logx.Logger) *Server {
 	if log == nil {
 		log = logx.New(nil, logx.Info, "text", "http")
 	}
 	return &Server{
 		Store:      st,
 		Bot:        bot,
+		Sweeper:    sweep,
 		Cfg:        cfg,
 		AdminToken: cfg.AdminToken,
 		Version:    cfg.Version,
@@ -110,9 +134,12 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	punished, _ := s.Store.Punished(ctx)
 	poll, _, aiCalls, aiFails := s.Bot.Stats()
 	deleted, deleteFails := s.Bot.DeleteStats()
+	reports, localFallback, simhashHits := s.Bot.ExtraStats()
+	pending := s.Bot.PendingQueueLen()
+	aiSnap := s.Bot.AIStatsSnapshot()
 
-	// Retention/sweep reporting best-effort: the janitor lives in main and is
-	// not wired into the server for this round beyond TTL config.
+	// Retention/sweep reporting: the janitor pushes each sweep result into the
+	// shared SweepState (main wires it in via the Sweeper field).
 	body := map[string]any{
 		"version":             s.Version,
 		"uptime_seconds":      int64(time.Since(s.StartedAt).Seconds()),
@@ -136,6 +163,35 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		"dry_run":             s.Cfg.DryRun,
 		"ai_ok":               true, // liveness is best-effort; errors counted above
 		"started_at":          s.StartedAt.Format(time.RFC3339),
+		// amend3 additions ---------------------------------------------------
+		"ai_models": s.Cfg.AIEffectiveModels(),
+		"ai_model_stats": map[string]any{
+			"calls": aiSnap.ModelCalls,
+			"oks":   aiSnap.ModelOKs,
+		},
+		"ai_fallbacks":         aiSnap.Fallbacks,
+		"ai_verify_rounds":     aiSnap.VerifyRounds,
+		"ai_verify_flipped":    aiSnap.VerifyFlipped,
+		"report_count":         reports,
+		"local_fallback_count": localFallback,
+		"simhash_hits":         simhashHits,
+		"pending_queue":        pending,
+		"prompt_version":       ai.PromptVersion,
+	}
+	// The sweeper block only appears when the janitor has run at least once.
+	if s.Sweeper != nil {
+		at, next, droppedSus, droppedSigs, remaining, ran := s.Sweeper.SweepSnapshot()
+		if ran {
+			body["last_sweep"] = map[string]any{
+				"at":                 at.Format(time.RFC3339),
+				"dropped_suspects":   droppedSus,
+				"dropped_signatures": droppedSigs,
+				"remaining_total":    remaining,
+			}
+			if next.After(time.Now()) {
+				body["next_sweep_in"] = next.Sub(time.Now()).String()
+			}
+		}
 	}
 	writeJSON(w, http.StatusOK, body)
 }

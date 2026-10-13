@@ -12,8 +12,9 @@
   对比结论：`go-telegram-bot-api/v5`（2021 停更）、`telebot.v3`（2024 停更）均不选。
   库只包裹在 `internal/telegram` 薄接口后，**库的 models 不泄漏到 bot 决策层**，
   决策层依赖接口 + fake，单测用 `WithServerURL` 指向 `httptest`，全程离线。
-- **AI 客户端**：不引库，保持手写 `net/http` POST（OpenAI 兼容）+ 重试。
-- **存储**：默认 `memory`（见下）；Redis / file 后端保留但仅显式启用。
+- **AI 客户端**：`github.com/sashabaranov/go-openai v1.43.0`（OpenAI 兼容），模型回退链、
+  多模态（图+文）、并发复核投票、body 捕获（网关 200+错误体）都包在 `internal/ai` 后。
+- **存储**：默认 `memory`（见下）；Redis 保留但仅显式启用，file **明确不实现**（回落内存+WARN）。
 
 ## 架构
 
@@ -28,15 +29,20 @@
                       ┌──────────────────────────────┐
                       │        bot（决策逻辑）          │
                       │  命令 / 入群 / 成员变更 / 发言    │
-                      │  白名单门 → 签名库 → AI → 处置    │
+                      │  白名单门 → 签名库 → AI → 投票    │
+                      │     → 重试队列 → 本地规则兜底     │
                       └──────┬──────────────┬────────┘
                              │              │
                   ┌──────────▼──┐    ┌──────▼─────────┐
                   │ internal/ai │    │ internal/store  │
-                  │ (OpenAI 兼容) │    │ Memory(默认)     │
-                  └─────────────┘    │ Redis/File(可选) │
-                                     │ + Sweeper/Janitor│
-                                     └─────────────────┘
+                  │ go-openai   │    │ Memory(默认)     │
+                  │ 回退链+投票   │    │ +SimHash 索引    │
+                  │ prompts/嵌入 │    │ +Sweeper/Janitor│
+                  └──────┬──────┘    └─────────────────┘
+                         │  ┌────────────────────────┐
+                         └─▶│ internal/retryq        │
+                            │ 10s×5 固定重试→本地兜底  │
+                            └────────────────────────┘
                       ┌──────────────────────────────┐
                       │  HTTP :3000                    │
                       │  / /healthz /readyz /statusz  │
@@ -71,10 +77,52 @@
 |---|---|---|
 | `/start` | 任何聊天 | 中文状态卡：`🟢 在线` + 版本 + 运行时长 + 存储后端 + 该聊天是否在保护范围 |
 | `/help` | 任何聊天 | 命令与行为说明 |
-| `/status` | 仅管理员 | uptime / 轮询 / 观察名单 / 签名库 / 处置计数 / AI 调用与失败 / 存储与 TTL |
+| `/status` | 仅管理员 | 模型链与逐模型成功/总数、回退、复核（含改判）、删除（含失败）、举报、本地兜底、SimHash 命中、待决队列、观察名单 / 签名库 / 处置 / 轮询 / 存储与 TTL / 提示词版本 |
 | `/check <文本>` | 仅管理员 | 文本直送 AI 并回显 JSON（`is_ad/category/confidence/reason`）+ 耗时，**不触发处置** |
+| `/report` | 群成员（回复广告消息） | 触发 AI 复审该消息；判广告即处置。每人每日限 `BOT_REPORT_DAILY_LIMIT` 次，同消息自动去重 |
 
 「仅管理员」= `BOT_ADMIN_USERS` 白名单用户或群主/管理员。私聊（DM）命令始终可用。
+
+## AI 判定链路（amend2/amend3）
+
+1. **模型回退链**：`BOT_AI_MODELS`（默认 `ultraspeed-studio → pro → flash`）。429/5xx/
+   超时/网络错误或网关池类错误码（`pool_parked`/`no_accounts`/`upstream_*`）时链内推进；
+   解析契约违例**不**推进（换模型无益）。
+2. **关思考**：每个请求带 `reasoning_effort=none`（备份 `chat_template_kwargs.enable_thinking=false`），
+   绝不发送 `max_tokens`。
+3. **图片多模态**：带图消息取最大尺寸图 + caption 一起判定，图片冲突时以图为准；
+   同一 `file_unique_id` 判定结果缓存（文件 hash 去重）。
+4. **置信度不足 → 三路并发复核**：`is_ad=true` 但 `confidence < BOT_AI_MIN_CONFIDENCE` 时
+   在复核模型上并发投票，≥`BOT_AI_VERIFY_MAJORITY` 票才处置；失败/超时路**弃权**；
+   平票/不足 → 进重试队列再判一轮。
+5. **失败重试**：固定 10s 间隔、最多 5 次、不退避不熔断，队列容量 `BOT_AI_RETRY_QUEUE`
+   （满则淘汰最旧并打 ERROR）。5 次用尽后**本地规则引擎自动兜底**（≥阈值处置，否则继续观察）。
+6. **SimHash 防改字**：签名库同时建 64 位字符 trigram simhash 索引，海明距离 ≤
+   `BOT_SIMHASH_DISTANCE`（默认 3）的变体（改一个字、插 emoji、加空格）直接命中，零 AI 调用。
+7. **/report**：群成员回复广告消息 `/report` → AI 复审；防滥用：每人每日
+   `BOT_REPORT_DAILY_LIMIT`（默认 3）+ 同一消息去重。
+
+## 提示词工程
+
+- 提示词是独立文件 `app/internal/ai/prompts/judge_v1.txt`（+ `judge_v1_bio.txt` 简介
+  追加段），go:embed 编译进二进制；`BOT_AI_PROMPT_FILE` 可用磁盘文件覆盖（调优不发版）。
+- 版本号 `PromptVersion=judge_v1` 打进**每次判定日志**与 `/status`、`/statusz`。
+- 只写「必杀特征清单」不写反例（防模型学到 false 范式）；输出契约严格 JSON
+  （`is_ad`/`category`/`confidence`/`reason`）；解析宽容但契约违例=失败走重试。
+- `category` 使用受控词表（办证｜色情｜儿童性内容｜赌博｜诈骗｜金融｜兼职｜引流｜违禁品｜
+  账号交易｜其他），但解析**从不**枚举校验（输出漂移不丢判定）。
+- 待判内容包裹在 `<msg>…</msg>` 之间，分隔符内的指令注入一律视为数据。
+
+### `-prompteval` 调优环
+
+```bash
+cd app && go run . -prompteval            # 走真实网关（唯一允许外呼的路径）
+go run . -prompteval -prompteval.models=mimo-v2.6-pro
+```
+
+对 `testdata/prompt_eval.jsonl`（29 条已标注样本）跑真实判定，输出每类错误统计
+（FN/FP + 契约违例），目标是 FN 优先：必杀域召回 ≥95%、真阴性零误封。标注集与提示词
+一起迭代：改 prompt → 跑 eval → 看逐条失败原因 → 再改。
 
 ## 环境变量
 
@@ -110,12 +158,15 @@
 | | `BOT_AI_MODELS` | 三模型逗号链 | 模型回退链 |
 | | `BOT_AI_MODEL` | `mimo-v2.6-pro-ultraspeed-studio` | 兼容旧单模型，`MODELS` 优先 |
 | | `BOT_AI_TIMEOUT` | `30s` | 单次判定超时 |
-| | `BOT_AI_RETRY_INTERVAL` / `_MAX_ATTEMPTS` / `_QUEUE` | `10s` / `5` / `500` | 固定间隔重试 |
+| | `BOT_AI_REASONING_EFFORT` | `none` | 关思考（网关校验过；绝不发 `max_tokens`） |
+| | `BOT_AI_PROMPT_FILE` | 空 | 覆盖内嵌提示词（调优不发版） |
+| | `BOT_AI_RETRY_INTERVAL` / `_MAX_ATTEMPTS` / `_QUEUE` | `10s` / `5` / `500` | 固定间隔重试（不退避、不熔断） |
 | | `BOT_AI_MIN_CONFIDENCE` | `0.85` | 置信度阈值，不足触发复核 |
-| | `BOT_AI_VERIFY_VOTES` / `_MODELS` / `_MAJORITY` / `_TIMEOUT` | `3` / `mimo-v2.6-flash` / `2` / `20s` | 并发复核 |
+| | `BOT_AI_VERIFY_VOTES` / `_MODELS` / `_MAJORITY` / `_TIMEOUT` | `3` / `mimo-v2.6-flash` / `2` / `45s` | 并发复核（单路超时，失败路弃权） |
 | | `BOT_AI_FALLBACK_BASE_URL` / `_API_KEY` / `_MODELS` | 空 | 备用 provider（可选） |
-| | `BOT_SIMHASH_DISTANCE` | `3` | 相似度匹配 |
-| | `BOT_LOCAL_RULES_ENABLED` / `_THRESHOLD` / `_KEYWORDS` | `true` / `3` / 空 | 本地规则兜底 |
+| | `BOT_SIMHASH_DISTANCE` | `3` | 相似度匹配（防改字绕过） |
+| | `BOT_LOCAL_RULES_ENABLED` / `_THRESHOLD` / `_KEYWORDS` | `true` / `3` / 空 | 本地规则兜底（5 次重试用尽后） |
+| | `BOT_REPORT_DAILY_LIMIT` | `3` | `/report` 每人每日上限（防滥用） |
 | 运行 | `BOT_POLL_TIMEOUT` / `BOT_WORKERS` | `30` / `4` | 轮询与并发 |
 | | `BOT_LOG_LEVEL` / `BOT_LOG_FORMAT` | `info` / `text` | 日志 |
 | | `BOT_ADMIN_TOKEN` | 空 | 非空开放 `/admin/*` |
@@ -129,8 +180,11 @@
 - `/` → `200 adbot ok`
 - `/healthz` / `/readyz` → 存活 / 就绪（就绪检查存储 `Ping`）
 - `/statusz` → JSON 状态快照：版本、uptime、轮询/处置/删除计数、AI 调用与失败、
-  各类记录条数、`store_backend`、`retention` / `retention_suspect` / `retention_signature`、
-  `retention_sliding`、`sweep_interval`、`dry_run`、`started_at`
+  各类记录条数、`store_backend`、`retention*`、`sweep_interval`、`dry_run`、`started_at`，
+  以及 amend3 项：`ai_models` / `ai_model_stats`（逐模型 calls/oks）、`ai_fallbacks`、
+  `ai_verify_rounds` / `ai_verify_flipped`、`report_count`、`local_fallback_count`、
+  `simhash_hits`、`pending_queue`、`prompt_version`、`last_sweep` / `next_sweep_in`
+  （janitor 跑过才出现）
 - `/admin/signatures` → 需要 `BOT_ADMIN_TOKEN`（`Authorization: Bearer`），
   `GET`/`POST`/`DELETE` 维护 bio/msg 签名库
 
@@ -153,9 +207,15 @@ cd app && go run . -selftest
 ./adbot -selftest
 ```
 
-依次检查：配置解析（脱敏摘要 + **生效 TTL 配置**）→ 存储（后端 + 各表当前条数）→
-AI（发「专业办理各种证件 加V信 xxx」判定并打印 JSON 与耗时）→ Telegram（`getMe`）。
-每项输出 `[PASS]/[FAIL]`，任一项失败退出码非 0。
+依次检查：配置解析（脱敏摘要 + **生效 TTL 配置** + `prompt_version`）→ 存储（后端 + 各表
+当前条数）→ AI（发「专业办理各种证件 加V信 xxx」判定并打印 JSON 与耗时）→ Telegram
+（`getMe`）。每项输出 `[PASS]/[FAIL]`，任一项失败退出码非 0。
+
+另有一条**显式 opt-in 的外呼**子命令（否则一切测试离线）：
+
+```bash
+cd app && go run . -prompteval   # 真实网关跑 29 条标注样本，输出 FN/FP 统计
+```
 
 ## 本地运行
 
@@ -179,6 +239,9 @@ cd app && go build ./... && go vet ./... && go test ./... -race -count=1
 
 ## 已知限制
 
+- **file 后端明确不实现**：内存模式是最终选择（belmo 文件系统疑似只读）；配置 `file`
+  会打 WARN 并回落内存，**重启丢观察名单/签名库/统计**属预期行为（封禁在 Telegram
+  服务端生效不受影响）。
 - **>48h 的消息不可删**：Bot API 限制，删除失败只记 warn，不中断处置流程。
 - **bio 仅 `getChat` 可取**：单聊/用户 chat 才返回 `bio`，取不到时留空继续（不算错误）。
 - **只删触发消息**：不再记录观察期消息 id、不做批量删除；入群前的历史消息无法删除。
@@ -202,13 +265,17 @@ cd app && go build ./... && go vet ./... && go test ./... -race -count=1
     ├── janitor.go          # TTL/capacity 清扫 goroutine
     ├── poller.go           # 库驱动 long-poll 的文档锚点
     ├── selftest.go         # -selftest 连通性验收
+    ├── prompteval.go       # -prompteval 标注集评估（唯一外呼路径）
+    ├── testdata/           # prompt_eval.jsonl（29 条标注样本）
     └── internal/
-        ├── ai/             # OpenAI 兼容判定（重试、fail-safe）
+        ├── ai/             # go-openai 判定：回退链/投票/多模态/prompts(judge_v1)
         ├── bot/            # 决策核心：命令/入群/发言/AI/签名命中/处置/白名单
         ├── config/         # 环境变量加载、脱敏、未识别变量告警
         ├── logx/           # 结构化日志（text/json）
-        ├── normalize/      # 归一化 + sha1 签名
+        ├── localrules/    # 本地规则兜底引擎（AI 不可达时的终局决策）
+        ├── normalize/      # 归一化 + sha1 签名 + SimHash
+        ├── retryq/         # 10s×5 固定重试队列 + 后台 worker
         ├── server/         # HTTP :3000（health/ready/status/admin）
-        ├── store/          # Store 接口 + Memory/Redis + Sweeper
+        ├── store/          # Store 接口 + Memory/Redis + SimHash 索引 + Sweeper
         └── telegram/       # go-telegram/bot 薄封装（领域类型 + 错误映射）
 ```

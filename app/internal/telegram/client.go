@@ -10,6 +10,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net/http"
+	"strconv"
 	"strings"
 
 	tgbot "github.com/go-telegram/bot"
@@ -22,6 +25,8 @@ type APIError struct {
 	Code        int
 	Description string
 	Method      string
+	// RetryAfter is Telegram's 429 parameters.retry_after (seconds; 0 = unset).
+	RetryAfter int
 }
 
 func (e *APIError) Error() string {
@@ -37,10 +42,11 @@ func (e *APIError) Error() string {
 
 // Update is the subset of a Telegram Update the bot cares about.
 type Update struct {
-	UpdateID     int64
-	Message      *Message
-	ChatMember   *ChatMemberUpdate
-	MyChatMember *ChatMemberUpdate
+	UpdateID      int64
+	Message       *Message
+	EditedMessage *Message
+	ChatMember    *ChatMemberUpdate
+	MyChatMember  *ChatMemberUpdate
 }
 
 // ChatMemberUpdate is the chat_member / my_chat_member update body.
@@ -65,10 +71,37 @@ type Message struct {
 	From      *User
 	Chat      Chat
 	Text      string
+	// Caption is the text attached to media messages (photo/document…).
+	Caption string
+	// Photo carries the photo sizes when the message is a photo (largest
+	// selection happens in the bot layer; here we keep all sizes).
+	Photo []PhotoSize
+	// Document is set for file documents (image documents are judged too).
+	Document *Document
+	// ReplyToMessage is set when this message replies to another (used by
+	// /report to identify the reported message).
+	ReplyToMessage *Message
 	// NewChatMembers lists users that just joined via this service message.
 	NewChatMembers []User
 	// LeftChatMember marks a leave service message.
 	LeftChatMember *User
+}
+
+// PhotoSize is one photo rendition.
+type PhotoSize struct {
+	FileID       string
+	FileUniqueID string
+	Width        int
+	Height       int
+	FileSize     int64
+}
+
+// Document is a generic file attachment.
+type Document struct {
+	FileID   string
+	FileName string
+	MimeType string
+	FileSize int64
 }
 
 // User is the subset of a Telegram user.
@@ -105,6 +138,9 @@ func convUpdate(u *models.Update) Update {
 	if u.Message != nil {
 		out.Message = convMessagePtr(u.Message)
 	}
+	if u.EditedMessage != nil {
+		out.EditedMessage = convMessagePtr(u.EditedMessage)
+	}
 	if u.ChatMember != nil {
 		out.ChatMember = convChatMemberUpdate(u.ChatMember)
 	}
@@ -124,10 +160,32 @@ func convMessage(m models.Message) Message {
 		MessageID: int64(m.ID),
 		Chat:      convChat(m.Chat),
 		Text:      m.Text,
+		Caption:   m.Caption,
 	}
 	if m.From != nil {
 		u := convUser(*m.From)
 		out.From = &u
+	}
+	for _, p := range m.Photo {
+		out.Photo = append(out.Photo, PhotoSize{
+			FileID:       p.FileID,
+			FileUniqueID: p.FileUniqueID,
+			Width:        p.Width,
+			Height:       p.Height,
+			FileSize:     int64(p.FileSize),
+		})
+	}
+	if m.Document != nil {
+		out.Document = &Document{
+			FileID:   m.Document.FileID,
+			FileName: m.Document.FileName,
+			MimeType: m.Document.MimeType,
+			FileSize: int64(m.Document.FileSize),
+		}
+	}
+	if m.ReplyToMessage != nil {
+		r := convMessage(*m.ReplyToMessage)
+		out.ReplyToMessage = &r
 	}
 	for _, u := range m.NewChatMembers {
 		out.NewChatMembers = append(out.NewChatMembers, convUser(u))
@@ -251,9 +309,15 @@ func (c *Client) toAPIError(method string, err error) error {
 		return nil
 	}
 	// Map library sentinel/text-bearing errors into our APIError carrying the
-	// Telegram description.
+	// Telegram description (and 429 retry_after when present).
 	desc := err.Error()
 	code := 0
+	retryAfter := 0
+	var tooMany *tgbot.TooManyRequestsError
+	if errors.As(err, &tooMany) {
+		code = 429
+		retryAfter = tooMany.RetryAfter
+	}
 	switch {
 	case errors.Is(err, tgbot.ErrorBadRequest):
 		code = 400
@@ -266,9 +330,9 @@ func (c *Client) toAPIError(method string, err error) error {
 	case errors.Is(err, tgbot.ErrorConflict):
 		code = 409
 	case errors.Is(err, tgbot.ErrorTooManyRequests):
-		code = 429
-	case tgbot.IsTooManyRequestsError(err):
-		code = 429
+		if code == 0 {
+			code = 429
+		}
 	case tgbot.IsMigrateError(err):
 		code = 400
 	}
@@ -277,7 +341,7 @@ func (c *Client) toAPIError(method string, err error) error {
 	if i := strings.LastIndex(desc, ": "); i >= 0 && code == 0 {
 		desc = strings.TrimSpace(desc[i+2:])
 	}
-	return &APIError{Code: code, Description: desc, Method: method}
+	return &APIError{Code: code, Description: desc, Method: method, RetryAfter: retryAfter}
 }
 
 // GetMe returns the bot's own User record.
@@ -370,6 +434,62 @@ func (c *Client) SendMessage(ctx context.Context, chatID int64, text string) (in
 func (c *Client) LeaveChat(ctx context.Context, chatID int64) error {
 	_, err := c.b.LeaveChat(ctx, &tgbot.LeaveChatParams{ChatID: chatID})
 	return c.toAPIError("leaveChat", err)
+}
+
+// GetFileMetadata returns file metadata (file_id → file_path) via getFile.
+func (c *Client) GetFileMetadata(ctx context.Context, fileID string) (FileMeta, error) {
+	f, err := c.b.GetFile(ctx, &tgbot.GetFileParams{FileID: fileID})
+	if err != nil {
+		return FileMeta{}, c.toAPIError("getFile", err)
+	}
+	if f == nil {
+		return FileMeta{}, nil
+	}
+	return FileMeta{FileID: f.FileID, FilePath: f.FilePath, FileSize: int64(f.FileSize)}, nil
+}
+
+// FileMeta mirrors models.File for the download path.
+type FileMeta struct {
+	FileID   string
+	FilePath string
+	FileSize int64
+}
+
+// DownloadFile downloads a file (photo/image document, ≤ maxBytes) over the
+// library's file endpoint. Larger files return an error without allocating.
+func (c *Client) DownloadFile(ctx context.Context, meta FileMeta, maxBytes int64) ([]byte, error) {
+	if meta.FilePath == "" {
+		return nil, &APIError{Code: 400, Description: "file path unavailable", Method: "downloadFile"}
+	}
+	if maxBytes > 0 && meta.FileSize > maxBytes {
+		return nil, &APIError{Code: 413, Description: "file too large: " + strconv.FormatInt(meta.FileSize, 10), Method: "downloadFile"}
+	}
+	link := c.b.FileDownloadLink(&models.File{FileID: meta.FileID, FilePath: meta.FilePath})
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, link, nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, &APIError{Code: resp.StatusCode, Description: "download http " + strconv.Itoa(resp.StatusCode), Method: "downloadFile"}
+	}
+	// Read at most maxBytes+1: one byte over the cap proves oversize.
+	limit := maxBytes
+	if limit <= 0 {
+		limit = 20 << 20
+	}
+	data, err := io.ReadAll(io.LimitReader(resp.Body, limit+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > limit {
+		return nil, &APIError{Code: 413, Description: "file too large (streamed)", Method: "downloadFile"}
+	}
+	return data, nil
 }
 
 // SetMyCommands registers the bot command list.

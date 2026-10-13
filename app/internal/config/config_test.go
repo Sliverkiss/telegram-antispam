@@ -68,8 +68,14 @@ func TestLoadDefaults(t *testing.T) {
 	if c.RetryInterval != 10*time.Second || c.RetryMax != 5 || c.RetryQueue != 500 {
 		t.Errorf("retry = %s/%d/%d", c.RetryInterval, c.RetryMax, c.RetryQueue)
 	}
-	if c.VerifyVotes != 3 || c.VerifyMajority != 2 || c.VerifyTimeout != 20*time.Second {
+	if c.VerifyVotes != 3 || c.VerifyMajority != 2 || c.VerifyTimeout != 45*time.Second {
 		t.Errorf("verify = %d/%d/%s", c.VerifyVotes, c.VerifyMajority, c.VerifyTimeout)
+	}
+	if c.AIReasoningEffort != "none" {
+		t.Errorf("AIReasoningEffort = %q, want none", c.AIReasoningEffort)
+	}
+	if c.ReportDailyLimit != 3 {
+		t.Errorf("ReportDailyLimit = %d, want 3", c.ReportDailyLimit)
 	}
 	if c.SimhashDistance != 3 {
 		t.Errorf("SimhashDistance = %d", c.SimhashDistance)

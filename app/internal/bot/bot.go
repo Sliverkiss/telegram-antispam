@@ -1,23 +1,36 @@
 // Package bot holds the antispam decision logic: member-join bio screening,
-// in-group message screening, signature-library direct hits, AI fallback
-// classification, group whitelisting + auto-leave, the four slash commands,
-// and the shared punishment flow (delete the triggering message → ban/kick →
-// record → notify). It depends only on interfaces (incl. the telegram
-// TelegramClient thin interface), so tests run against fakes with no network.
+// in-group message screening (text + photo multimodal), signature-library
+// direct hits (sha1 exact + simhash near-duplicate), AI chain classification
+// with confidence-triggered concurrent vote verification, the fixed-interval
+// background retry queue, the local rule engine terminal fallback, the
+// /report AI review flow, group whitelisting + auto-leave, the slash commands,
+// and the shared punishment flow (delete only the triggering message →
+// ban/kick → record → notify).
+//
+// Hardening contract (amend3 B): every update is dispatched under a recover
+// guard (one panicking message must never kill the process); deleteMessage
+// tolerates 429 retry_after (≤3 retries) and 400 message-can't-be-deleted
+// (warn, continue); dry-run performs zero writes; non-whitelisted chats get
+// zero AI calls and zero writes.
 package bot
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"runtime/debug"
 	"strings"
 	"sync/atomic"
 	"time"
 
 	"adbot/internal/ai"
 	"adbot/internal/config"
+	"adbot/internal/localrules"
 	"adbot/internal/logx"
 	"adbot/internal/normalize"
+	"adbot/internal/retryq"
 	"adbot/internal/store"
 	"adbot/internal/telegram"
 )
@@ -31,43 +44,77 @@ type TelegramClient interface {
 	DeleteMessage(ctx context.Context, chatID, messageID int64) error
 	SendMessage(ctx context.Context, chatID int64, text string) (int64, error)
 	LeaveChat(ctx context.Context, chatID int64) error
+	// Image judgment path (amend3 A.3).
+	GetFileMetadata(ctx context.Context, fileID string) (telegram.FileMeta, error)
+	DownloadFile(ctx context.Context, meta telegram.FileMeta, maxBytes int64) ([]byte, error)
 }
 
-// Classifier returns an ad verdict for one piece of content; ok=false means
-// "undecided" (never act).
-type Classifier func(ctx context.Context, content string) (ai.Verdict, bool)
-
-// UpdCounter lets poller report poll rounds. The library drives polling, but
-// keep the counter for /status.
-type UpdCounter interface {
-	NotePoll()
+// AIClassifier is the pluggable judgment engine (ai.Client in production,
+// a fake in tests). ok=false means the whole chain failed → retry queue.
+type AIClassifier interface {
+	Classify(ctx context.Context, content ai.Content, mode string) (ai.ClassifyResult, bool)
 }
+
+// Verifier runs one concurrent vote round (ai.Verify in production).
+type Verifier func(ctx context.Context, content ai.Content) ai.VerifyResult
 
 // Bot binds the store, telegram, AI, and config into the decision flow.
 type Bot struct {
 	Store store.Store
 	TG    TelegramClient
-	AI    Classifier
-	Cfg   config.Config
-	Log   *logx.Logger
+	AI    AIClassifier
+	// Verify is nil unless confidence-triggered voting is configured.
+	Verify Verifier
+	Cfg    config.Config
+	Log    *logx.Logger
+
+	// RetryQ is the shared pending queue; main wires it after New (the retry
+	// closure needs the bot itself).
+	RetryQ *retryq.Queue
+
+	// LocalRules is the terminal fallback engine; zero value uses defaults.
+	LocalRules localrules.Engine
+
+	// ImageJudge verdict cache + hash dedup (same file_unique_id judged once).
+	Images *store.ImageCache
+
+	AIStats *ai.Stats
 
 	startedAt time.Time
 
 	// Stats (atomic for /statusz while the poll loop is running).
-	pollCount   atomic.Int64
-	punishCount atomic.Int64
-	deleteCount atomic.Int64
-	deleteFails atomic.Int64
-	aiCalls     atomic.Int64
-	aiFails     atomic.Int64
+	pollCount    atomic.Int64
+	punishCount  atomic.Int64
+	deleteCount  atomic.Int64
+	deleteFails  atomic.Int64
+	aiCalls      atomic.Int64
+	aiFails      atomic.Int64
+	reportCount  atomic.Int64
+	reportDedup  atomic.Int64
+	localRuleCnt atomic.Int64 // local rule terminal decisions
+	simhashHits  atomic.Int64
 }
 
 // New builds a Bot with defaults filled in.
-func New(st store.Store, tg TelegramClient, classify Classifier, cfg config.Config, log *logx.Logger) *Bot {
+func New(st store.Store, tg TelegramClient, classify AIClassifier, verify Verifier, cfg config.Config, log *logx.Logger) *Bot {
 	if log == nil {
 		log = logx.New(nil, logx.Info, "text", "bot")
 	}
-	return &Bot{Store: st, TG: tg, AI: classify, Cfg: cfg, Log: log, startedAt: time.Now()}
+	if m, ok := st.(*store.Memory); ok {
+		m.SetSimhashDistance(cfg.SimhashDistance)
+	}
+	return &Bot{
+		Store:      st,
+		TG:         tg,
+		AI:         classify,
+		Verify:     verify,
+		Cfg:        cfg,
+		Log:        log,
+		LocalRules: localrules.Engine{Threshold: cfg.LocalRuleThreshold, ExtraKeywords: cfg.LocalKeywords},
+		Images:     store.NewImageCache(5000),
+		AIStats:    ai.NewStats(),
+		startedAt:  time.Now(),
+	}
 }
 
 // Uptime returns the time since the bot started.
@@ -83,21 +130,57 @@ func (b *Bot) DeleteStats() (deleted, failed int64) {
 	return b.deleteCount.Load(), b.deleteFails.Load()
 }
 
+// ExtraStats returns the amend3 counters for /status and /statusz.
+func (b *Bot) ExtraStats() (reports, localFallback, simhashHits int64) {
+	return b.reportCount.Load(), b.localRuleCnt.Load(), b.simhashHits.Load()
+}
+
 // NotePoll bumps the poll counter (called once per getUpdates round).
 func (b *Bot) NotePoll() { b.pollCount.Add(1) }
 
+// PendingQueueLen returns the retry queue length (0 when unwired).
+func (b *Bot) PendingQueueLen() int {
+	if b.RetryQ == nil {
+		return 0
+	}
+	return b.RetryQ.Len()
+}
+
 // ---------------------------------------------------------------------------
-// Update dispatch
+// Update dispatch (panic-isolated)
 // ---------------------------------------------------------------------------
 
-// HandleUpdate dispatches one Telegram update to the right handler.
+// HandleUpdate dispatches one Telegram update under a recover guard: a panic
+// in one update logs ERROR + stack and never kills the process.
 func (b *Bot) HandleUpdate(ctx context.Context, u telegram.Update) {
-	// Command messages take priority and are exempt from ad screening.
+	defer b.recoverUpdate(u.UpdateID)
+	b.handleUpdate(ctx, u)
+}
+
+func (b *Bot) recoverUpdate(updateID int64) {
+	if r := recover(); r != nil {
+		b.Log.Error("update_panic",
+			"update_id", updateID,
+			"panic", fmt.Sprint(r),
+			"stack", string(debug.Stack()))
+	}
+}
+
+func (b *Bot) handleUpdate(ctx context.Context, u telegram.Update) {
+	// Commands take priority and are exempt from ad screening.
 	if u.Message != nil {
 		if cmd, args, ok := parseCommand(u.Message.Text); ok {
 			b.HandleCommand(ctx, *u.Message, cmd, args)
 			return
 		}
+	}
+	if u.EditedMessage != nil {
+		// Edited messages re-run screening on the new content but never
+		// re-punish an already-punished signature hit twice for the same id:
+		// the flow is identical to a fresh message; dedup happens at the
+		// punishment layer via the store (suspect removal).
+		b.HandleMessage(ctx, *u.EditedMessage)
+		return
 	}
 
 	if u.Message != nil && len(u.Message.NewChatMembers) > 0 {
@@ -211,52 +294,75 @@ func (b *Bot) screenNewMember(ctx context.Context, chatID int64, u telegram.User
 	}
 	b.Log.Info("join_recorded", "chat", chatID, "uid", u.ID, "username", u.Username, "has_bio", bio != "")
 
-	// C: signature library check over bio + username + first_name (normalized).
-	sigs := []string{}
+	// Signature check over bio + username + first_name (normalized), with
+	// simhash near-duplicate matching (防改字绕过).
 	for _, s := range []string{bio, u.Username, u.FirstName} {
-		if sig := normalize.Signature(s); sig != "" {
-			sigs = append(sigs, sig)
-		}
-	}
-	for _, sig := range sigs {
-		hit, err := b.Store.HasBioSignature(ctx, sig)
-		if err != nil {
-			b.Log.Error("sig_lookup_error", "uid", u.ID, "err", err.Error())
+		if strings.TrimSpace(s) == "" {
 			continue
 		}
-		if hit {
-			b.Log.Info("signature_hit", "chat", chatID, "uid", u.ID, "kind", "bio")
+		norm := normalize.Normalize(s)
+		if norm == "" {
+			continue
+		}
+		if hit := b.searchBioSignature(ctx, norm); hit {
+			b.Log.Info("signature_hit", "chat", chatID, "uid", u.ID, "kind", "bio", "near", "simhash")
 			b.punish(ctx, chatID, u.ID, b.Cfg.Action, "signature", "bio", nil)
 			if b.Cfg.DeleteJoinMsg && joinMsgID > 0 {
-				if err := b.TG.DeleteMessage(ctx, chatID, joinMsgID); err != nil {
-					b.Log.Warn("delete_join_msg_error", "err", err.Error())
-				}
+				b.deleteOne(ctx, chatID, joinMsgID)
 			}
 			return
 		}
 	}
 
-	// Not hit + non-empty bio → AI.
+	// Not hit + non-empty bio → AI (bio mode: the same must-kill list plus the
+	// self-promotion clause).
 	if strings.TrimSpace(bio) == "" {
 		return
 	}
-	b.aiCalls.Add(1)
-	v, ok := b.AI(ctx, bio)
-	if !ok {
-		b.aiFails.Add(1)
-		b.Log.Warn("ai_undecided_join", "uid", u.ID)
-		return
-	}
-	b.Log.Info("ai_join_verdict", "uid", u.ID, "is_ad", v.IsAd, "category", v.Category, "confidence", v.Confidence)
-	if v.IsAd {
-		b.punish(ctx, chatID, u.ID, b.Cfg.Action, v.Category, v.Reason, nil)
-		b.Store.AddBioSignature(ctx, normalize.Signature(bio), normalize.Normalize(bio))
-	}
+	b.judge(ctx, judgmentInput{
+		key:       joinKey(u.ID),
+		kind:      "join",
+		chatID:    chatID,
+		messageID: joinMsgID,
+		uid:       u.ID,
+		text:      bio,
+		mode:      "bio",
+		punish:    true,
+		writeBio:  true,
+	})
 }
 
 // ---------------------------------------------------------------------------
-// Message screening
+// Message screening (text + photo multimodal)
 // ---------------------------------------------------------------------------
+
+// mediaContent extracts the judgment content from a message: text, or
+// caption+image for photos. imageFileID is the largest photo (or image
+// document) to download; empty when the message has no media.
+func (b *Bot) mediaContent(m telegram.Message) (text, imageFileID, fileUniqueID string) {
+	text = m.Text
+	if text == "" {
+		text = m.Caption
+	}
+	if len(m.Photo) > 0 {
+		// Largest size by area (Bot API orders ascending, but be robust).
+		best := m.Photo[0]
+		for _, p := range m.Photo {
+			if p.Width*p.Height > best.Width*best.Height {
+				best = p
+			}
+		}
+		return text, best.FileID, best.FileUniqueID
+	}
+	if m.Document != nil && isImageMime(m.Document.MimeType) {
+		return text, m.Document.FileID, m.Document.FileID
+	}
+	return text, "", ""
+}
+
+func isImageMime(m string) bool {
+	return strings.HasPrefix(m, "image/")
+}
 
 // HandleMessage screens one group message.
 func (b *Bot) HandleMessage(ctx context.Context, m telegram.Message) {
@@ -275,10 +381,6 @@ func (b *Bot) HandleMessage(ctx context.Context, m telegram.Message) {
 		b.Log.Debug("ignored_chat", "chat", chatID, "type", m.Chat.Type)
 		return
 	}
-	if strings.TrimSpace(m.Text) == "" {
-		return
-	}
-
 	if b.Cfg.IgnoreAdmins && b.isAdmin(ctx, chatID, uid) {
 		b.Log.Debug("skip_admin", "chat", chatID, "uid", uid)
 		return
@@ -289,20 +391,27 @@ func (b *Bot) HandleMessage(ctx context.Context, m telegram.Message) {
 		return
 	}
 
+	text, imageFileID, fileUniqueID := b.mediaContent(m)
+
+	// Service messages (no text, no caption, no media) — nothing to judge.
+	if strings.TrimSpace(text) == "" && imageFileID == "" {
+		return
+	}
+
 	suspect, err := b.Store.IsSuspect(ctx, uid)
 	if err != nil {
 		b.Log.Error("suspect_lookup_error", "uid", uid, "err", err.Error())
 	}
 
-	sig := normalize.Signature(m.Text)
-	if sig != "" {
-		hit, err := b.Store.HasMessageSignature(ctx, sig)
-		if err != nil {
-			b.Log.Error("msgsig_lookup_error", "uid", uid, "err", err.Error())
-		} else if hit {
-			b.Log.Info("signature_hit", "chat", chatID, "uid", uid, "kind", "msg")
-			b.punishAndClear(ctx, chatID, uid, m.MessageID, b.Cfg.Action, "signature", "广告签名命中", "", false)
-			return
+	// Signature check on the text part (exact + simhash).
+	if strings.TrimSpace(text) != "" {
+		norm := normalize.Normalize(text)
+		if norm != "" {
+			if hit := b.searchMessageSignature(ctx, norm); hit {
+				b.Log.Info("signature_hit", "chat", chatID, "uid", uid, "kind", "msg", "near", "simhash")
+				b.punishAndClear(ctx, chatID, uid, m.MessageID, b.Cfg.Action, "signature", "广告签名命中", text, true, false)
+				return
+			}
 		}
 	}
 
@@ -310,19 +419,428 @@ func (b *Bot) HandleMessage(ctx context.Context, m telegram.Message) {
 		return
 	}
 
-	// Suspect, not a known signature → AI.
-	b.aiCalls.Add(1)
-	v, ok := b.AI(ctx, m.Text)
-	if !ok {
-		b.aiFails.Add(1)
-		b.Log.Warn("ai_undecided_message", "uid", uid)
+	// Suspect, not a known signature → AI (photo multimodal when present).
+	b.judge(ctx, judgmentInput{
+		key:          msgKey(chatID, m.MessageID),
+		kind:         "message",
+		chatID:       chatID,
+		messageID:    m.MessageID,
+		uid:          uid,
+		text:         text,
+		imageFileID:  imageFileID,
+		fileUniqueID: fileUniqueID,
+		mode:         "message",
+		punish:       true,
+		writeMsg:     true,
+	})
+}
+
+// ---------------------------------------------------------------------------
+// /report flow
+// ---------------------------------------------------------------------------
+
+// HandleReport processes a /report command: the reported message goes through
+// the same AI review; judged as ad → delete that message + punishment.
+// Anti-abuse: per-reporter daily limit + same-message dedup.
+func (b *Bot) HandleReport(ctx context.Context, m telegram.Message, args string) {
+	// Identify the reported message: reply target, or "<message_id>", or
+	// admin "<chat_id> <message_id>".
+	var targetChat int64
+	var targetMsg int64
+	var target *telegram.Message
+	if m.ReplyToMessage != nil {
+		target = m.ReplyToMessage
+		targetChat = target.Chat.ID
+		targetMsg = target.MessageID
+	} else {
+		fields := strings.Fields(args)
+		switch len(fields) {
+		case 1:
+			id, err := parseInt64(fields[0])
+			if err != nil {
+				b.replyHelpful(ctx, m, "用法：回复要举报的消息发送 /report，或 /report <message_id>")
+				return
+			}
+			targetChat = m.Chat.ID
+			targetMsg = id
+		case 2:
+			// Private-chat admin form: /report <chat_id> <message_id>.
+			chatID, err1 := parseInt64(fields[0])
+			msgID, err2 := parseInt64(fields[1])
+			if err1 != nil || err2 != nil {
+				b.replyHelpful(ctx, m, "用法：/report <chat_id> <message_id>（管理员私聊）")
+				return
+			}
+			targetChat, targetMsg = chatID, msgID
+		default:
+			b.replyHelpful(ctx, m, "用法：回复要举报的消息发送 /report，或 /report <message_id>")
+			return
+		}
+	}
+
+	// The bot cannot fetch arbitrary messages by id; a /report without a
+	// reply must refuse unless tests inject the target (admin path fetches
+	// nothing today — Bot API has no getMessage).
+	if target == nil {
+		b.replyHelpful(ctx, m, "请直接回复要举报的消息发送 /report（暂不支持仅凭 id 举报）")
 		return
 	}
-	b.Log.Info("ai_message_verdict", "uid", uid, "is_ad", v.IsAd, "category", v.Category, "confidence", v.Confidence)
-	if v.IsAd {
-		// Delete only the triggering message → ban/kick → write msg signature →
-		// remove from watchlist → record + notify.
-		b.punishAndClear(ctx, chatID, uid, m.MessageID, b.Cfg.Action, v.Category, v.Reason, m.Text, true)
+	if !b.Cfg.AuthorizedChat(targetChat) && targetChat != m.Chat.ID {
+		b.replyHelpful(ctx, m, "只能举报受保护群内的消息")
+		return
+	}
+
+	// Anti-abuse: same-message dedup first (a spam wave of /report on one
+	// message must not multiply AI calls).
+	mem, ok := b.Store.(*store.Memory)
+	if ok {
+		if !mem.MarkReported(targetChat, targetMsg) {
+			b.reportDedup.Add(1)
+			b.Log.Debug("report_dedup", "chat", targetChat, "message_id", targetMsg)
+			b.replyHelpful(ctx, m, "该消息已在处理中/已处理")
+			return
+		}
+	}
+	// Per-reporter daily limit.
+	day := time.Now().Format("2006-01-02")
+	if ok {
+		limit := b.Cfg.ReportDailyLimit
+		if limit <= 0 {
+			limit = 3 // config default (BOT_REPORT_DAILY_LIMIT) when unset
+		}
+		if n := mem.BumpReportUsage(day, m.From.ID); n > limit {
+			b.Log.Warn("report_limit", "uid", m.From.ID, "count", n, "limit", b.Cfg.ReportDailyLimit)
+			b.replyHelpful(ctx, m, "今日举报次数已达上限")
+			return
+		}
+	}
+	b.reportCount.Add(1)
+	b.AIStats.NoteReport()
+
+	// The reporter's own admin status does not matter; the reported message's
+	// author might be an admin → do not punish admins (consistent with
+	// BOT_IGNORE_ADMINS).
+	if target.From != nil && b.Cfg.IgnoreAdmins && b.isAdmin(ctx, targetChat, target.From.ID) {
+		b.Log.Debug("report_skip_admin", "chat", targetChat, "uid", target.From.ID)
+		b.replyHelpful(ctx, m, "举报的对象是管理员，跳过")
+		return
+	}
+
+	text, imageFileID, fileUniqueID := b.mediaContent(*target)
+	if strings.TrimSpace(text) == "" && imageFileID == "" {
+		b.replyHelpful(ctx, m, "被举报消息没有可判定内容")
+		return
+	}
+
+	// Signature fast-path.
+	if strings.TrimSpace(text) != "" {
+		norm := normalize.Normalize(text)
+		if norm != "" && b.searchMessageSignature(ctx, norm) {
+			b.Log.Info("signature_hit", "chat", targetChat, "message_id", targetMsg, "kind", "report")
+			b.replyHelpful(ctx, m, "已确认：签名命中，正在处置")
+			b.punishAndClear(ctx, targetChat, targetUID(target.From), targetMsg, b.Cfg.Action, "signature", "举报签名命中", text, false, false)
+			return
+		}
+	}
+
+	b.judge(ctx, judgmentInput{
+		key:          reportKey(targetChat, targetMsg),
+		kind:         "report",
+		chatID:       targetChat,
+		messageID:    targetMsg,
+		uid:          targetUID(target.From),
+		text:         text,
+		imageFileID:  imageFileID,
+		fileUniqueID: fileUniqueID,
+		mode:         "message",
+		punish:       true,
+		writeMsg:     true,
+		replyTo:      m.Chat.ID,
+	})
+}
+
+func parseInt64(s string) (int64, error) {
+	var n int64
+	_, err := fmt.Sscanf(strings.TrimSpace(s), "%d", &n)
+	return n, err
+}
+
+// targetUID returns the reported author's id (0 when unknown).
+func targetUID(u *telegram.User) int64 {
+	if u == nil {
+		return 0
+	}
+	return u.ID
+}
+
+// ---------------------------------------------------------------------------
+// Judgment pipeline: AI chain → (low confidence) vote → retry queue → local rules
+// ---------------------------------------------------------------------------
+
+// judgmentInput is everything one judgment needs, shared by the live path and
+// the retry worker.
+type judgmentInput struct {
+	key          string
+	kind         string // message | join | report
+	chatID       int64
+	messageID    int64 // the triggering message to delete
+	uid          int64
+	text         string
+	imageFileID  string // when set, the image is downloaded and judged multimodally
+	fileUniqueID string
+	mode         string // prompt mode: message | bio
+	punish       bool   // run the punishment flow on an ad verdict
+	writeMsg     bool   // write the message signature on an ad verdict
+	writeBio     bool   // write the bio signature on an ad verdict
+	replyTo      int64  // report path: chat to send the review result to
+}
+
+func msgKey(chatID, messageID int64) string {
+	return fmt.Sprintf("msg:%d:%d", chatID, messageID)
+}
+
+func joinKey(uid int64) string {
+	return fmt.Sprintf("join:%d", uid)
+}
+
+func reportKey(chatID, messageID int64) string {
+	return fmt.Sprintf("report:%d:%d", chatID, messageID)
+}
+
+// judge runs the primary judgment; failures and unresolved votes go to the
+// retry queue (the poll loop is never blocked).
+func (b *Bot) judge(ctx context.Context, in judgmentInput) {
+	verdict, model, ok, imageURL := b.runAI(ctx, in)
+	if !ok {
+		b.aiFails.Add(1)
+		b.enqueueRetry(in, "chain_failed")
+		return
+	}
+	b.finishJudgment(ctx, in, verdict, model, imageURL)
+}
+
+// runAI performs the AI round (with image download + cache) and returns the
+// verdict; ok=false means the chain failed (retry).
+func (b *Bot) runAI(ctx context.Context, in judgmentInput) (verdict ai.Verdict, model string, ok bool, imageURL string) {
+	content := ai.Content{Text: in.text}
+	if in.imageFileID != "" {
+		dataURL, v, cached := b.imageFor(ctx, in.imageFileID, in.fileUniqueID)
+		if dataURL != "" {
+			content.ImageURL = dataURL
+			if cached {
+				// File-hash dedup: the same image was already judged.
+				if v != nil {
+					return *v, "image_cache", true, dataURL
+				}
+			}
+		} else {
+			// Download/encode failure → same retry queue, never dropped.
+			b.Log.Warn("image_download_failed", "file_unique_id", in.fileUniqueID)
+			b.enqueueRetry(in, "image_download")
+			return ai.Verdict{}, "", false, ""
+		}
+	}
+	b.aiCalls.Add(1)
+	res, ok := b.AI.Classify(ctx, content, in.mode)
+	if !ok {
+		b.aiFails.Add(1)
+		return ai.Verdict{}, "", false, content.ImageURL
+	}
+	b.AIStats.NoteAttempt(res.Model, true)
+	for _, at := range res.Attempts {
+		if at.Status != "ok" && at.Status != "" {
+			b.AIStats.NoteAttempt(at.Model, false)
+		}
+	}
+	if res.Fallback {
+		b.AIStats.NoteFallback()
+	}
+	if in.imageFileID != "" && content.ImageURL != "" {
+		// Cache the verdict for this file_unique_id.
+		vj, _ := json.Marshal(res.Verdict)
+		b.Images.Put(in.fileUniqueID, string(vj), content.ImageURL)
+	}
+	return res.Verdict, res.Model, true, content.ImageURL
+}
+
+// imageFor downloads and encodes one image (≤20MB), or returns the cached
+// verdict+data URL for a repeated file_unique_id.
+func (b *Bot) imageFor(ctx context.Context, fileID, fileUniqueID string) (du string, cachedVerdict *ai.Verdict, cached bool) {
+	if fileUniqueID != "" {
+		if vj, du, ok := b.Images.Get(fileUniqueID); ok {
+			var v ai.Verdict
+			json.Unmarshal([]byte(vj), &v)
+			return du, &v, true
+		}
+	}
+	meta, err := b.TG.GetFileMetadata(ctx, fileID)
+	if err != nil {
+		b.Log.Warn("getfile_error", "err", err.Error())
+		return "", nil, false
+	}
+	data, err := b.TG.DownloadFile(ctx, meta, 20<<20)
+	if err != nil {
+		b.Log.Warn("download_error", "err", err.Error())
+		return "", nil, false
+	}
+	return imageDataURL(data), nil, false
+}
+
+// finishJudgment applies the verdict: ad with enough confidence → punish;
+// ad below the threshold → concurrent vote; not ad → done.
+func (b *Bot) finishJudgment(ctx context.Context, in judgmentInput, verdict ai.Verdict, model string, imageURL string) {
+	b.Log.Info("ai_verdict",
+		"kind", in.kind,
+		"chat", in.chatID,
+		"message_id", in.messageID,
+		"uid", in.uid,
+		"is_ad", verdict.IsAd,
+		"category", verdict.Category,
+		"confidence", verdict.Confidence,
+		"model", model,
+		"prompt_version", ai.PromptVersion)
+
+	if !verdict.IsAd {
+		if in.kind == "report" && in.replyTo != 0 {
+			b.replyChat(ctx, in.replyTo, "未判定为广告（该消息保留）")
+		}
+		return
+	}
+
+	// Confidence gate: ≥ threshold → punish; below → concurrent vote round.
+	if verdict.Confidence >= b.Cfg.MinConfidence || b.Verify == nil {
+		if b.Verify == nil && verdict.Confidence < b.Cfg.MinConfidence {
+			// No verifier wired (tests): treat low-confidence as needing the
+			// vote path but with none available — punish anyway per the
+			// "漏杀是严重错误" orientation.
+			b.Log.Warn("verify_unavailable", "uid", in.uid, "confidence", verdict.Confidence)
+		}
+		b.commitAd(ctx, in, verdict)
+		return
+	}
+
+	// Low confidence → concurrent flash vote.
+	b.aiCalls.Add(1)
+	content := ai.Content{Text: in.text, ImageURL: imageURL}
+	res := b.Verify(ctx, content)
+	b.AIStats.NoteVerify(false)
+	b.Log.Info("ai_verify",
+		"key", in.key,
+		"chat", in.chatID,
+		"message_id", in.messageID,
+		"votes_total", res.VotesTotal,
+		"votes_ad", res.VotesAd,
+		"votes_abstain", res.Abstentions,
+		"final", res.Final,
+		"total_ms", res.TotalMS,
+		"per_vote", res.Format())
+	switch res.Final {
+	case "ad":
+		b.AIStats.NoteVerify(false)
+		b.commitAd(ctx, in, verdict)
+	case "not_ad":
+		b.AIStats.NoteVerify(true) // vote overrode the primary verdict
+		if in.kind == "report" && in.replyTo != 0 {
+			b.replyChat(ctx, in.replyTo, "复核后未判定为广告（该消息保留）")
+		}
+	default:
+		// Short of majority / tie / too many abstentions → not released:
+		// re-enqueue for another round after the fixed interval.
+		b.aiFails.Add(1)
+		b.enqueueRetry(in, "vote_unresolved")
+	}
+}
+
+// commitAd punishes the ad verdict (delete the triggering message → ban/kick
+// → signature write → watchlist removal → record + notify).
+func (b *Bot) commitAd(ctx context.Context, in judgmentInput, verdict ai.Verdict) {
+	category := verdict.ControlledCategory()
+	if in.kind == "report" && in.replyTo != 0 {
+		b.replyChat(ctx, in.replyTo, fmt.Sprintf("已判定为广告（%s，置信度 %.2f），正在处置", category, verdict.Confidence))
+	}
+	b.punishAndClear(ctx, in.chatID, in.uid, in.messageID, b.Cfg.Action, category, verdict.Reason, in.text, in.writeMsg || in.writeBio, in.kind == "join")
+}
+
+// enqueueRetry pushes a judgment into the pending queue (dedup by key).
+func (b *Bot) enqueueRetry(in judgmentInput, reason string) {
+	if b.RetryQ == nil {
+		b.Log.Error("ai_unresolved", "key", in.key, "reason", reason, "summary", "重试队列未接线（测试/自检模式），本次放弃")
+		return
+	}
+	if in.kind == "report" && in.replyTo != 0 {
+		b.replyChat(context.Background(), in.replyTo, "AI 暂不可用，已进入重试队列")
+	}
+	b.RetryQ.Enqueue(retryq.Item{
+		Key:       in.key,
+		Kind:      in.kind,
+		ChatID:    in.chatID,
+		MessageID: in.messageID,
+		UID:       in.uid,
+		Text:      in.text,
+		Mode:      in.mode,
+		Attempts:  0,
+		Reason:    reason,
+	})
+}
+
+// RetryRound is the retryq closure: one full retry round. ok=true means the
+// item reached a terminal state (verdict applied or local fallback decided).
+func (b *Bot) RetryRound(ctx context.Context, it retryq.Item) (bool, string) {
+	in := judgmentInput{
+		key:       it.Key,
+		kind:      it.Kind,
+		chatID:    it.ChatID,
+		messageID: it.MessageID,
+		uid:       it.UID,
+		text:      it.Text,
+		mode:      it.Mode,
+		punish:    true,
+		writeMsg:  it.Kind == "message" || it.Kind == "report",
+		writeBio:  it.Kind == "join",
+		replyTo:   0,
+	}
+	verdict, model, ok, _ := b.runAI(ctx, in)
+	if ok {
+		b.finishJudgment(ctx, in, verdict, model, "")
+		return true, ""
+	}
+	// Attempts exhausted (the queue bumps on return) → local rule fallback
+	// decides the terminal state. The queue calls RetryRound once per round;
+	// we detect the last round via it.Attempts == max-1.
+	if it.Attempts >= b.Cfg.RetryMax-1 {
+		b.localFallback(ctx, in, it.LastErrCode)
+		return true, "local_fallback"
+	}
+	return false, "chain_failed"
+}
+
+// localFallback is the terminal, fully automatic decision after the retry
+// budget is exhausted: local rules score the normalized text; ≥ threshold →
+// punish, below → keep watching (no human in the loop).
+func (b *Bot) localFallback(ctx context.Context, in judgmentInput, lastErr string) {
+	b.localRuleCnt.Add(1)
+	b.AIStats.NoteLocalFallback()
+	res := b.LocalRules.Evaluate(normalize.Normalize(in.text), false)
+	if b.Cfg.LocalRulesEnabled && res.IsAd {
+		b.Log.Error("local_fallback_punish",
+			"key", in.key,
+			"score", res.Score,
+			"threshold", res.Threshold,
+			"hits", strings.Join(res.Hits, ","),
+			"last_error", lastErr,
+			"category", "其他")
+		b.punishAndClear(ctx, in.chatID, in.uid, in.messageID, b.Cfg.Action, "其他", "本地规则兜底命中", in.text, in.writeMsg || in.writeBio, in.kind == "join")
+		return
+	}
+	// Below threshold: no punishment, user stays on the watchlist (observed).
+	b.Log.Error("local_fallback_pass",
+		"key", in.key,
+		"score", res.Score,
+		"threshold", res.Threshold,
+		"hits", strings.Join(res.Hits, ","),
+		"last_error", lastErr)
+	if in.kind == "report" && in.replyTo != 0 {
+		b.replyChat(ctx, in.replyTo, "AI 多次不可达且本地规则未达阈值，该消息保留观察")
 	}
 }
 
@@ -350,6 +868,11 @@ func parseCommand(text string) (cmd string, args string, ok bool) {
 // HandleCommand routes a slash command.
 func (b *Bot) HandleCommand(ctx context.Context, m telegram.Message, cmd, args string) {
 	uid := m.From.ID
+	// /report is available to every group member (anti-abuse inside).
+	if cmd == "/report" && m.Chat.Type != "private" {
+		b.HandleReport(ctx, m, args)
+		return
+	}
 	// /start and /help are available to everyone, in any chat.
 	switch cmd {
 	case "/start":
@@ -393,8 +916,8 @@ func (b *Bot) cmdStart(ctx context.Context, m telegram.Message) {
 }
 
 func (b *Bot) cmdHelp(ctx context.Context, m telegram.Message) {
-	text := "/start 查看状态 · /help 帮助 · /status 管理状态 · /check <文本> AI 判定测试\n" +
-		"本机器人只服务白名单群，检测广告号（简介/发言）并删除触发消息、封禁/踢出。"
+	text := "/start 查看状态 · /help 帮助 · /report 回复消息举报 · /status 管理状态 · /check <文本> AI 判定测试\n" +
+		"本机器人只服务白名单群，检测广告号（简介/发言/图片）并删除触发消息、封禁/踢出。"
 	b.reply(ctx, m, text)
 }
 
@@ -406,15 +929,26 @@ func (b *Bot) cmdStatus(ctx context.Context, m telegram.Message) {
 	punished, _ := b.Store.Punished(ctxb)
 	poll, _, aiCalls, aiFails := b.Stats()
 	deleted, deleteFails := b.DeleteStats()
+	reports, localFB, simHits := b.ExtraStats()
+	sn := b.AIStats.Snapshot()
+	pending := b.PendingQueueLen()
 
-	text := fmt.Sprintf("📊 状态\n版本 %s · 运行 %s\n后端 %s · TTL %s（滑窗 %v）\n"+
-		"轮询 %d · 处置 %d · 删除 %d（失败 %d）\nAI 调用 %d / 失败 %d\n"+
-		"观察名单 %d · 签名库 bio %d / msg %d\n模式 %s",
-		b.Cfg.Version, b.Uptime().Round(time.Second).String(),
+	var modelLines []string
+	for _, model := range sn.SortedModels() {
+		modelLines = append(modelLines, fmt.Sprintf("%s %d/%d", model, sn.ModelOKs[model], sn.ModelCalls[model]))
+	}
+	text := fmt.Sprintf("📊 状态\n版本 %s · 运行 %s · 提示词 %s\n后端 %s · TTL %s（滑窗 %v）\n"+
+		"模型链 %s\n模型调用 %s（成功/总）· 回退 %d\n"+
+		"复核 %d 次（改判 %d）· 删除 %d（失败 %d）· 处置 %d\n"+
+		"AI 调用 %d / 失败 %d · 举报 %d · 兜底 %d · SimHash 命中 %d · 待决队列 %d\n"+
+		"观察名单 %d · 签名库 bio %d / msg %d · 轮询 %d\n模式 %s",
+		b.Cfg.Version, b.Uptime().Round(time.Second).String(), ai.PromptVersion,
 		b.Cfg.Store, b.Cfg.Retention.String(), b.Cfg.RetentionSliding,
-		poll, punished, deleted, deleteFails,
-		aiCalls, aiFails,
-		suspects, bioSigs, msgSigs,
+		strings.Join(b.Cfg.AIEffectiveModels(), "→"),
+		strings.Join(modelLines, " · "), sn.Fallbacks,
+		sn.VerifyRounds, sn.VerifyFlipped, deleted, deleteFails, punished,
+		aiCalls, aiFails, reports, localFB, simHits, pending,
+		suspects, bioSigs, msgSigs, poll,
 		map[bool]string{true: "干跑", false: "正常"}[b.Cfg.DryRun])
 	b.reply(ctx, m, text)
 }
@@ -426,21 +960,48 @@ func (b *Bot) cmdCheck(ctx context.Context, m telegram.Message, args string) {
 	}
 	b.aiCalls.Add(1)
 	start := time.Now()
-	v, ok := b.AI(ctx, args)
+	res, ok := b.AI.Classify(ctx, ai.Content{Text: args}, "message")
 	elapsed := time.Since(start)
 	if !ok {
 		b.aiFails.Add(1)
-		b.replyHelpful(ctx, m, "AI 判定失败（不可达或无法解析），未触发任何处置")
+		b.replyHelpful(ctx, m, "AI 判定失败（整条模型链不可达或输出违反契约），未触发任何处置")
 		return
 	}
+	var voteNote string
+	v := res.Verdict
+	finalVerdict := v
+	if v.IsAd && v.Confidence < b.Cfg.MinConfidence && b.Verify != nil {
+		b.aiCalls.Add(1)
+		vres := b.Verify(ctx, ai.Content{Text: args})
+		b.AIStats.NoteVerify(false)
+		voteNote = "\n复核：" + vres.Format()
+		switch vres.Final {
+		case "ad":
+			finalVerdict = v
+		case "not_ad":
+			finalVerdict = ai.Verdict{IsAd: false, Category: "无", Confidence: 0, Reason: "复核否决"}
+		}
+	}
 	out, _ := json.Marshal(map[string]any{
-		"is_ad":      v.IsAd,
-		"category":   v.Category,
-		"confidence": v.Confidence,
-		"reason":     v.Reason,
-		"elapsed_ms": elapsed.Milliseconds(),
+		"is_ad":          finalVerdict.IsAd,
+		"category":       finalVerdict.ControlledCategory(),
+		"confidence":     finalVerdict.Confidence,
+		"reason":         finalVerdict.Reason,
+		"model":          res.Model,
+		"fallback":       res.Fallback,
+		"attempts":       fmt.Sprintf("%s", formatChain(res)),
+		"elapsed_ms":     elapsed.Milliseconds(),
+		"prompt_version": ai.PromptVersion,
 	})
-	b.reply(ctx, m, string(out))
+	b.reply(ctx, m, string(out)+voteNote)
+}
+
+func formatChain(res ai.ClassifyResult) string {
+	var parts []string
+	for _, a := range res.Attempts {
+		parts = append(parts, fmt.Sprintf("%s/%s", a.Model, a.Status))
+	}
+	return strings.Join(parts, ",")
 }
 
 func (b *Bot) reply(ctx context.Context, m telegram.Message, text string) {
@@ -465,6 +1026,12 @@ func (b *Bot) replyHelpful(ctx context.Context, m telegram.Message, text string)
 	b.reply(ctx, m, text)
 }
 
+func (b *Bot) replyChat(ctx context.Context, chatID int64, text string) {
+	if _, err := b.TG.SendMessage(ctx, chatID, text); err != nil {
+		b.Log.Warn("reply_error", "chat", chatID, "err", err.Error())
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Decision helpers
 // ---------------------------------------------------------------------------
@@ -477,6 +1044,54 @@ func (b *Bot) isAdmin(ctx context.Context, chatID, uid int64) bool {
 		return false
 	}
 	return m.Status == "creator" || m.Status == "administrator"
+}
+
+// searchBioSignature: exact sha1 then simhash near-match (bio library).
+func (b *Bot) searchBioSignature(ctx context.Context, normalized string) bool {
+	sig := normalize.SignatureOf(normalized)
+	if sig == "" {
+		return false
+	}
+	if hit, err := b.Store.HasBioSignature(ctx, sig); err == nil && hit {
+		return true
+	} else if err != nil {
+		b.Log.Error("biosig_lookup_error", "err", err.Error())
+	}
+	return b.simhashNear(ctx, normalized, "bio")
+}
+
+// searchMessageSignature: exact sha1 then simhash near-match (msg library).
+func (b *Bot) searchMessageSignature(ctx context.Context, normalized string) bool {
+	sig := normalize.SignatureOf(normalized)
+	if sig == "" {
+		return false
+	}
+	if hit, err := b.Store.HasMessageSignature(ctx, sig); err == nil && hit {
+		return true
+	} else if err != nil {
+		b.Log.Error("msgsig_lookup_error", "err", err.Error())
+	}
+	return b.simhashNear(ctx, normalized, "msg")
+}
+
+// simhashNear does the near-duplicate probe when the store supports it.
+func (b *Bot) simhashNear(ctx context.Context, normalized, kind string) bool {
+	sr, ok := b.Store.(store.Signaturer)
+	if !ok {
+		return false
+	}
+	var sig string
+	var hit bool
+	if kind == "bio" {
+		sig, hit = sr.SearchBioSignature(ctx, normalized, b.Cfg.SimhashDistance)
+	} else {
+		sig, hit = sr.SearchMessageSignature(ctx, normalized, b.Cfg.SimhashDistance)
+	}
+	if hit {
+		b.simhashHits.Add(1)
+		_ = sig
+	}
+	return hit
 }
 
 // punish deletes the triggering message (if non-zero) then bans/kicks, records,
@@ -494,31 +1109,77 @@ func (b *Bot) punish(ctx context.Context, chatID, uid int64, action, category, r
 // punishAndClear deletes only the triggering message (msgID), bans/kicks, writes
 // the message signature (from original text when provided), removes the suspect,
 // records and notifies.
-func (b *Bot) punishAndClear(ctx context.Context, chatID, uid, msgID int64, action, category, reason, original string, writeSig bool) {
+func (b *Bot) punishAndClear(ctx context.Context, chatID, uid, msgID int64, action, category, reason, original string, writeSig, bioKind bool) {
 	if msgID > 0 {
 		b.deleteOne(ctx, chatID, msgID)
 	}
 	b.ban(ctx, chatID, uid, action)
-	if writeSig && original != "" {
-		b.Store.AddMessageSignature(ctx, normalize.Signature(original), normalize.Normalize(original))
+	if b.Cfg.DryRun {
+		// Dry-run: zero writes — no signature, no watchlist removal, no record.
+		return
+	}
+	if writeSig && strings.TrimSpace(original) != "" {
+		sig, norm := normalize.Signature(original), normalize.Normalize(original)
+		if bioKind {
+			if err := b.Store.AddBioSignature(ctx, sig, norm); err != nil {
+				b.Log.Error("add_biosig_error", "uid", uid, "err", err.Error())
+			}
+		} else if err := b.Store.AddMessageSignature(ctx, sig, norm); err != nil {
+			b.Log.Error("add_msgsig_error", "uid", uid, "err", err.Error())
+		}
 	}
 	b.Store.RemoveSuspect(ctx, uid)
 	b.recordPunishment(ctx, chatID, uid, action, category, reason)
 	b.notify(ctx, chatID, uid, category)
 }
 
+// deleteOne deletes one message with 429 retry_after tolerance (≤3 retries)
+// and 400 "message can't be deleted" as a warn-only outcome. Delete failures
+// never interrupt the ban/signature flow.
 func (b *Bot) deleteOne(ctx context.Context, chatID, msgID int64) {
 	if b.Cfg.DryRun {
 		b.Log.Info("dry_run_skip_delete", "chat", chatID, "message_id", msgID)
 		return
 	}
-	if err := b.TG.DeleteMessage(ctx, chatID, msgID); err != nil {
-		// >48h old messages or non-admin bots fail here — warn, keep going.
+	for retry := 0; retry < 3; retry++ {
+		err := b.TG.DeleteMessage(ctx, chatID, msgID)
+		if err == nil {
+			b.deleteCount.Add(1)
+			return
+		}
+		var apiErr *telegram.APIError
+		if errors.As(err, &apiErr) {
+			switch {
+			case apiErr.Code == 429 && apiErr.RetryAfter > 0:
+				wait := time.Duration(apiErr.RetryAfter) * time.Second
+				if wait > 10*time.Second {
+					wait = 10 * time.Second
+				}
+				b.Log.Warn("delete_rate_limited", "chat", chatID, "message_id", msgID, "retry_after_s", apiErr.RetryAfter, "retry", retry+1)
+				select {
+				case <-ctx.Done():
+					b.deleteFails.Add(1)
+					return
+				case <-time.After(wait):
+				}
+				continue
+			case apiErr.Code == 400 && strings.Contains(strings.ToLower(apiErr.Description), "delete"):
+				// "message can't be deleted": already gone / >48h — noise.
+				b.Log.Warn("delete_message_not_deletable", "chat", chatID, "message_id", msgID, "err", apiErr.Description)
+				b.deleteFails.Add(1)
+				return
+			case apiErr.Code == 403:
+				b.Log.Error("delete_forbidden", "chat", chatID, "message_id", msgID, "err", apiErr.Description)
+				b.deleteFails.Add(1)
+				return
+			}
+		}
 		b.deleteFails.Add(1)
 		b.Log.Warn("delete_message_error", "chat", chatID, "message_id", msgID, "err", err.Error())
 		return
 	}
-	b.deleteCount.Add(1)
+	b.deleteFails.Add(1)
+	b.Log.Warn("delete_message_exhausted", "chat", chatID, "message_id", msgID)
 }
 
 func (b *Bot) ban(ctx context.Context, chatID, uid int64, action string) {
@@ -554,4 +1215,17 @@ func (b *Bot) notify(ctx context.Context, chatID, uid int64, category string) {
 	if _, err := b.TG.SendMessage(ctx, b.Cfg.LogChat, text); err != nil {
 		b.Log.Warn("notify_error", "err", err.Error())
 	}
+}
+
+// imageDataURL base64-encodes downloaded bytes with a magic-byte mime sniff.
+func imageDataURL(data []byte) string {
+	mime := "image/jpeg"
+	if len(data) >= 8 && data[0] == 0x89 && data[1] == 'P' {
+		mime = "image/png"
+	} else if len(data) >= 6 && data[0] == 'G' && data[1] == 'I' {
+		mime = "image/gif"
+	} else if len(data) > 12 && data[8] == 'W' && data[9] == 'E' {
+		mime = "image/webp"
+	}
+	return "data:" + mime + ";base64," + base64.StdEncoding.EncodeToString(data)
 }
