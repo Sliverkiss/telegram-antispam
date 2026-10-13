@@ -4,16 +4,16 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"sort"
 	"time"
 
 	"adbot/internal/ai"
 	"adbot/internal/config"
-	"adbot/internal/store"
 	"adbot/internal/telegram"
 )
 
 // runSelftest executes the belmo connectivity acceptance checks in order:
-// config → Redis → AI → Telegram. Each prints [PASS]/[FAIL]; any failure
+// config → storage → AI → Telegram. Each prints [PASS]/[FAIL]; any failure
 // makes the process exit non-zero. Timeouts are bounded.
 func runSelftest(cfg config.Config) {
 	ok := true
@@ -24,37 +24,35 @@ func runSelftest(cfg config.Config) {
 
 	// 1. Config (already parsed — render the redacted summary).
 	fmt.Println("[PASS] config: parsed")
-	for _, k := range []string{"BOT_ADDR", "BOT_ACTION", "BOT_REDIS_URL", "BOT_AI_BASE_URL", "BOT_AI_MODEL", "BOT_LOG_CHAT"} {
+	keys := sortedKeys(cfg.Redacted())
+	for _, k := range keys {
 		fmt.Printf("        %s=%s\n", k, cfg.Redacted()[k])
 	}
 
-	// 2. Redis: PING → SET/GET/DEL roundtrip.
-	if cfg.RedisURL == "" {
-		fmt.Println("[PASS] redis: not configured — in-memory store (dev/test)")
+	// TTL configuration (explicit requirement for -selftest).
+	fmt.Printf("        effective TTL suspect=%s signature=%s sliding=%v\n",
+		cfg.RetentionFor("suspect"), cfg.RetentionFor("signature"), cfg.RetentionSliding)
+
+	// 2. Storage: report the chosen backend and its record counts.
+	st, backend, err := openStore(cfg, nil)
+	if err != nil {
+		fmt.Printf("[FAIL] store: %v\n", err)
+		ok = false
+	} else if backend == "memory" {
+		fmt.Println("[WARN] store: memory — 数据不会持久化，重启丢失")
 	} else {
-		rs, err := store.OpenRedis(cfg.RedisURL, cfg.SuspectTTL, cfg.RedisInsecureTLS, nil)
-		if err != nil {
-			fmt.Printf("[FAIL] redis: connect: %v\n", err)
+		fmt.Printf("[PASS] store: %s\n", backend)
+	}
+	if st != nil {
+		defer st.Close()
+		if err := st.Ping(ctx); err != nil {
+			fmt.Printf("[FAIL] store: ping: %v\n", err)
 			ok = false
 		} else {
-			defer rs.Close()
-			if err := rs.Ping(ctx); err != nil {
-				fmt.Printf("[FAIL] redis: PING: %v\n", err)
-				ok = false
-			} else {
-				fmt.Println("[PASS] redis: PING")
-				probe := "adbot:selftest:probe"
-				if _, err := rs.Do("SET", probe, "1"); err != nil {
-					fmt.Printf("[FAIL] redis: SET: %v\n", err)
-					ok = false
-				} else if _, err := rs.Do("GET", probe); err != nil {
-					fmt.Printf("[FAIL] redis: GET: %v\n", err)
-					ok = false
-				} else {
-					fmt.Println("[PASS] redis: SET/GET roundtrip")
-				}
-				rs.Do("DEL", probe)
-			}
+			suspects, _ := st.SuspectCount(ctx)
+			bioSigs, _ := st.BioSigCount(ctx)
+			msgSigs, _ := st.MsgSigCount(ctx)
+			fmt.Printf("[PASS] store: ping ok · suspects=%d bio_sigs=%d msg_sigs=%d\n", suspects, bioSigs, msgSigs)
 		}
 	}
 
@@ -87,13 +85,18 @@ func runSelftest(cfg config.Config) {
 		fmt.Println("[FAIL] telegram: BOT_TOKEN is not set")
 		ok = false
 	} else {
-		tg := telegram.NewClient(cfg.Token)
-		me, err := tg.GetMe(ctx)
+		tg, err := telegram.NewClient(cfg.Token)
 		if err != nil {
-			fmt.Printf("[FAIL] telegram: getMe: %v\n", err)
+			fmt.Printf("[FAIL] telegram: init: %v\n", err)
 			ok = false
 		} else {
-			fmt.Printf("[PASS] telegram: getMe → @%s (id=%d)\n", me.Username, me.ID)
+			me, err := tg.GetMe(ctx)
+			if err != nil {
+				fmt.Printf("[FAIL] telegram: getMe: %v\n", err)
+				ok = false
+			} else {
+				fmt.Printf("[PASS] telegram: getMe → @%s (id=%d)\n", me.Username, me.ID)
+			}
 		}
 	}
 
@@ -101,4 +104,13 @@ func runSelftest(cfg config.Config) {
 	if !ok {
 		os.Exit(1)
 	}
+}
+
+func sortedKeys(m map[string]string) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
 }

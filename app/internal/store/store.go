@@ -40,6 +40,33 @@ type Stats struct {
 // ErrNotConfigured marks a missing BOT_REDIS_URL (memory fallback expected).
 var ErrNotConfigured = errors.New("store: no redis url configured")
 
+// SweepOptions drives one sweep pass. SuspectTTL / SignatureTTL are already
+// resolved per-category TTLs (0 = never expire that category); Now is the
+// sweep time (zero = the store's own clock).
+type SweepOptions struct {
+	SuspectTTL    time.Duration
+	SignatureTTL  time.Duration
+	MaxSuspects   int
+	MaxSignatures int
+	Now           time.Time
+}
+
+// SweepResult reports what a sweep pass dropped/evicted.
+type SweepResult struct {
+	DroppedSuspects   int64
+	DroppedSignatures int64
+	EvictedSuspects   int64 // capacity evictions, also counted in DroppedSuspects
+	EvictedSignatures int64 // capacity evictions, also counted in DroppedSignatures
+	RemainingTotal    int64
+}
+
+// Sweeper is implemented by stores that support the janitor's sweep pass (the
+// memory store; it is where BOT_RETENTION / capacity guards live).
+type Sweeper interface {
+	Store
+	Sweep(ctx context.Context, so SweepOptions) (SweepResult, error)
+}
+
 // Store is the persistence contract. All methods are safe for concurrent
 // use by multiple goroutines (the bot's single poll loop and the HTTP admin
 // handlers).

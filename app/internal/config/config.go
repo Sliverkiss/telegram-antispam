@@ -1,11 +1,19 @@
 // Package config loads every knob of the antispam bot from environment
 // variables (nothing is hardcoded in code beyond defaults). It also renders
-// credential-redacted summaries for startup and selftest logs.
+// credential-redacted summaries for startup and selftest logs, and reports
+// unrecognized BOT_* variables so a typo does not silently disable a feature.
+//
+// The environment-variable contract is the single authority: TASK_antispam_amend1.md
+// §6 (minus the deletions the user requested — no BOT_DELETE_QPS, no tracked
+// message id cap/retention, no observation-message id tracking — and no
+// BOT_REPORT_*, which belong to amend2's report flow and are not in this round).
+// See app/.env.example for the annotated list.
 package config
 
 import (
 	"fmt"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -15,99 +23,315 @@ import (
 
 // Config is the full runtime configuration.
 type Config struct {
-	Token     string
-	BotAddr   string
-	LogLevel  string
-	LogFormat string
+	// Core -------------------------------------------------------------------
+	Token   string
+	BotAddr string
+	// Chats is the authorized group whitelist (BOT_CHATS). Empty/absent means
+	// no group is authorized; ChatsSet records whether the variable was present.
+	Chats           map[int64]bool
+	ChatsSet        bool
+	LeaveOtherChats bool
+	LeaveNotice     bool
+	AdminUsers      map[int64]bool
+	DryRun          bool
 
+	// Behavior ----------------------------------------------------------------
+	Action           string // "ban" or "kick"
+	IgnoreAdmins     bool
+	DeleteJoinMsg    bool
+	LogChat          int64 // 0 = disabled
+	CmdAutodeleteSec int
+
+	// Store & retention -------------------------------------------------------
+	Store            string // memory (default) | redis | file | auto
 	RedisURL         string
 	RedisInsecureTLS bool
-	SuspectTTL       time.Duration
-	SuspectTTLSet    bool
+	DBPath           string
+	DBFsync          bool
 
-	Action         string // "ban" or "kick"
-	IgnoreAdmins   bool
-	DeleteJoinMsg  bool
-	LogChat        int64 // 0 = disabled
-	AdminToken     string
-	MaxTrackedMsgs int
+	Retention          time.Duration // 0 = never expire
+	RetentionSuspect   time.Duration // 0 = follow Retention
+	RetentionSignature time.Duration // 0 = follow Retention
+	RetentionSliding   bool
+	SweepInterval      time.Duration
+	MaxSuspects        int
+	MaxSignatures      int
 
-	AIBaseURL string
-	AIKey     string
-	AIModel   string
-	AITimeout time.Duration
+	// AI ----------------------------------------------------------------------
+	AIBaseURL          string
+	AIKey              string
+	AIModels           []string // model fallback chain (BOT_AI_MODELS)
+	AIModel            string   // single-model compat (BOT_AI_MODEL)
+	AITimeout          time.Duration
+	RetryInterval      time.Duration
+	RetryMax           int
+	RetryQueue         int
+	MinConfidence      float64
+	VerifyVotes        int
+	VerifyModels       []string
+	VerifyMajority     int
+	VerifyTimeout      time.Duration
+	FallbackBaseURL    string
+	FallbackAPIKey     string
+	FallbackModels     []string
+	SimhashDistance    int
+	LocalRulesEnabled  bool
+	LocalRuleThreshold int
+	LocalKeywords      []string // appended keyword list (BOT_LOCAL_KEYWORDS)
 
+	// Runtime / logging / admin ----------------------------------------------
 	PollTimeout int
-	AllUpdates  string // canonical member-join update kinds
+	Workers     int
+	LogLevel    string
+	LogFormat   string
+	AdminToken  string
 	Version     string
 }
 
-// Load reads the environment into a Config with defaults applied.
+// Load reads the environment into a Config with defaults applied. It is pure
+// (reads only os.LookupEnv) and never logs.
 func Load() Config {
+	var models []string
+	if v := os.Getenv("BOT_AI_MODELS"); v != "" {
+		models = csvList(v)
+	}
 	c := Config{
-		BotAddr:          envOr("BOT_ADDR", ":3000"),
-		LogLevel:         envOr("BOT_LOG_LEVEL", "info"),
-		LogFormat:        envOr("BOT_LOG_FORMAT", "text"),
-		Action:           envOr("BOT_ACTION", "ban"),
-		AIBaseURL:        envOr("BOT_AI_BASE_URL", "https://mimo.xn--ug8h.eu.org/v1"),
-		AIModel:          envOr("BOT_AI_MODEL", "mimo-v2.6-pro-ultraspeed-studio"),
-		PollTimeout:      intEnv("BOT_POLL_TIMEOUT", 25),
-		DeleteJoinMsg:    boolEnv("BOT_DELETE_JOIN_MSG", false),
+		BotAddr:         envOr("BOT_ADDR", ":3000"),
+		LeaveOtherChats: boolEnv("BOT_LEAVE_OTHER_CHATS", true),
+		LeaveNotice:     boolEnv("BOT_LEAVE_NOTICE", true),
+		DryRun:          boolEnv("BOT_DRY_RUN", false),
+
+		Action:           envOr("BOT_ACTION", "kick"),
 		IgnoreAdmins:     boolEnv("BOT_IGNORE_ADMINS", true),
-		MaxTrackedMsgs:   intEnv("BOT_MAX_TRACKED_MSGS", 200),
+		DeleteJoinMsg:    boolEnv("BOT_DELETE_JOIN_MSG", false),
+		CmdAutodeleteSec: intEnv("BOT_CMD_AUTODELETE_SEC", 0),
+
+		Store:            envOr("BOT_STORE", "memory"),
+		RedisURL:         os.Getenv("BOT_REDIS_URL"),
 		RedisInsecureTLS: boolEnv("BOT_REDIS_INSECURE_TLS", false),
-		Version:          "0.1.0",
+		DBPath:           envOr("BOT_DB_PATH", "data/adbot.db"),
+		DBFsync:          boolEnv("BOT_DB_FSYNC", false),
+
+		Retention:        durationEnv("BOT_RETENTION", 72*time.Hour),
+		RetentionSliding: boolEnv("BOT_RETENTION_SLIDING", true),
+		SweepInterval:    durationEnv("BOT_SWEEP_INTERVAL", 10*time.Minute),
+		MaxSuspects:      intEnv("BOT_MAX_SUSPECTS", 50000),
+		MaxSignatures:    intEnv("BOT_MAX_SIGNATURES", 50000),
+
+		AIBaseURL:          envOr("BOT_AI_BASE_URL", "https://mimo.xn--ug8h.eu.org/v1"),
+		AIKey:              os.Getenv("BOT_AI_API_KEY"),
+		AIModels:           models,
+		AIModel:            envOr("BOT_AI_MODEL", "mimo-v2.6-pro-ultraspeed-studio"),
+		AITimeout:          durationEnv("BOT_AI_TIMEOUT", 30*time.Second),
+		RetryInterval:      durationEnv("BOT_AI_RETRY_INTERVAL", 10*time.Second),
+		RetryMax:           intEnv("BOT_AI_RETRY_MAX_ATTEMPTS", 5),
+		RetryQueue:         intEnv("BOT_AI_RETRY_QUEUE", 500),
+		MinConfidence:      floatEnv("BOT_AI_MIN_CONFIDENCE", 0.85),
+		VerifyVotes:        intEnv("BOT_AI_VERIFY_VOTES", 3),
+		VerifyModels:       csvList(envOr("BOT_AI_VERIFY_MODELS", "mimo-v2.6-flash")),
+		VerifyMajority:     intEnv("BOT_AI_VERIFY_MAJORITY", 2),
+		VerifyTimeout:      durationEnv("BOT_AI_VERIFY_TIMEOUT", 20*time.Second),
+		FallbackBaseURL:    os.Getenv("BOT_AI_FALLBACK_BASE_URL"),
+		FallbackAPIKey:     os.Getenv("BOT_AI_FALLBACK_API_KEY"),
+		FallbackModels:     csvList(os.Getenv("BOT_AI_FALLBACK_MODELS")),
+		SimhashDistance:    intEnv("BOT_SIMHASH_DISTANCE", 3),
+		LocalRulesEnabled:  boolEnv("BOT_LOCAL_RULES_ENABLED", true),
+		LocalRuleThreshold: intEnv("BOT_LOCAL_RULE_THRESHOLD", 3),
+		LocalKeywords:      csvList(os.Getenv("BOT_LOCAL_KEYWORDS")),
+
+		PollTimeout: intEnv("BOT_POLL_TIMEOUT", 30),
+		Workers:     intEnv("BOT_WORKERS", 4),
+		LogLevel:    envOr("BOT_LOG_LEVEL", "info"),
+		LogFormat:   envOr("BOT_LOG_FORMAT", "text"),
+		AdminToken:  os.Getenv("BOT_ADMIN_TOKEN"),
+		Version:     envOr("BOT_VERSION", "dev"),
 	}
 	c.Token = os.Getenv("BOT_TOKEN")
-	c.RedisURL = os.Getenv("BOT_REDIS_URL")
-	c.AIKey = os.Getenv("BOT_AI_API_KEY")
-	c.AdminToken = os.Getenv("BOT_ADMIN_TOKEN")
+	c.ChatsSet = os.Getenv("BOT_CHATS") != ""
+	c.Chats = parseIntSet(os.Getenv("BOT_CHATS"))
+	c.AdminUsers = parseIntSet(os.Getenv("BOT_ADMIN_USERS"))
 	if v := os.Getenv("BOT_LOG_CHAT"); v != "" {
-		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+		if n, err := strconv.ParseInt(strings.TrimSpace(v), 10, 64); err == nil {
 			c.LogChat = n
 		}
 	}
-	c.AITimeout = durationEnv("BOT_AI_TIMEOUT", 30*time.Second)
-	if v := os.Getenv("BOT_SUSPECT_TTL"); v != "" {
-		if d, err := time.ParseDuration(v); err == nil {
-			c.SuspectTTL = d
-			c.SuspectTTLSet = true
-		} else if n, err := strconv.Atoi(v); err == nil && n >= 0 {
-			c.SuspectTTL = time.Duration(n) * time.Second
-			c.SuspectTTLSet = true
-		}
+	// Per-category retention: empty/unparsable follows BOT_RETENTION.
+	c.RetentionSuspect = optionalDuraenv("BOT_RETENTION_SUSPECT")
+	c.RetentionSignature = optionalDuraenv("BOT_RETENTION_SIGNATURE")
+
+	// The sweep interval may not be zero/negative (the janitor must run); an
+	// explicit 0 or a negative value falls back to the default cadence.
+	if c.SweepInterval <= 0 {
+		c.SweepInterval = 10 * time.Minute
 	}
+
 	if c.Action != "ban" && c.Action != "kick" {
 		c.Action = "ban"
 	}
 	return c
 }
 
+// AIEffectiveModels returns the model fallback chain: BOT_AI_MODELS if set,
+// otherwise the single BOT_AI_MODEL.
+func (c Config) AIEffectiveModels() []string {
+	if len(c.AIModels) > 0 {
+		return c.AIModels
+	}
+	if c.AIModel != "" {
+		return []string{c.AIModel}
+	}
+	return []string{"mimo-v2.6-pro-ultraspeed-studio"}
+}
+
+// RetentionFor returns the TTL to apply to a record category ("suspect" or
+// "signature"); a ≤0 duration means "follow the global BOT_RETENTION".
+func (c Config) RetentionFor(category string) time.Duration {
+	switch category {
+	case "suspect":
+		if d := c.RetentionSuspect; d > 0 {
+			return d
+		}
+	case "signature":
+		if d := c.RetentionSignature; d > 0 {
+			return d
+		}
+	}
+	return c.Retention
+}
+
+// AuthorizedChat reports whether chatID is inside the BOT_CHATS whitelist.
+// An empty whitelist authorizes nothing (fail-safe), except that a DM to the
+// bot may additionally be treated as authorized by the caller (it is).
+func (c Config) AuthorizedChat(chatID int64) bool {
+	return c.Chats[chatID]
+}
+
+// IsAdminUser reports whether uid is a configured admin (BOT_ADMIN_USERS).
+func (c Config) IsAdminUser(uid int64) bool { return c.AdminUsers[uid] }
+
 // Redacted renders a credential-safe summary (tokens/passwords → prefix only).
 func (c Config) Redacted() map[string]string {
 	return map[string]string{
-		"BOT_ADDR":             c.BotAddr,
-		"BOT_LOG_LEVEL":        c.LogLevel,
-		"BOT_LOG_FORMAT":       c.LogFormat,
-		"BOT_ACTION":           c.Action,
-		"BOT_IGNORE_ADMINS":    strconv.FormatBool(c.IgnoreAdmins),
-		"BOT_DELETE_JOIN_MSG":  strconv.FormatBool(c.DeleteJoinMsg),
-		"BOT_LOG_CHAT":         strconv.FormatInt(c.LogChat, 10),
-		"BOT_REDIS_URL":        redactURL(c.RedisURL),
-		"BOT_SUSPECT_TTL":      c.SuspectTTL.String(),
-		"BOT_AI_BASE_URL":      c.AIBaseURL,
-		"BOT_AI_MODEL":         c.AIModel,
-		"BOT_AI_TIMEOUT":       c.AITimeout.String(),
-		"BOT_AI_API_KEY":       redactToken(c.AIKey),
-		"BOT_ADMIN_TOKEN":      redactToken(c.AdminToken),
-		"BOT_TOKEN":            redactToken(c.Token),
-		"BOT_MAX_TRACKED_MSGS": strconv.Itoa(c.MaxTrackedMsgs),
+		"BOT_ADDR":                  c.BotAddr,
+		"BOT_CHATS":                 formatIDSet(c.Chats),
+		"BOT_LEAVE_OTHER_CHATS":     strconv.FormatBool(c.LeaveOtherChats),
+		"BOT_LEAVE_NOTICE":          strconv.FormatBool(c.LeaveNotice),
+		"BOT_ADMIN_USERS":           formatIDSet(c.AdminUsers),
+		"BOT_DRY_RUN":               strconv.FormatBool(c.DryRun),
+		"BOT_ACTION":                c.Action,
+		"BOT_IGNORE_ADMINS":         strconv.FormatBool(c.IgnoreAdmins),
+		"BOT_DELETE_JOIN_MSG":       strconv.FormatBool(c.DeleteJoinMsg),
+		"BOT_LOG_CHAT":              strconv.FormatInt(c.LogChat, 10),
+		"BOT_CMD_AUTODELETE_SEC":    strconv.Itoa(c.CmdAutodeleteSec),
+		"BOT_STORE":                 c.Store,
+		"BOT_REDIS_URL":             redactURL(c.RedisURL),
+		"BOT_REDIS_INSECURE_TLS":    strconv.FormatBool(c.RedisInsecureTLS),
+		"BOT_DB_PATH":               c.DBPath,
+		"BOT_DB_FSYNC":              strconv.FormatBool(c.DBFsync),
+		"BOT_RETENTION":             c.Retention.String(),
+		"BOT_RETENTION_SUSPECT":     fmtDura(c.RetentionSuspect),
+		"BOT_RETENTION_SIGNATURE":   fmtDura(c.RetentionSignature),
+		"BOT_RETENTION_SLIDING":     strconv.FormatBool(c.RetentionSliding),
+		"BOT_SWEEP_INTERVAL":        c.SweepInterval.String(),
+		"BOT_MAX_SUSPECTS":          strconv.Itoa(c.MaxSuspects),
+		"BOT_MAX_SIGNATURES":        strconv.Itoa(c.MaxSignatures),
+		"BOT_AI_BASE_URL":           c.AIBaseURL,
+		"BOT_AI_API_KEY":            redactToken(c.AIKey),
+		"BOT_AI_MODELS":             strings.Join(c.AIEffectiveModels(), ","),
+		"BOT_AI_TIMEOUT":            c.AITimeout.String(),
+		"BOT_AI_RETRY_INTERVAL":     c.RetryInterval.String(),
+		"BOT_AI_RETRY_MAX_ATTEMPTS": strconv.Itoa(c.RetryMax),
+		"BOT_AI_RETRY_QUEUE":        strconv.Itoa(c.RetryQueue),
+		"BOT_AI_MIN_CONFIDENCE":     strconv.FormatFloat(c.MinConfidence, 'f', 2, 64),
+		"BOT_AI_VERIFY_VOTES":       strconv.Itoa(c.VerifyVotes),
+		"BOT_AI_VERIFY_MODELS":      strings.Join(c.VerifyModels, ","),
+		"BOT_AI_VERIFY_MAJORITY":    strconv.Itoa(c.VerifyMajority),
+		"BOT_AI_VERIFY_TIMEOUT":     c.VerifyTimeout.String(),
+		"BOT_AI_FALLBACK_BASE_URL":  c.FallbackBaseURL,
+		"BOT_AI_FALLBACK_API_KEY":   redactToken(c.FallbackAPIKey),
+		"BOT_AI_FALLBACK_MODELS":    strings.Join(c.FallbackModels, ","),
+		"BOT_SIMHASH_DISTANCE":      strconv.Itoa(c.SimhashDistance),
+		"BOT_LOCAL_RULES_ENABLED":   strconv.FormatBool(c.LocalRulesEnabled),
+		"BOT_LOCAL_RULE_THRESHOLD":  strconv.Itoa(c.LocalRuleThreshold),
+		"BOT_LOCAL_KEYWORDS":        strings.Join(c.LocalKeywords, ","),
+		"BOT_POLL_TIMEOUT":          strconv.Itoa(c.PollTimeout),
+		"BOT_WORKERS":               strconv.Itoa(c.Workers),
+		"BOT_LOG_LEVEL":             c.LogLevel,
+		"BOT_LOG_FORMAT":            c.LogFormat,
+		"BOT_ADMIN_TOKEN":           redactToken(c.AdminToken),
+		"BOT_TOKEN":                 redactToken(c.Token),
 	}
 }
 
 // SummaryLogger returns a logger for the given config.
 func (c Config) Logger() *logx.Logger {
 	return logx.New(os.Stderr, logx.ParseLevel(c.LogLevel), c.LogFormat, "adbot")
+}
+
+// Validate reports a human-readable error if the config is unusable.
+func (c Config) Validate() error {
+	if c.Token == "" && os.Getenv("BOT_TOKEN") == "" {
+		return fmt.Errorf("BOT_TOKEN is required")
+	}
+	if c.MaxSuspects < 1 {
+		return fmt.Errorf("BOT_MAX_SUSPECTS must be >= 1")
+	}
+	if c.MaxSignatures < 1 {
+		return fmt.Errorf("BOT_MAX_SIGNATURES must be >= 1")
+	}
+	if c.SweepInterval <= 0 {
+		return fmt.Errorf("BOT_SWEEP_INTERVAL must be > 0")
+	}
+	return nil
+}
+
+// UnrecognizedBotVars returns the BOT_* variables that were set but are not
+// part of the recognized contract. Unknown prefixes are warned at startup so a
+// typo (e.g. BOT_MAX_TRACKED) is loud instead of silently ignored.
+func UnrecognizedBotVars() []string {
+	known := map[string]bool{
+		"BOT_TOKEN": true, "BOT_ADDR": true, "BOT_CHATS": true,
+		"BOT_LEAVE_OTHER_CHATS": true, "BOT_LEAVE_NOTICE": true,
+		"BOT_ADMIN_USERS": true, "BOT_DRY_RUN": true, "BOT_ACTION": true,
+		"BOT_IGNORE_ADMINS": true, "BOT_DELETE_JOIN_MSG": true,
+		"BOT_LOG_CHAT": true, "BOT_CMD_AUTODELETE_SEC": true,
+		"BOT_STORE": true, "BOT_REDIS_URL": true,
+		"BOT_REDIS_INSECURE_TLS": true, "BOT_DB_PATH": true,
+		"BOT_DB_FSYNC": true, "BOT_RETENTION": true,
+		"BOT_RETENTION_SUSPECT": true, "BOT_RETENTION_SIGNATURE": true,
+		"BOT_RETENTION_SLIDING": true, "BOT_SWEEP_INTERVAL": true,
+		"BOT_MAX_SUSPECTS": true, "BOT_MAX_SIGNATURES": true,
+		"BOT_AI_BASE_URL": true, "BOT_AI_API_KEY": true,
+		"BOT_AI_MODELS": true, "BOT_AI_MODEL": true, "BOT_AI_TIMEOUT": true,
+		"BOT_AI_RETRY_INTERVAL": true, "BOT_AI_RETRY_MAX_ATTEMPTS": true,
+		"BOT_AI_RETRY_QUEUE": true, "BOT_AI_MIN_CONFIDENCE": true,
+		"BOT_AI_VERIFY_VOTES": true, "BOT_AI_VERIFY_MODELS": true,
+		"BOT_AI_VERIFY_MAJORITY": true, "BOT_AI_VERIFY_TIMEOUT": true,
+		"BOT_AI_FALLBACK_BASE_URL": true, "BOT_AI_FALLBACK_API_KEY": true,
+		"BOT_AI_FALLBACK_MODELS": true, "BOT_SIMHASH_DISTANCE": true,
+		"BOT_LOCAL_RULES_ENABLED": true, "BOT_LOCAL_RULE_THRESHOLD": true,
+		"BOT_LOCAL_KEYWORDS": true,
+		"BOT_POLL_TIMEOUT":   true, "BOT_WORKERS": true,
+		"BOT_LOG_LEVEL": true, "BOT_LOG_FORMAT": true,
+		"BOT_ADMIN_TOKEN": true, "BOT_VERSION": true,
+	}
+	var out []string
+	for _, kv := range os.Environ() {
+		i := strings.IndexByte(kv, '=')
+		if i <= 0 {
+			continue
+		}
+		name := kv[:i]
+		if !strings.HasPrefix(name, "BOT_") {
+			continue
+		}
+		if known[name] {
+			continue
+		}
+		out = append(out, name)
+	}
+	sort.Strings(out)
+	return out
 }
 
 func envOr(key, def string) string {
@@ -122,7 +346,7 @@ func intEnv(key string, def int) int {
 	if v == "" {
 		return def
 	}
-	n, err := strconv.Atoi(v)
+	n, err := strconv.Atoi(strings.TrimSpace(v))
 	if err != nil || n < 0 {
 		return def
 	}
@@ -149,10 +373,85 @@ func durationEnv(key string, def time.Duration) time.Duration {
 	if v == "" {
 		return def
 	}
-	if d, err := time.ParseDuration(v); err == nil {
+	if d, err := time.ParseDuration(strings.TrimSpace(v)); err == nil {
 		return d
 	}
 	return def
+}
+
+// optionalDurationEnv reads a duration-typed variable that may legitimately be
+// absent or empty; it returns d (or 0) on any parse failure so callers know it
+// was unset and can fall back to the global retention.
+func optionalDuraenv(key string) time.Duration {
+	v := os.Getenv(key)
+	if v == "" {
+		return 0
+	}
+	d, err := time.ParseDuration(strings.TrimSpace(v))
+	if err != nil {
+		return 0
+	}
+	return d
+}
+
+func floatEnv(key string, def float64) float64 {
+	v := os.Getenv(key)
+	if v == "" {
+		return def
+	}
+	f, err := strconv.ParseFloat(strings.TrimSpace(v), 64)
+	if err != nil {
+		return def
+	}
+	return f
+}
+
+// csvList splits a comma-separated list, trimming whitespace and dropping
+// empty items.
+func csvList(s string) []string {
+	var out []string
+	for _, part := range strings.Split(s, ",") {
+		p := strings.TrimSpace(part)
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// parseIntSet parses a comma-separated list of int64 ids (e.g. "-1003888828164").
+// Unparseable items are skipped; want all-or-nothing semantics for the warning
+// is not required — the set is simply best-effort.
+func parseIntSet(s string) map[int64]bool {
+	if strings.TrimSpace(s) == "" {
+		return nil
+	}
+	out := map[int64]bool{}
+	for _, part := range csvList(s) {
+		if n, err := strconv.ParseInt(part, 10, 64); err == nil {
+			out[n] = true
+		}
+	}
+	return out
+}
+
+func formatIDSet(m map[int64]bool) string {
+	if len(m) == 0 {
+		return ""
+	}
+	ids := make([]string, 0, len(m))
+	for id := range m {
+		ids = append(ids, strconv.FormatInt(id, 10))
+	}
+	sort.Strings(ids)
+	return strings.Join(ids, ",")
+}
+
+func fmtDura(d time.Duration) string {
+	if d == 0 {
+		return "" // follows BOT_RETENTION
+	}
+	return d.String()
 }
 
 // redactToken shows only the first 4 chars (or "set"/"unset").
@@ -168,7 +467,6 @@ func redactURL(raw string) string {
 	if raw == "" {
 		return "unset"
 	}
-	// Strip userinfo manually to avoid leaking a password substring.
 	if i := strings.Index(raw, "://"); i >= 0 {
 		rest := raw[i+3:]
 		if j := strings.Index(rest, "@"); j >= 0 {
@@ -184,12 +482,4 @@ func truncatePrefix(s string, n int) string {
 		return s
 	}
 	return s[:n] + "…"
-}
-
-// Validate reports a human-readable error if the config is unusable.
-func (c Config) Validate() error {
-	if c.Token == "" && os.Getenv("BOT_TOKEN") == "" {
-		return fmt.Errorf("BOT_TOKEN is required")
-	}
-	return nil
 }

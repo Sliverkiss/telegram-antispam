@@ -7,7 +7,9 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
+	"adbot/internal/config"
 	"adbot/internal/logx"
 	"adbot/internal/store"
 )
@@ -18,13 +20,17 @@ func (s *stubBot) Stats() (int64, int64, int64, int64) {
 	return s.poll, s.punished, s.aiCalls, s.aiFails
 }
 
+func (s *stubBot) DeleteStats() (int64, int64) { return 0, 0 }
+func (s *stubBot) Uptime() time.Duration       { return time.Minute }
+
 func newTestServer(t *testing.T, adminToken string) (*Server, *httptest.Server) {
 	t.Helper()
 	st := store.NewMemory()
 	for i := 0; i < 7; i++ {
 		st.RecordPunishment(context.Background(), store.Punishment{UID: int64(i), Action: "ban"})
 	}
-	s := New(st, &stubBot{punished: 7, aiCalls: 3}, adminToken, "test", logx.New(nil, logx.Error, "text", "http"))
+	cfg := config.Config{Store: "memory", AdminToken: adminToken, Version: "test", Retention: 0}
+	s := New(st, &stubBot{punished: 7, aiCalls: 3}, cfg, logx.New(nil, logx.Error, "text", "http"))
 	ts := httptest.NewServer(s.Handler())
 	t.Cleanup(ts.Close)
 	return s, ts
@@ -66,8 +72,8 @@ func TestStatusz(t *testing.T) {
 	if _, ok := body["version"]; !ok {
 		t.Error("statusz missing version")
 	}
-	if _, ok := body["redis_ok"]; !ok {
-		t.Error("statusz missing redis_ok")
+	if _, ok := body["store_backend"]; !ok {
+		t.Error("statusz missing store_backend")
 	}
 }
 

@@ -1,134 +1,189 @@
 # adbot — Telegram 反广告 Bot
 
-一个 **Go stdlib-only**（零第三方依赖，`go.sum` 为空）的 Telegram 反灰黑产/反广告导流 Bot。
-入群时筛查新成员简介（bio），群内发言按签名库 + AI 双通道判定，命中即封禁/踢出，
-并维护「观察名单」与「bio / 消息」两级 sha1 签名库，逐步积累可直接命中、无需 AI 的本地知识。
+一个用 Go 编写的 Telegram 反灰黑产/反广告导流 Bot。入群时筛查新成员简介（bio），
+群内发言按**签名库 + AI 双通道**判定，命中即删除触发消息并封禁/踢出；同时维护
+「观察名单」与「bio / 消息」两级 sha1 签名库，逐渐积累无需 AI 的本地命中知识。
 
-- 手写 Telegram Bot API 客户端（`net/http`，long polling）
-- 手写 RESP 协议 Redis 客户端（改编自内部参考实现，支持 TLS / `rediss://` / AUTH）
-- OpenAI 兼容 AI 判定（默认指向 `mimo …ultraspeed` 网关），可插拔
-- `net/http` 服务监听 **:3000**，供 belmo 健康检查
-- `-selftest` 一键连通性验收
+本仓库只服务白名单群（`BOT_CHATS`），非白名单内的事件/消息一律忽略，零 AI 调用、零写入。
+
+## 库选型
+
+- **Telegram 客户端**：`github.com/go-telegram/bot v1.27.0`（2026-09 仍在维护，零传递依赖）。
+  对比结论：`go-telegram-bot-api/v5`（2021 停更）、`telebot.v3`（2024 停更）均不选。
+  库只包裹在 `internal/telegram` 薄接口后，**库的 models 不泄漏到 bot 决策层**，
+  决策层依赖接口 + fake，单测用 `WithServerURL` 指向 `httptest`，全程离线。
+- **AI 客户端**：不引库，保持手写 `net/http` POST（OpenAI 兼容）+ 重试。
+- **存储**：默认 `memory`（见下）；Redis / file 后端保留但仅显式启用。
 
 ## 架构
 
 ```
-                        ┌───────────────────────────────┐
- Telegram Bot API ─────▶│  poller (getUpdates long poll) │
-  (net/http)            └──────────────┬────────────────┘
-                                      │ update
-                                      ▼
-                        ┌───────────────────────────────┐
-                        │          bot (决策逻辑)         │
-                        │  A. 入群 → bio 签名库 → AI      │
-                        │  B. 发言 → msg 签名库 → AI      │
-                        └──────┬──────────────┬─────────┘
-                               │              │
-                    ┌──────────▼──┐     ┌─────▼──────────┐
-                    │  internal/ai │     │ internal/store │
-                    │ (OpenAI 兼容) │     │ Memory │ Redis │
-                    └─────────────┘     └─────┬──────────┘
-                                              │ RESP (手写)
-                                              ▼
-                                           Redis
-                        ┌───────────────────────────────┐
-                        │  HTTP :3000                    │
-                        │  / /healthz /readyz /statusz   │
-                        │  /admin/signatures (带 token)  │
-                        └───────────────────────────────┘
+                      ┌──────────────────────────────┐
+ Telegram Bot API ───▶│  internal/telegram (薄封装)    │
+  (go-telegram/bot)   │  Start(ctx)+WithAllowedUpdates │
+                      │  + WithErrorsHandler           │
+                      └──────────────┬───────────────┘
+                                     │ Update（自有领域类型）
+                                     ▼
+                      ┌──────────────────────────────┐
+                      │        bot（决策逻辑）          │
+                      │  命令 / 入群 / 成员变更 / 发言    │
+                      │  白名单门 → 签名库 → AI → 处置    │
+                      └──────┬──────────────┬────────┘
+                             │              │
+                  ┌──────────▼──┐    ┌──────▼─────────┐
+                  │ internal/ai │    │ internal/store  │
+                  │ (OpenAI 兼容) │    │ Memory(默认)     │
+                  └─────────────┘    │ Redis/File(可选) │
+                                     │ + Sweeper/Janitor│
+                                     └─────────────────┘
+                      ┌──────────────────────────────┐
+                      │  HTTP :3000                    │
+                      │  / /healthz /readyz /statusz  │
+                      │  /admin/signatures (带 token)  │
+                      └──────────────────────────────┘
 ```
 
-## Redis key schema（前缀 `adbot:`）
+## 存储模式与数据丢失语义（重要）
 
-| Key | 类型 | 用途 |
+- `BOT_STORE=memory`（**默认**）：观察名单 / 签名库 / 统计都在内存，**重启后丢失**。
+  - 启动日志会打印：`内存模式：重启后观察名单/签名库/统计将丢失`。
+  - 丢失的只是「签名缓存 + 观察名单 + 统计」；**封禁/踢出是 Telegram 服务端生效的，
+    重启不会解除**。重启后同一广告号会重新走一次 AI 判定，不会漏判。
+- `redis` / `file`：代码保留，显式设置才启用（file 后端本轮回落内存并打 WARN）。
+- 为什么默认内存：belmo 文件系统疑似只读、平台 Redis 外网不通。
+
+## TTL 与自动清理
+
+- 每条记录带写入时间 `ts`，默认保留 **72h**（`BOT_RETENTION=72h`；`0`/负数 = 永不过期）。
+- 分类覆盖：`BOT_RETENTION_SUSPECT`（观察名单）、`BOT_RETENTION_SIGNATURE`（签名库），不设跟随全局。
+- **滑动过期**（`BOT_RETENTION_SLIDING=true` 默认）：命中/刷新即续 `ts`，热门签名不会被反复清掉。
+- janitor goroutine 每 `BOT_SWEEP_INTERVAL`（默认 `10m`）扫一次，**启动时也先跑一次**，日志：
+  `event=sweep`，字段 `dropped_suspects` / `dropped_signatures` / `remaining_total` / `heap_kib` / `elapsed_ms`。
+- 容量护栏：`BOT_MAX_SUSPECTS` / `BOT_MAX_SIGNATURES`（各 `50000`），超限按最旧淘汰并打 WARN。
+- **不存在消息追踪**：处置只删触发的那条广告消息，不记录观察期消息 id、不做批量删除。
+
+## 命令
+
+启动时用 `SetMyCommands` 注册。命令消息自身跳过广告判定。
+
+| 命令 | 可用范围 | 说明 |
 |---|---|---|
-| `adbot:suspect` | SET | 观察名单 uid 集合 |
-| `adbot:suspect:<uid>` | HASH(+TTL) | uid/username/first_name/joined_at/chat_id/bio |
-| `adbot:biosig` | SET | bio 签名 sha1 集合 |
-| `adbot:biosig:<sha1>` | STRING | 归一化原文 |
-| `adbot:msgsig` | SET | 消息签名 sha1 集合 |
-| `adbot:msgsig:<sha1>` | STRING | 归一化原文 |
-| `adbot:track:<chatid>:<uid>` | LIST | 该用户已知消息 id（LPUSH，LTRIM 封顶） |
-| `adbot:puni:<uid>` | STRING | 处罚记录（JSON） |
-| `adbot:stats` | HASH | `punished` 计数 |
+| `/start` | 任何聊天 | 中文状态卡：`🟢 在线` + 版本 + 运行时长 + 存储后端 + 该聊天是否在保护范围 |
+| `/help` | 任何聊天 | 命令与行为说明 |
+| `/status` | 仅管理员 | uptime / 轮询 / 观察名单 / 签名库 / 处置计数 / AI 调用与失败 / 存储与 TTL |
+| `/check <文本>` | 仅管理员 | 文本直送 AI 并回显 JSON（`is_ad/category/confidence/reason`）+ 耗时，**不触发处置** |
+
+「仅管理员」= `BOT_ADMIN_USERS` 白名单用户或群主/管理员。私聊（DM）命令始终可用。
 
 ## 环境变量
 
-| 变量 | 默认 | 说明 |
-|---|---|---|
-| `BOT_TOKEN` | — | **必填**。BotFather 发放的 token |
-| `BOT_ADDR` | `:3000` | HTTP 监听地址（belmo 靠它判定健康） |
-| `BOT_ACTION` | `ban` | `ban` 封禁 / `kick` 封禁后立即解封（可再次入群） |
-| `BOT_IGNORE_ADMINS` | `true` | 跳过群主/管理员（防误杀自己人） |
-| `BOT_DELETE_JOIN_MSG` | `false` | 入群签名命中时删除「XX 入群」系统消息 |
-| `BOT_LOG_CHAT` | 空 | 处置通知目标 chat_id（空=关闭） |
-| `BOT_LOG_LEVEL` | `info` | `debug`/`info`/`warn`/`error` |
-| `BOT_LOG_FORMAT` | `text` | `text`/`json` |
-| `BOT_REDIS_URL` | 空 | `redis://` 或 `rediss://`（TLS）；空=内存实现 |
-| `BOT_REDIS_INSECURE_TLS` | `false` | 跳过证书校验（仅开发） |
-| `BOT_SUSPECT_TTL` | 空 | 观察名单过期（如 `24h`）；空=永不过期 |
-| `BOT_AI_BASE_URL` | `https://mimo.xn--ug8h.eu.org/v1` | OpenAI 兼容网关 |
-| `BOT_AI_API_KEY` | — | 网关 API Key |
-| `BOT_AI_MODEL` | `mimo-v2.6-pro-ultraspeed-studio` | 模型名 |
-| `BOT_AI_TIMEOUT` | `30s` | 单次 AI 超时 |
-| `BOT_ADMIN_TOKEN` | 空 | 非空时开启 `/admin/*` 并校验 `Authorization: Bearer`；空=关闭 |
-| `BOT_MAX_TRACKED_MSGS` | `200` | 每 chat+uid 记录的消息 id 上限 |
-| `BOT_POLL_TIMEOUT` | `25` | getUpdates long-poll 秒数 |
+完整契约与 `config.go` 一致；未识别的 `BOT_*` 变量会在启动时打 WARN。
+逐项中文注释与默认值见 `app/.env.example`（复制为 `.env` 使用）。
 
-> 所有变量都走环境变量；代码中不硬编码任何真实凭据。启动日志 / `-selftest` 输出会**脱敏**
-> （token/password 只显示前缀）。
+| 分组 | 变量 | 默认 | 说明 |
+|---|---|---|---|
+| 核心 | `BOT_TOKEN` | — | **必填**。BotFather 发放的 token |
+| | `BOT_ADDR` | `:3000` | HTTP 监听地址 |
+| | `BOT_CHATS` | 空 | 授权群白名单（逗号分隔）；空 = 不授权任何群，所有群被退出 |
+| | `BOT_LEAVE_OTHER_CHATS` | `true` | 被拉进非白名单群立即 `leaveChat` |
+| | `BOT_LEAVE_NOTICE` | `true` | 退出前先发一句说明 |
+| | `BOT_ADMIN_USERS` | 空 | 管理员 uid；消息永不判定，可用 `/status`、`/check` |
+| | `BOT_DRY_RUN` | `false` | `true` 只判定+打日志，不处置 |
+| 行为 | `BOT_ACTION` | `kick` | `kick` 封后即解 / `ban` 永久 |
+| | `BOT_IGNORE_ADMINS` | `true` | 跳过群主/管理员 |
+| | `BOT_DELETE_JOIN_MSG` | `false` | 删除广告号入群系统消息 |
+| | `BOT_LOG_CHAT` | `0` | 处置通知目标 chat id（0=关） |
+| | `BOT_CMD_AUTODELETE_SEC` | `0` | 命令回复自动删除秒数（0=不删） |
+| 存储 | `BOT_STORE` | `memory` | `memory` / `redis` / `file` / `auto` |
+| | `BOT_REDIS_URL` | 空 | redis 后端连接串 |
+| | `BOT_REDIS_INSECURE_TLS` | `false` | 跳过 TLS 校验（仅开发） |
+| | `BOT_DB_PATH` | `data/adbot.db` | file 后端路径（本轮回落内存） |
+| | `BOT_DB_FSYNC` | `false` | file 后端是否 fsync |
+| 保留 | `BOT_RETENTION` | `72h` | 全局保留时长（0/负 = 永久） |
+| | `BOT_RETENTION_SUSPECT` / `_SIGNATURE` | 空 | 分类覆盖，空 = 跟随全局 |
+| | `BOT_RETENTION_SLIDING` | `true` | 滑动过期 |
+| | `BOT_SWEEP_INTERVAL` | `10m` | janitor 清扫间隔 |
+| | `BOT_MAX_SUSPECTS` / `BOT_MAX_SIGNATURES` | `50000` | 容量护栏 |
+| AI | `BOT_AI_BASE_URL` | `https://mimo.xn--ug8h.eu.org/v1` | OpenAI 兼容网关 |
+| | `BOT_AI_API_KEY` | 空 | 判定 key；缺则跳过 AI 并 WARN |
+| | `BOT_AI_MODELS` | 三模型逗号链 | 模型回退链 |
+| | `BOT_AI_MODEL` | `mimo-v2.6-pro-ultraspeed-studio` | 兼容旧单模型，`MODELS` 优先 |
+| | `BOT_AI_TIMEOUT` | `30s` | 单次判定超时 |
+| | `BOT_AI_RETRY_INTERVAL` / `_MAX_ATTEMPTS` / `_QUEUE` | `10s` / `5` / `500` | 固定间隔重试 |
+| | `BOT_AI_MIN_CONFIDENCE` | `0.85` | 置信度阈值，不足触发复核 |
+| | `BOT_AI_VERIFY_VOTES` / `_MODELS` / `_MAJORITY` / `_TIMEOUT` | `3` / `mimo-v2.6-flash` / `2` / `20s` | 并发复核 |
+| | `BOT_AI_FALLBACK_BASE_URL` / `_API_KEY` / `_MODELS` | 空 | 备用 provider（可选） |
+| | `BOT_SIMHASH_DISTANCE` | `3` | 相似度匹配 |
+| | `BOT_LOCAL_RULES_ENABLED` / `_THRESHOLD` / `_KEYWORDS` | `true` / `3` / 空 | 本地规则兜底 |
+| 运行 | `BOT_POLL_TIMEOUT` / `BOT_WORKERS` | `30` / `4` | 轮询与并发 |
+| | `BOT_LOG_LEVEL` / `BOT_LOG_FORMAT` | `info` / `text` | 日志 |
+| | `BOT_ADMIN_TOKEN` | 空 | 非空开放 `/admin/*` |
+| | `BOT_VERSION` | `dev` | 构建注入 |
+
+> 所有变量走环境变量，代码不硬编码真实凭据。启动日志与 `-selftest` 输出会**脱敏**
+> （token/password 只显示前缀或不显示）。
+
+## HTTP 接口
+
+- `/` → `200 adbot ok`
+- `/healthz` / `/readyz` → 存活 / 就绪（就绪检查存储 `Ping`）
+- `/statusz` → JSON 状态快照：版本、uptime、轮询/处置/删除计数、AI 调用与失败、
+  各类记录条数、`store_backend`、`retention` / `retention_suspect` / `retention_signature`、
+  `retention_sliding`、`sweep_interval`、`dry_run`、`started_at`
+- `/admin/signatures` → 需要 `BOT_ADMIN_TOKEN`（`Authorization: Bearer`），
+  `GET`/`POST`/`DELETE` 维护 bio/msg 签名库
 
 ## belmo 部署
 
-1. 导入仓库到 belmo，build pack 选 **Nixpacks**。
+1. 导入仓库到 belmo，build pack 选 **Nixpacks**（`app/nixpacks.toml` 已固定：`go build -o app .`）。
+   依赖只有 `github.com/go-telegram/bot`，`go mod download` 走默认即可。
 2. **Base Directory: `app`**（关键——留空则检测不到 Go 项目）。
-3. Build / Start 命令**留空**，`app/nixpacks.toml` 已固定（`go build -o app .` / `./app`）。
+3. Build / Start 命令**留空**。
 4. **端口 `3000`**（`BOT_ADDR` 默认 `:3000`）。
-5. 配置环境变量（至少 `BOT_TOKEN`、`BOT_AI_API_KEY`；生产建议再配 `BOT_REDIS_URL` 与 `BOT_ADMIN_TOKEN`）。
+5. 配置环境变量：至少 `BOT_TOKEN`、`BOT_CHATS`、`BOT_ADMIN_USERS`，以及 `BOT_AI_API_KEY`
+   （可选 `BOT_ADMIN_TOKEN`；`BOT_STORE` 默认 `memory` 即可，belmo 文件系统疑似只读、外网 Redis 不通）。
 
 ## 自检 CLI（连通性验收）
 
 ```bash
-./app -selftest
+# 仓库根，先建 .env（从 app/.env.example 复制并填值）
+cd app && go run . -selftest
+# 或已构建产物
+./adbot -selftest
 ```
 
-依次检查：配置解析（脱敏摘要）→ Redis（PING + SET/GET/DEL 往返）→ AI（发一条
-「专业办理各种证件 加V信 xxx」判定并打印 JSON 与耗时）→ Telegram（`getMe`）。
-每项输出 `[PASS]/[FAIL]`，任一项失败时退出码非 0。
-
-```bash
-BOT_TOKEN=xxx BOT_AI_API_KEY=yyy BOT_REDIS_URL=rediss://:pw@host:6379 ./app -selftest
-```
+依次检查：配置解析（脱敏摘要 + **生效 TTL 配置**）→ 存储（后端 + 各表当前条数）→
+AI（发「专业办理各种证件 加V信 xxx」判定并打印 JSON 与耗时）→ Telegram（`getMe`）。
+每项输出 `[PASS]/[FAIL]`，任一项失败退出码非 0。
 
 ## 本地运行
 
 ```bash
-# 直接跑（内存存储，适合开发）
-cd app && BOT_TOKEN=xxx BOT_AI_API_KEY=yyy go run . 
+# 内存存储（默认），适合开发
+cd app && cp .env.example .env   # 填入 BOT_TOKEN 等再启动
+set -a && . ./.env && set +a && go run .
 
-# docker（仓库根）
+# docker（仓库根，从 .env 读取）
 docker compose up --build
 
 # 测试（全程离线，无需 Redis/Telegram/网络）
-cd app && go build ./... && go vet ./... && go test ./... -count=1
+cd app && go build ./... && go vet ./... && go test ./... -race -count=1
 ```
 
 ## 部署前给 Bot 的权限要求
 
 - 把 Bot 加进目标群并设为**管理员**，务必勾选 **删除消息（Delete messages）** 权限，
   否则无法删除他人消息；`banChatMember` 也要求 Bot 有管理员身份。
-- 建议开启 `/setprivacy` 设为 *Disabled*？——实际由 `getUpdates` 的
-  `allowed_updates`（`message` + `chat_member`）驱动，`my_chat_member` 仅用于忽略自身状态变更。
+- 轮询由库 `WithAllowedUpdates`（`message` + `chat_member` + `my_chat_member`）驱动。
 
 ## 已知限制
 
 - **>48h 的消息不可删**：Bot API 限制，删除失败只记 warn，不中断处置流程。
 - **bio 仅 `getChat` 可取**：单聊/用户 chat 才返回 `bio`，取不到时留空继续（不算错误）。
-- **Bot API 不能按用户批量删历史消息**：因此靠「观察期消息 id 记录」
-  （`adbot:track:<chat>:<uid>`，上限 `BOT_MAX_TRACKED_MSGS`）删除已知消息——
-  入群前的历史消息不在记录内，无法删除。
-- **AI 判定存在误封风险**：解析失败/超时一律 fail-safe（不处置）；AI 判定的广告
-  会回写签名库，但误判也会沉淀为签名，需用 `/admin/signatures` 人工维护修正。
+- **只删触发消息**：不再记录观察期消息 id、不做批量删除；入群前的历史消息无法删除。
+- **AI 判定存在误封风险**：解析失败/超时一律 fail-safe（不处置）；AI 判定的广告会回写签名库，
+  误判也会沉淀为签名，需用 `/admin/signatures` 人工维护修正。
 
 ## 目录
 
@@ -137,20 +192,23 @@ cd app && go build ./... && go vet ./... && go test ./... -count=1
 ├── Dockerfile
 ├── docker-compose.yml
 ├── README.md
+├── .gitignore              # 含 .env，绝不入库真实凭据
+├── .dockerignore           # 排除 .env / .git / 日志 / 构建产物
 └── app/
-    ├── go.mod                 # module adbot，无任何 require（stdlib only）
-    ├── nixpacks.toml
-    ├── .env.example
-    ├── main.go                # 入口：配置、存储、AI、poller、HTTP、优雅退出
-    ├── poller.go              # getUpdates long polling + 409/网络退避
-    ├── selftest.go            # ./app -selftest 连通性验收
+    ├── go.mod / go.sum     # module adbot；唯一依赖 github.com/go-telegram/bot v1.27.0
+    ├── nixpacks.toml       # belmo 构建固定
+    ├── .env.example        # 环境变量契约（§6）
+    ├── main.go             # 入口：配置、存储、AI、HTTP、janitor、优雅退出
+    ├── janitor.go          # TTL/capacity 清扫 goroutine
+    ├── poller.go           # 库驱动 long-poll 的文档锚点
+    ├── selftest.go         # -selftest 连通性验收
     └── internal/
-        ├── ai/                # OpenAI 兼容判定（围栏剥离、脏输出、重试、fail-safe）
-        ├── bot/               # 决策核心：入群/发言/AI/签名命中/处置
-        ├── config/            # 环境变量加载与脱敏
-        ├── logx/              # 结构化日志（text/json）
-        ├── normalize/         # 归一化 + sha1 签名
-        ├── server/            # HTTP :3000（health/ready/status/admin）
-        ├── store/             # Store 接口 + Memory + Redis（手写 RESP）
-        └── telegram/          # 手写 Bot API 客户端
+        ├── ai/             # OpenAI 兼容判定（重试、fail-safe）
+        ├── bot/            # 决策核心：命令/入群/发言/AI/签名命中/处置/白名单
+        ├── config/         # 环境变量加载、脱敏、未识别变量告警
+        ├── logx/           # 结构化日志（text/json）
+        ├── normalize/      # 归一化 + sha1 签名
+        ├── server/         # HTTP :3000（health/ready/status/admin）
+        ├── store/          # Store 接口 + Memory/Redis + Sweeper
+        └── telegram/       # go-telegram/bot 薄封装（领域类型 + 错误映射）
 ```

@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"time"
 
+	"adbot/internal/config"
 	"adbot/internal/logx"
 	"adbot/internal/normalize"
 	"adbot/internal/store"
@@ -17,24 +18,35 @@ import (
 // Inspector is the subset of the bot the server reads for /statusz.
 type Inspector interface {
 	Stats() (poll, punished, aiCalls, aiFails int64)
+	DeleteStats() (deleted, failed int64)
+	Uptime() time.Duration
 }
 
 // Server carries dependencies for building the mux.
 type Server struct {
 	Store      store.Store
 	Bot        Inspector
+	Cfg        config.Config
 	AdminToken string
 	Version    string
 	StartedAt  time.Time
 	Log        *logx.Logger
 }
 
-// New builds a Server.
-func New(st store.Store, bot Inspector, adminToken, version string, log *logx.Logger) *Server {
+// New builds a Server from the full config.
+func New(st store.Store, bot Inspector, cfg config.Config, log *logx.Logger) *Server {
 	if log == nil {
 		log = logx.New(nil, logx.Info, "text", "http")
 	}
-	return &Server{Store: st, Bot: bot, AdminToken: adminToken, Version: version, StartedAt: time.Now(), Log: log}
+	return &Server{
+		Store:      st,
+		Bot:        bot,
+		Cfg:        cfg,
+		AdminToken: cfg.AdminToken,
+		Version:    cfg.Version,
+		StartedAt:  time.Now(),
+		Log:        log,
+	}
 }
 
 // Handler returns the routed http.Handler.
@@ -47,7 +59,6 @@ func (s *Server) Handler() http.Handler {
 	if s.AdminToken != "" {
 		mux.HandleFunc("/admin/signatures", s.handleAdminSignatures)
 	} else {
-		// Route closed: 404.
 		mux.HandleFunc("/admin/signatures", func(w http.ResponseWriter, r *http.Request) {
 			http.NotFound(w, r)
 		})
@@ -76,7 +87,7 @@ func (s *Server) handleReady(w http.ResponseWriter, r *http.Request) {
 	if err := s.Store.Ping(ctx); err != nil {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		w.WriteHeader(http.StatusServiceUnavailable)
-		w.Write([]byte("redis: " + err.Error() + "\n"))
+		w.Write([]byte("store: " + err.Error() + "\n"))
 		return
 	}
 	w.WriteHeader(http.StatusOK)
@@ -87,32 +98,44 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
 	defer cancel()
 
-	redisOK := true
-	redisErr := ""
+	storeOK := true
+	storeErr := ""
 	if err := s.Store.Ping(ctx); err != nil {
-		redisOK = false
-		redisErr = err.Error()
+		storeOK = false
+		storeErr = err.Error()
 	}
 	suspects, _ := s.Store.SuspectCount(ctx)
 	bioSigs, _ := s.Store.BioSigCount(ctx)
 	msgSigs, _ := s.Store.MsgSigCount(ctx)
 	punished, _ := s.Store.Punished(ctx)
 	poll, _, aiCalls, aiFails := s.Bot.Stats()
+	deleted, deleteFails := s.Bot.DeleteStats()
 
+	// Retention/sweep reporting best-effort: the janitor lives in main and is
+	// not wired into the server for this round beyond TTL config.
 	body := map[string]any{
-		"version":        s.Version,
-		"uptime_seconds": int64(time.Since(s.StartedAt).Seconds()),
-		"poll_count":     poll,
-		"punish_count":   punished,
-		"ai_calls":       aiCalls,
-		"ai_failures":    aiFails,
-		"suspects":       suspects,
-		"bio_signatures": bioSigs,
-		"msg_signatures": msgSigs,
-		"redis_ok":       redisOK,
-		"redis_error":    redisErr,
-		"ai_ok":          true, // liveness of AI is best-effort; errors counted above
-		"started_at":     s.StartedAt.Format(time.RFC3339),
+		"version":             s.Version,
+		"uptime_seconds":      int64(time.Since(s.StartedAt).Seconds()),
+		"poll_count":          poll,
+		"punish_count":        punished,
+		"ai_calls":            aiCalls,
+		"ai_failures":         aiFails,
+		"deleted_count":       deleted,
+		"delete_failed":       deleteFails,
+		"suspects":            suspects,
+		"bio_signatures":      bioSigs,
+		"msg_signatures":      msgSigs,
+		"store_ok":            storeOK,
+		"store_error":         storeErr,
+		"store_backend":       s.Cfg.Store,
+		"retention":           s.Cfg.Retention.String(),
+		"retention_suspect":   s.Cfg.RetentionFor("suspect").String(),
+		"retention_signature": s.Cfg.RetentionFor("signature").String(),
+		"retention_sliding":   s.Cfg.RetentionSliding,
+		"sweep_interval":      s.Cfg.SweepInterval.String(),
+		"dry_run":             s.Cfg.DryRun,
+		"ai_ok":               true, // liveness is best-effort; errors counted above
+		"started_at":          s.StartedAt.Format(time.RFC3339),
 	}
 	writeJSON(w, http.StatusOK, body)
 }
