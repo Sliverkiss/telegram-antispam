@@ -178,7 +178,9 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		"ai_ok":               true, // liveness is best-effort; errors counted above
 		"started_at":          s.StartedAt.Format(time.RFC3339),
 		// amend3 additions ---------------------------------------------------
-		"ai_models": s.Cfg.AIEffectiveModels(),
+		"ai_models":              s.Cfg.AIEffectiveModels(),
+		"ai_base_url_host":       s.Cfg.AIBaseURLHost(),
+		"ai_base_url_configured": s.Cfg.AIBaseURLConfigured(),
 		"ai_model_stats": map[string]any{
 			"calls": aiSnap.ModelCalls,
 			"oks":   aiSnap.ModelOKs,

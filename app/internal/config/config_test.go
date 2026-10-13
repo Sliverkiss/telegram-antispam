@@ -188,6 +188,41 @@ func TestLoadEnv(t *testing.T) {
 	}
 }
 
+func TestAIBaseURLDiagnostics(t *testing.T) {
+	clearBOT(t)
+	c := Load()
+	if c.AIBaseURLConfigured() {
+		t.Error("shipped placeholder must not count as configured")
+	}
+	if got := c.AIBaseURLHost(); got != "api.your-gateway.invalid" {
+		t.Errorf("placeholder host = %q", got)
+	}
+
+	t.Setenv("BOT_AI_BASE_URL", "https://gw.example.com/v1")
+	c = Load()
+	if !c.AIBaseURLConfigured() {
+		t.Error("real endpoint must count as configured")
+	}
+	if got := c.AIBaseURLHost(); got != "gw.example.com" {
+		t.Errorf("configured host = %q", got)
+	}
+
+	t.Setenv("BOT_AI_BASE_URL", "not a url")
+	c = Load()
+	if got := c.AIBaseURLHost(); got != "<invalid>" {
+		t.Errorf("invalid host = %q", got)
+	}
+	if !c.AIBaseURLConfigured() {
+		t.Error("non-placeholder junk still counts as configured (WARN is separate)")
+	}
+
+	t.Setenv("BOT_AI_BASE_URL", "")
+	c = Load()
+	if c.AIBaseURLConfigured() {
+		t.Error("empty must not count as configured")
+	}
+}
+
 func TestChatsNegativeIDsAndList(t *testing.T) {
 	clearBOT(t)
 	t.Setenv("BOT_CHATS", "-1001234567890,-100200300,")

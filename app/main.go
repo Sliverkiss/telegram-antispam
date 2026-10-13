@@ -99,10 +99,20 @@ func main() {
 	if cfg.AIKey == "" {
 		log.Warn("ai_key_missing", "summary", "BOT_AI_API_KEY 未配置：将跳过 AI 判定，绝不误封")
 	}
-	if cfg.AIBaseURL == "" || strings.Contains(cfg.AIBaseURL, ".invalid") {
+	if !cfg.AIBaseURLConfigured() {
 		log.Warn("ai_base_url_missing",
 			"summary", "BOT_AI_BASE_URL 未配置（仍是占位符）：AI 判定会全部失败并走本地规则兜底，请在环境变量里填入你的 OpenAI 兼容网关")
 	}
+	// Ops visibility: which gateway actually arrived in this process's
+	// environment (host only — never the key). Makes a platform variable that
+	// was not injected obvious at a glance, instead of surfacing later as a
+	// DNS error deep in the AI chain.
+	log.Info("ai_config",
+		"base_url_host", cfg.AIBaseURLHost(),
+		"base_url_configured", cfg.AIBaseURLConfigured(),
+		"api_key_set", cfg.AIKey != "",
+		"models", strings.Join(cfg.AIEffectiveModels(), ","),
+		"prompt_version", ai.PromptVersion)
 
 	// AI provider chain: primary + optional fallback provider.
 	primary := ai.NewClient(ai.ClientConfig{

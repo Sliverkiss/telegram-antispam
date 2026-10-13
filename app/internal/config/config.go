@@ -12,6 +12,7 @@ package config
 
 import (
 	"fmt"
+	"net/url"
 	"os"
 	"sort"
 	"strconv"
@@ -334,6 +335,27 @@ func (c Config) Validate() error {
 		return fmt.Errorf("BOT_SWEEP_INTERVAL must be > 0")
 	}
 	return nil
+}
+
+// AIBaseURLHost returns the host of the configured AI gateway (no scheme, no
+// path, no credentials) for ops diagnostics — never exposes the API key.
+// Empty when BOT_AI_BASE_URL is unset or unparseable.
+func (c Config) AIBaseURLHost() string {
+	if strings.TrimSpace(c.AIBaseURL) == "" {
+		return ""
+	}
+	u, err := url.Parse(c.AIBaseURL)
+	if err != nil || u.Host == "" {
+		return "<invalid>"
+	}
+	return u.Host
+}
+
+// AIBaseURLConfigured reports whether BOT_AI_BASE_URL holds a real endpoint
+// (i.e. is set and not the shipped placeholder).
+func (c Config) AIBaseURLConfigured() bool {
+	h := strings.TrimSpace(c.AIBaseURL)
+	return h != "" && !strings.Contains(h, ".invalid")
 }
 
 // UnrecognizedBotVars returns the BOT_* variables that were set but are not
