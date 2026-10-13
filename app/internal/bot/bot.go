@@ -90,8 +90,14 @@ type Bot struct {
 	// nil → no caching (direct API call each time).
 	adminCache *adminCache
 
-	// judgeClock is stubbed in tests to control timing-sensitive flows.
-	judgeClock func() time.Time
+	// judgeClock is the clock the ⏱️ 处理时间 stamp uses; held in an
+	// atomic.Value so a test can stub it while pool chains read it
+	// concurrently (amend6 A: judgments now run off the update handler).
+	judgeClock atomic.Value // func() time.Time
+
+	// judgePool runs AI judgments off the update handler (amend6 A); nil or
+	// disabled → the legacy inline path. main wires it after New.
+	judgePool *judgePool
 
 	startedAt time.Time
 
@@ -114,7 +120,7 @@ func New(st store.Store, tg TelegramClient, classify AIClassifier, verify Verifi
 	if m, ok := st.(*store.Memory); ok {
 		m.SetSimhashDistance(cfg.SimhashDistance)
 	}
-	return &Bot{
+	b := &Bot{
 		Store:      st,
 		TG:         tg,
 		AI:         classify,
@@ -125,13 +131,46 @@ func New(st store.Store, tg TelegramClient, classify AIClassifier, verify Verifi
 		Images:     store.NewImageCache(5000),
 		AIStats:    ai.NewStats(),
 		adminCache: newAdminCache(cfg.AdminCacheTTL, cfg.AdminCacheMax),
-		judgeClock: time.Now,
+		judgeClock: atomic.Value{},
 		startedAt:  time.Now(),
 	}
+	b.judgePool = newJudgePool(b, cfg)
+	return b
 }
 
 // Uptime returns the time since the bot started.
 func (b *Bot) Uptime() time.Duration { return time.Since(b.startedAt) }
+
+// StartJudgePool launches the async judgment pool (amend6 A). No-op when the
+// pool is disabled (BOT_JUDGE_ASYNC=false) — submitJudge then runs inline.
+func (b *Bot) StartJudgePool(ctx context.Context) {
+	if b.judgePool == nil {
+		return
+	}
+	b.judgePool.startWorkers(ctx)
+}
+
+// StopJudgePool gracefully drains the judgment pool (amend6 A: called BEFORE
+// shutdown_complete is logged). Idempotent; no-op when unwired.
+func (b *Bot) StopJudgePool() {
+	if b.judgePool == nil {
+		return
+	}
+	b.judgePool.Stop()
+}
+
+// JudgePoolStats exposes the /statusz gauges (amend6 A.4).
+func (b *Bot) JudgePoolStats() (async bool, concurrency, queued, inflight, cap, enqueued, full int64) {
+	return b.judgePool.StatsSnapshot()
+}
+
+// JudgePoolDrainBudget is the graceful-shutdown budget (for /statusz).
+func (b *Bot) JudgePoolDrainBudget() time.Duration {
+	if b.judgePool == nil {
+		return 0
+	}
+	return b.judgePool.drain
+}
 
 // Stats returns a snapshot for /statusz.
 func (b *Bot) Stats() (poll, punished, aiCalls, aiFails int64) {
@@ -151,13 +190,17 @@ func (b *Bot) ExtraStats() (localFallback, simhashHits int64) {
 // NotifySnapshotRaw is kept (see serverstats.go); the public NotifySnapshot
 // name is bound to the server view adapter.
 
-// now returns the judge clock reading (real time unless a test froze it).
+// now returns the judge clock reading (real time unless a test stubbed it via
+// setJudgeClock; safe to call from pool chains concurrently).
 func (b *Bot) now() time.Time {
-	if b.judgeClock == nil {
-		return time.Now()
+	if f, ok := b.judgeClock.Load().(func() time.Time); ok && f != nil {
+		return f()
 	}
-	return b.judgeClock()
+	return time.Now()
 }
+
+// setJudgeClock stubs the judge clock (tests only).
+func (b *Bot) setJudgeClock(f func() time.Time) { b.judgeClock.Store(f) }
 
 // NotePoll bumps the poll counter (called once per getUpdates round).
 func (b *Bot) NotePoll() { b.pollCount.Add(1) }
@@ -346,22 +389,25 @@ func (b *Bot) screenNewMember(ctx context.Context, chatID int64, u telegram.User
 	}
 
 	// Not hit + non-empty bio → AI (bio mode: the same must-kill list plus the
-	// self-promotion clause).
+	// self-promotion clause). Async: the update handler returns immediately;
+	// the join key serializes this judgment ahead of the same user's first
+	// judgeable message (amend6 A.3).
 	if strings.TrimSpace(bio) == "" {
 		return
 	}
-	b.judge(ctx, judgmentInput{
-		key:       joinKey(u.ID),
-		kind:      "join",
-		chatID:    chatID,
-		messageID: joinMsgID,
-		uid:       u.ID,
-		username:  u.Username,
-		firstName: u.FirstName,
-		text:      bio,
-		mode:      "bio",
-		punish:    true,
-		writeBio:  true,
+	b.submitJudge(ctx, judgmentInput{
+		key:        joinKey(u.ID),
+		kind:       "join",
+		chatID:     chatID,
+		messageID:  joinMsgID,
+		uid:        u.ID,
+		username:   u.Username,
+		firstName:  u.FirstName,
+		text:       bio,
+		mode:       "bio",
+		punish:     true,
+		writeBio:   true,
+		enqueuedAt: b.now(),
 	})
 }
 
@@ -466,7 +512,10 @@ func (b *Bot) HandleMessage(ctx context.Context, m telegram.Message) {
 	}
 
 	// Suspect, not a known signature → AI (photo multimodal when present).
-	b.judge(ctx, judgmentInput{
+	// Async: the update handler returns immediately (amend6 A.3); the message
+	// key serializes this judgment per chat:message while different users'
+	// judgments run concurrently.
+	b.submitJudge(ctx, judgmentInput{
 		key:          msgKey(chatID, m.MessageID),
 		kind:         "message",
 		chatID:       chatID,
@@ -480,6 +529,7 @@ func (b *Bot) HandleMessage(ctx context.Context, m telegram.Message) {
 		mode:         "message",
 		punish:       true,
 		writeMsg:     true,
+		enqueuedAt:   b.now(),
 	})
 }
 
@@ -506,6 +556,9 @@ type judgmentInput struct {
 	writeMsg     bool   // write the message signature on an ad verdict
 	writeBio     bool   // write the bio signature on an ad verdict
 	retries      int    // AI retry rounds already consumed (🔁 line)
+	// enqueuedAt stamps the submitJudge handoff (judge_dequeued wait_ms).
+	// zero on the legacy/retry paths — judgepool treats zero as "now".
+	enqueuedAt time.Time
 }
 
 func msgKey(chatID, messageID int64) string {
@@ -516,17 +569,36 @@ func joinKey(uid int64) string {
 	return fmt.Sprintf("join:%d", uid)
 }
 
+// submitJudge is the ONLY judgment entry point from update handlers (amend6
+// A.3): async (enqueue, milliseconds) when the pool is on, inline legacy
+// otherwise (escape hatch / tests that never started the pool).
+// EXCEPTION: the /check admin command stays fully synchronous by design — a
+// human asked for a verdict and is waiting for the reply (cmdCheck).
+func (b *Bot) submitJudge(ctx context.Context, in judgmentInput) bool {
+	if b.judgePool == nil {
+		b.judge(ctx, in) // unwired (tests): legacy inline behavior
+		return true
+	}
+	return b.judgePool.submitJudge(ctx, in)
+}
+
 // judge runs the primary judgment; failures and unresolved votes go to the
-// retry queue (the poll loop is never blocked).
+// retry queue. It executes ON A POOL CHAIN RUNNER (amend6 A) — never inline on
+// the update handler, which is what used to block the single library worker
+// for the whole BOT_AI_TIMEOUT chain walk.
 func (b *Bot) judge(ctx context.Context, in judgmentInput) {
 	start := b.startJudge()
 	verdict, model, ok, imageURL := b.runAI(ctx, in)
 	if !ok {
 		b.aiFails.Add(1)
 		b.enqueueRetry(in, "chain_failed")
+		b.Log.Info("judge_done", "key", in.key, "kind", in.kind, "uid", in.uid,
+			"outcome", "retry", "judge_ms", b.endJudge(start).Milliseconds())
 		return
 	}
 	b.finishJudgment(ctx, in, verdict, model, imageURL, b.endJudge(start))
+	b.Log.Info("judge_done", "key", in.key, "kind", in.kind, "uid", in.uid,
+		"outcome", "verdict", "is_ad", verdict.IsAd, "judge_ms", b.endJudge(start).Milliseconds())
 }
 
 // runAI performs the AI round (with image download + cache) and returns the

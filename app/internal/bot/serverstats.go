@@ -43,3 +43,20 @@ func (b *Bot) NotifySnapshotRaw() notify.Stats {
 	}
 	return b.Notifier.Snapshot()
 }
+
+// JudgePoolView adapts the judge-pool gauges into the server's plain view
+// (amend6 A.4). BOT_UPDATE_WORKERS rides along so /statusz shows the library
+// worker count next to the pool gauges.
+func (b *Bot) JudgePoolView() server.JudgePoolView {
+	async, conc, queued, inflight, cap, enq, full := b.JudgePoolStats()
+	return server.JudgePoolView{
+		Async:          async,
+		Concurrency:    conc,
+		Queued:         queued,
+		Inflight:       inflight,
+		QueueCap:       cap,
+		EnqueuedTotal:  enq,
+		QueueFullTotal: full,
+		UpdateWorkers:  b.Cfg.UpdateWorkers,
+	}
+}

@@ -222,6 +222,126 @@ func TestClassifyRequestShape(t *testing.T) {
 	}
 }
 
+// --- Thinking-off on EVERY request (amend6 C) -----------------------------------
+//
+// The user asked for proof that thinking is off. These tests capture EVERY
+// request body via httptest and assert reasoning_effort="none" AND
+// chat_template_kwargs.enable_thinking=false per request — fallback chain
+// models 2/3, every verify lane, the multimodal image request, and the bio
+// prompt mode. Not just the first model.
+
+func assertThinkingOff(t *testing.T, body map[string]any, context string) {
+	t.Helper()
+	if body["reasoning_effort"] != "none" {
+		t.Errorf("[%s] reasoning_effort = %v, want none", context, body["reasoning_effort"])
+	}
+	kwargs, _ := body["chat_template_kwargs"].(map[string]any)
+	if kwargs == nil || kwargs["enable_thinking"] != false {
+		t.Errorf("[%s] chat_template_kwargs = %v, want {enable_thinking:false}", context, body["chat_template_kwargs"])
+	}
+	if _, bad := body["max_tokens"]; bad {
+		t.Errorf("[%s] request must not send max_tokens", context)
+	}
+}
+
+// TestThinkingOffEveryFallbackModel: models 2 and 3 of the fallback chain are
+// reached via 429/500 on the earlier ones; each captured request body must
+// carry both thinking-off fields.
+func TestThinkingOffEveryFallbackModel(t *testing.T) {
+	fg := &fakeGateway{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		json.NewDecoder(r.Body).Decode(&body)
+		model := fmt.Sprint(body["model"])
+		fg.record(model, body)
+		if model == "m1" {
+			w.WriteHeader(http.StatusTooManyRequests)
+			return
+		}
+		if model == "m2" {
+			w.WriteHeader(500)
+			return
+		}
+		w.Write([]byte(completionBody(verdictJSON(false, "无", 0.9, "ok"))))
+	}))
+	defer srv.Close()
+
+	res, ok := newClient(srv.URL, []string{"m1", "m2", "m3"}, 2*time.Second).
+		ClassifyText(context.Background(), "x", "message")
+	if !ok || res.Model != "m3" {
+		t.Fatalf("chain must succeed on the third model: ok=%v res=%+v", ok, res)
+	}
+	if fg.count("m1") != 1 || fg.count("m2") != 1 || fg.count("m3") != 1 {
+		t.Fatalf("all three models must be walked: %v", fg.calls)
+	}
+	fg.mu.Lock()
+	bodies := append([]map[string]any(nil), fg.bodies...)
+	fg.mu.Unlock()
+	if len(bodies) != 3 {
+		t.Fatalf("captured bodies = %d, want 3", len(bodies))
+	}
+	for i, body := range bodies {
+		assertThinkingOff(t, body, fmt.Sprintf("fallback model #%d", i+1))
+	}
+}
+
+// TestThinkingOffEveryVerifyLane: 3 concurrent vote lanes on the same model —
+// each lane's request body carries both thinking-off fields.
+func TestThinkingOffEveryVerifyLane(t *testing.T) {
+	fg := &fakeGateway{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		json.NewDecoder(r.Body).Decode(&body)
+		fg.record(fmt.Sprint(body["model"]), body)
+		w.Write([]byte(completionBody(verdictJSON(true, "赌博", 0.9, "ad"))))
+	}))
+	defer srv.Close()
+
+	c := newClient(srv.URL, []string{"flash"}, 2*time.Second)
+	res := Verify(context.Background(), c, VerifyConfig{Votes: 3, Models: []string{"flash"}, Majority: 2, Timeout: 2 * time.Second}, nil, Content{Text: "x"})
+	if res.Final != "ad" || res.VotesTotal != 3 {
+		t.Fatalf("verify = %+v", res)
+	}
+	fg.mu.Lock()
+	bodies := append([]map[string]any(nil), fg.bodies...)
+	fg.mu.Unlock()
+	if len(bodies) != 3 {
+		t.Fatalf("captured bodies = %d, want 3 (one per lane)", len(bodies))
+	}
+	for i, body := range bodies {
+		assertThinkingOff(t, body, fmt.Sprintf("verify lane #%d", i+1))
+	}
+}
+
+// TestThinkingOffMultimodalAndBioMode: the multimodal (image) request and the
+// bio prompt mode request both carry both thinking-off fields.
+func TestThinkingOffMultimodalAndBioMode(t *testing.T) {
+	fg := &fakeGateway{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		json.NewDecoder(r.Body).Decode(&body)
+		fg.record(fmt.Sprint(body["model"]), body)
+		w.Write([]byte(completionBody(verdictJSON(false, "无", 0.9, "ok"))))
+	}))
+	defer srv.Close()
+
+	c := newClient(srv.URL, []string{"m"}, 2*time.Second)
+	if _, ok := c.Classify(context.Background(), Content{Text: "看图", ImageURL: "data:image/jpeg;base64,AAAA"}, "message"); !ok {
+		t.Fatal("multimodal classify failed")
+	}
+	if _, ok := c.ClassifyText(context.Background(), "我擅长推广引流", "bio"); !ok {
+		t.Fatal("bio-mode classify failed")
+	}
+	fg.mu.Lock()
+	bodies := append([]map[string]any(nil), fg.bodies...)
+	fg.mu.Unlock()
+	if len(bodies) != 2 {
+		t.Fatalf("captured bodies = %d, want 2 (multimodal + bio)", len(bodies))
+	}
+	assertThinkingOff(t, bodies[0], "multimodal image request")
+	assertThinkingOff(t, bodies[1], "bio mode request")
+}
+
 // --- Multimodal request shape --------------------------------------------------
 
 func TestClassifyMultimodalRequestShape(t *testing.T) {

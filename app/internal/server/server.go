@@ -27,6 +27,22 @@ type Inspector interface {
 	AIStatsSnapshot() AISnapshot
 	// Amend4: notification subsystem counters (notify.target_ok etc.).
 	NotifySnapshot() NotifyStatsView
+	// Amend6 A: async judgement-pool gauges (nil-safe zero view when the
+	// escape hatch is on).
+	JudgePoolView() JudgePoolView
+}
+
+// JudgePoolView is the judge-pool counters the server renders (plain data so
+// server does not import bot).
+type JudgePoolView struct {
+	Async          bool
+	Concurrency    int64
+	Queued         int64
+	Inflight       int64
+	QueueCap       int64
+	EnqueuedTotal  int64
+	QueueFullTotal int64
+	UpdateWorkers  int
 }
 
 // NotifyStatsView is the notify counters the server renders (plain data so
@@ -211,6 +227,18 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		body["notify.target_ok"] = ns.TargetOK
 	}
 	body["notify"] = nb
+
+	// amend6 A: judgement-pool gauges (update_workers mirrors
+	// BOT_UPDATE_WORKERS from the config).
+	jv := s.Bot.JudgePoolView()
+	body["judge_async"] = jv.Async
+	body["judge_concurrency"] = jv.Concurrency
+	body["judge_queued"] = jv.Queued
+	body["judge_inflight"] = jv.Inflight
+	body["judge_queue_cap"] = jv.QueueCap
+	body["judge_enqueued_total"] = jv.EnqueuedTotal
+	body["judge_queue_full_total"] = jv.QueueFullTotal
+	body["update_workers"] = jv.UpdateWorkers
 	// The sweeper block only appears when the janitor has run at least once.
 	if s.Sweeper != nil {
 		at, next, droppedSus, droppedSigs, remaining, ran := s.Sweeper.SweepSnapshot()

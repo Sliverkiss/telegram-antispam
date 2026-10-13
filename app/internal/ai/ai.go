@@ -229,7 +229,7 @@ func NewClient(cfg ClientConfig) *Client {
 		cfg.Timeout = 30 * time.Second
 	}
 	if len(cfg.Models) == 0 {
-		cfg.Models = []string{"mimo-v2.6-pro-ultraspeed-studio", "mimo-v2.6-pro", "mimo-v2.6-flash"}
+		cfg.Models = []string{"mimo-v2.6-pro", "mimo-v2.6-flash", "mimo-v2.6-pro-ultraspeed-studio"}
 	}
 	ocfg := openai.DefaultConfig(cfg.APIKey)
 	if cfg.BaseURL != "" {

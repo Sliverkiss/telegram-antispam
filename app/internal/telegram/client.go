@@ -262,21 +262,38 @@ func convChatMember(m models.ChatMember) ChatMember {
 // Client talks to the Bot API through github.com/go-telegram/bot.
 type Client struct {
 	b *tgbot.Bot
+	// updateWorkers records the worker count handed to the library (0 = the
+	// library default of 1). The library keeps the live field private, so the
+	// configured value is kept here for tests and diagnostics.
+	updateWorkers int
 }
+
+// UpdateWorkers reports the configured update-dispatch worker count
+// (0 = the library default of 1).
+func (c *Client) UpdateWorkers() int { return c.updateWorkers }
 
 // Options configure the underlying library client. ServerURL is used by tests
 // to point at an httptest server (fully offline); SkipGetMe avoids the
 // library's init-time getMe on an empty/fake server.
 type Options struct {
-	ServerURL      string
-	SkipGetMe      bool
-	PollTimeout    int // long-poll seconds; 0 = library default (1m)
+	ServerURL string
+	SkipGetMe bool
+	// PollTimeout is the long-poll seconds; 0 = library default (1m).
+	PollTimeout int
+	// UpdateWorkers is the number of library update-dispatch goroutines
+	// (amend6 A.1: go-telegram/bot defaults to 1 — one slow handler blocks
+	// every other update). 0 = library default (1). Range-clamped by the
+	// config layer (1..128).
+	UpdateWorkers  int
 	AllowedUpdates []string
 	ErrorsHandler  func(error)
 }
 
 // NewClient builds a client for the given token using default opts (real
-// api.telegram.org endpoint, getMe checked at init).
+// api.telegram.org endpoint, getMe checked at init). The library default of a
+// single update worker stays in effect here; main passes BOT_UPDATE_WORKERS
+// through NewClientWithOptions so a slow handler cannot serialize the whole
+// update stream (amend6 A.1).
 func NewClient(token string) (*Client, error) {
 	return NewClientWithOptions(token, Options{})
 }
@@ -296,11 +313,14 @@ func NewClientWithOptions(token string, opts Options) (*Client, error) {
 	if len(opts.AllowedUpdates) > 0 {
 		optsT = append(optsT, tgbot.WithAllowedUpdates(opts.AllowedUpdates))
 	}
+	if opts.UpdateWorkers > 0 {
+		optsT = append(optsT, tgbot.WithWorkers(opts.UpdateWorkers))
+	}
 	b, err := tgbot.New(token, optsT...)
 	if err != nil {
 		return nil, err
 	}
-	return &Client{b: b}, nil
+	return &Client{b: b, updateWorkers: opts.UpdateWorkers}, nil
 }
 
 func (c *Client) toAPIError(method string, err error) error {

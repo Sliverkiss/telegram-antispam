@@ -112,6 +112,8 @@ func main() {
 		"base_url_configured", cfg.AIBaseURLConfigured(),
 		"api_key_set", cfg.AIKey != "",
 		"models", strings.Join(cfg.AIEffectiveModels(), ","),
+		"reasoning_effort", cfg.AIReasoningEffort,
+		"enable_thinking", false,
 		"prompt_version", ai.PromptVersion)
 
 	// AI provider chain: primary + optional fallback provider.
@@ -135,13 +137,26 @@ func main() {
 	}
 
 	// Telegram client (library-backed; real endpoint unless tests override).
-	tg, err := telegram.NewClient(cfg.Token)
+	// BOT_UPDATE_WORKERS (default 16, clamped 1..128) replaces the library's
+	// single update worker — without it ONE slow handler parks the whole
+	// update stream (measured: a 66s AI chain blocked every other update).
+	tg, err := telegram.NewClientWithOptions(cfg.Token, telegram.Options{
+		UpdateWorkers: cfg.UpdateWorkers,
+	})
 	if err != nil {
 		log.Error("telegram_init_error", "err", err.Error())
 		os.Exit(1)
 	}
 
 	b := bot.New(st, tg, chain, verify, cfg, log.WithComponent("bot"))
+
+	// Async judgement pool (amend6 A): update handlers return in milliseconds;
+	// AI chains run on pool chain runners (same-uid serial, cross-uid
+	// concurrent, bounded by BOT_JUDGE_QUEUE + BOT_AI_CONCURRENCY config,
+	// whole-chain budget BOT_AI_JUDGE_TIMEOUT). BOT_JUDGE_ASYNC=false is the
+	// one-line rollback to the legacy inline behavior.
+	judgePoolCtx, stopJudgePool := context.WithCancel(context.Background())
+	b.StartJudgePool(judgePoolCtx)
 
 	// Notification subsystem (amend4): async bounded queue + worker; the
 	// sender is the plain-text NotifySender (no parse_mode, preview off).
@@ -196,6 +211,8 @@ func main() {
 		<-sigCh
 		log.Info("shutdown_signal")
 		stopPoll()
+		stopJudgePool()
+		b.StopJudgePool() // drains up to BOT_JUDGE_DRAIN, logs judge_pool_stopped
 		stopRetry()
 		retryQ.Stop()
 		janitorStop()

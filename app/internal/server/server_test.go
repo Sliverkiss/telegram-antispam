@@ -46,6 +46,10 @@ func (s *stubBot) AIStatsSnapshot() AISnapshot {
 func (s *stubBot) NotifySnapshot() NotifyStatsView {
 	return NotifyStatsView{Enabled: true, TargetOK: true, TargetChecked: true, Sent: 7}
 }
+func (s *stubBot) JudgePoolView() JudgePoolView {
+	return JudgePoolView{Async: true, Concurrency: 8, Queued: 2, Inflight: 1,
+		QueueCap: 500, EnqueuedTotal: 42, QueueFullTotal: 0, UpdateWorkers: 16}
+}
 
 // fakeSweep reports a fixed (already-run) sweep for /statusz rendering.
 type fakeSweep struct{}

@@ -62,8 +62,24 @@ func TestLoadDefaults(t *testing.T) {
 	if c.PollTimeout != 30 || c.Workers != 4 {
 		t.Errorf("PollTimeout/Workers = %d/%d", c.PollTimeout, c.Workers)
 	}
-	if c.AITimeout != 60*time.Second {
+	if c.AITimeout != 90*time.Second {
 		t.Errorf("AITimeout = %s", c.AITimeout)
+	}
+	// amend6 B: whole-chain judge budget + async pool knobs.
+	if c.AIJudgeTimeout != 150*time.Second {
+		t.Errorf("AIJudgeTimeout = %s", c.AIJudgeTimeout)
+	}
+	if !c.JudgeAsync {
+		t.Error("JudgeAsync default should be true")
+	}
+	if c.JudgeQueue != 500 || c.JudgeConcurrency != 8 {
+		t.Errorf("judge pool = %d/%d, want 500/8", c.JudgeQueue, c.JudgeConcurrency)
+	}
+	if c.JudgeDrain != 10*time.Second {
+		t.Errorf("JudgeDrain = %s", c.JudgeDrain)
+	}
+	if c.UpdateWorkers != 16 {
+		t.Errorf("UpdateWorkers = %d, want 16", c.UpdateWorkers)
 	}
 	if c.RetryInterval != 10*time.Second || c.RetryMax != 5 || c.RetryQueue != 500 {
 		t.Errorf("retry = %s/%d/%d", c.RetryInterval, c.RetryMax, c.RetryQueue)
@@ -288,6 +304,48 @@ func TestAIModelCompatSingle(t *testing.T) {
 // Before the fix, AIEffectiveModels fell through to the single default model
 // id, silently disabling fallback so one upstream timeout killed the
 // judgment outright.
+// amend6 B.3: the default chain is exactly
+// pro → flash → ultraspeed-studio with pro first (the hanging ultraspeed
+// model moved to the tail), and BOT_AI_MODELS still overrides it verbatim.
+func TestDefaultChainOrderProFirst(t *testing.T) {
+	clearBOT(t)
+	c := Load()
+	got := c.AIEffectiveModels()
+	want := []string{"mimo-v2.6-pro", "mimo-v2.6-flash", "mimo-v2.6-pro-ultraspeed-studio"}
+	if len(got) != len(want) {
+		t.Fatalf("default chain = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("default chain = %v, want %v (pro must be first)", got, want)
+		}
+	}
+	// The four shipped surfaces agree (config / .env.example /
+	// docker-compose.yml / README).
+	if d := DefaultAIModelChain(); strings.Join(d, ",") != strings.Join(want, ",") {
+		t.Errorf("DefaultAIModelChain = %v, want %v", d, want)
+	}
+	envChain, err := os.ReadFile(".env.example")
+	if err == nil {
+		line := ""
+		for _, l := range strings.Split(string(envChain), "\n") {
+			if strings.HasPrefix(l, "BOT_AI_MODELS=") {
+				line = strings.TrimPrefix(l, "BOT_AI_MODELS=")
+				break
+			}
+		}
+		if line != strings.Join(want, ",") {
+			t.Errorf(".env.example BOT_AI_MODELS = %q, want %q", line, strings.Join(want, ","))
+		}
+	}
+	// BOT_AI_MODELS set → it wins.
+	t.Setenv("BOT_AI_MODELS", "x-model,y-model")
+	c2 := Load()
+	if strings.Join(c2.AIEffectiveModels(), ",") != "x-model,y-model" {
+		t.Errorf("override = %v, want BOT_AI_MODELS to win", c2.AIEffectiveModels())
+	}
+}
+
 func TestAIEffectiveModelsDefaultsToFullChain(t *testing.T) {
 	clearBOT(t)
 	t.Setenv("BOT_AI_BASE_URL", "https://gw.example.com/v1")

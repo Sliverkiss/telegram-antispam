@@ -3,11 +3,14 @@ package telegram
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 // newTestServer returns an httptest server emulating just enough of the Bot API
@@ -241,5 +244,117 @@ func TestIsRetriable(t *testing.T) {
 	}
 	if IsRetriable(&APIError{Code: 403}) {
 		t.Error("403 should not be retriable")
+	}
+}
+
+// --- amend6 A.1: UpdateWorkers → library WithWorkers --------------------------
+
+// TestClientUpdateWorkersFunctional: with UpdateWorkers=4, four updates arrive
+// while one handler is parked on a 400ms sleep — the other three handlers run
+// CONCURRENTLY (total wall time < 4×400ms), proving the client no longer
+// serializes updates through a single worker (defaultWorkers=1 in the
+// library). Fully offline: an httptest fake Bot API with a fast getUpdates
+// response, never Start()ing a real long-poll.
+func TestClientUpdateWorkersFunctional(t *testing.T) {
+	const updates = 4
+	const sleep = 400 * time.Millisecond
+	var inflight, maxInflight atomic.Int64
+	var polls atomic.Int64
+
+	// Own server (not newTestServer) so UpdateWorkers can be passed through
+	// NewClientWithOptions — the exact path main.go takes.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if !strings.HasSuffix(r.URL.Path, "/getUpdates") {
+			json.NewEncoder(w).Encode(map[string]any{"ok": true, "result": true})
+			return
+		}
+		// Two rounds: first delivers `updates` messages, second is empty.
+		if polls.Add(1) == 1 {
+			msgs := make([]map[string]any, updates)
+			for i := range msgs {
+				msgs[i] = map[string]any{
+					"update_id": i + 1,
+					"message": map[string]any{"message_id": i + 1, "text": fmt.Sprintf("m%d", i),
+						"chat": map[string]any{"id": -500, "type": "supergroup"},
+						"from": map[string]any{"id": 7, "is_bot": false, "first_name": "F"}},
+				}
+			}
+			json.NewEncoder(w).Encode(map[string]any{"ok": true, "result": msgs})
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]any{"ok": true, "result": []map[string]any{}})
+	}))
+	defer srv.Close()
+	c, err := NewClientWithOptions("123:TEST", Options{
+		ServerURL: srv.URL, SkipGetMe: true, UpdateWorkers: updates,
+	})
+	if err != nil {
+		t.Fatalf("NewClientWithOptions: %v", err)
+	}
+	if got := c.UpdateWorkers(); got != updates {
+		t.Fatalf("UpdateWorkers = %d, want %d", got, updates)
+	}
+
+	handlerDone := make(chan struct{}, updates)
+	c.RegisterDefaultHandler(func(ctx context.Context, u Update) {
+		cur := inflight.Add(1)
+		for {
+			old := maxInflight.Load()
+			if cur <= old || maxInflight.CompareAndSwap(old, cur) {
+				break
+			}
+		}
+		time.Sleep(sleep)
+		inflight.Add(-1)
+		handlerDone <- struct{}{}
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	start := time.Now()
+	go c.Start(ctx)
+	for i := 0; i < updates; i++ {
+		select {
+		case <-handlerDone:
+		case <-time.After(5 * time.Second):
+			cancel()
+			t.Fatal("handlers did not finish")
+		}
+	}
+	elapsed := time.Since(start)
+	cancel()
+	// With one worker: 4 × 400ms = 1600ms serialized. With 4 workers the four
+	// handlers overlap (≈400ms + polling slack). Assert with a wide margin.
+	if maxInflight.Load() < 2 {
+		t.Errorf("handlers must run concurrently with UpdateWorkers=4, max inflight = %d", maxInflight.Load())
+	}
+	if elapsed >= 3*sleep {
+		t.Errorf("elapsed = %v; updates look serialized (1 worker), want overlap", elapsed)
+	}
+}
+
+// TestClientUpdateWorkersConfigured: the workers option maps to the
+// configured count on the underlying library bot (unit-level).
+func TestClientUpdateWorkersConfigured(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]any{"ok": true, "result": true})
+	}))
+	defer srv.Close()
+	for _, n := range []int{1, 8, 128} {
+		c, err := NewClientWithOptions("123:TEST", Options{ServerURL: srv.URL, SkipGetMe: true, UpdateWorkers: n})
+		if err != nil {
+			t.Fatalf("NewClientWithOptions(workers=%d): %v", n, err)
+		}
+		if got := c.UpdateWorkers(); got != n {
+			t.Errorf("workers = %d, want %d", got, n)
+		}
+	}
+	// 0 = library default (1) — the option is simply not passed.
+	c, err := NewClientWithOptions("123:TEST", Options{ServerURL: srv.URL, SkipGetMe: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := c.UpdateWorkers(); got != 0 {
+		t.Errorf("default workers option = %d, want 0 (library default of 1 applies)", got)
 	}
 }

@@ -84,7 +84,7 @@
 
 ## AI 判定链路（amend2/amend3）
 
-1. **模型回退链**：`BOT_AI_MODELS`（默认 `ultraspeed-studio → pro → flash`）。429/5xx/
+1. **模型回退链**：`BOT_AI_MODELS`（默认 `pro → flash → ultraspeed-studio`，amend6 起挂死的 ultraspeed 挪到链尾）。429/5xx/
    超时/网络错误或网关池类错误码（`pool_parked`/`no_accounts`/`upstream_*`）时链内推进；
    解析契约违例**不**推进（换模型无益）。
 2. **关思考**：每个请求带 `reasoning_effort=none`（备份 `chat_template_kwargs.enable_thinking=false`），
@@ -154,7 +154,8 @@ go run . -prompteval -prompteval.models=mimo-v2.6-pro
 | | `BOT_AI_API_KEY` | 空 | 判定 key；缺则跳过 AI 并 WARN |
 | | `BOT_AI_MODELS` | 三模型逗号链 | 模型回退链 |
 | | `BOT_AI_MODEL` | `mimo-v2.6-pro-ultraspeed-studio` | 兼容旧单模型，`MODELS` 优先 |
-| | `BOT_AI_TIMEOUT` | `60s` | 单次判定超时（网关有 30s+ 长尾，勿调小） |
+| | `BOT_AI_TIMEOUT` | `90s` | 单次判定超时（amend6 放宽；异步池下不再阻塞别人） |
+| | `BOT_AI_JUDGE_TIMEOUT` | `150s` | 单条判定整条链总预算（超出转重试队列） |
 | | `BOT_AI_REASONING_EFFORT` | `none` | 关思考（网关校验过；绝不发 `max_tokens`） |
 | | `BOT_AI_PROMPT_FILE` | 空 | 覆盖内嵌提示词（调优不发版） |
 | | `BOT_AI_RETRY_INTERVAL` / `_MAX_ATTEMPTS` / `_QUEUE` | `10s` / `5` / `500` | 固定间隔重试（不退避、不熔断） |
@@ -164,6 +165,9 @@ go run . -prompteval -prompteval.models=mimo-v2.6-pro
 | | `BOT_SIMHASH_DISTANCE` | `3` | 相似度匹配（防改字绕过） |
 | | `BOT_LOCAL_RULES_ENABLED` / `_THRESHOLD` / `_KEYWORDS` | `true` / `3` / 空 | 本地规则兜底（5 次重试用尽后） |
 | 运行 | `BOT_POLL_TIMEOUT` / `BOT_WORKERS` | `30` / `4` | 轮询与并发 |
+| 判定池 | `BOT_JUDGE_ASYNC` | `true` | 判定异步池总开关（false = 旧行内同步，一行回滚） |
+| | `BOT_JUDGE_QUEUE` / `BOT_AI_CONCURRENCY` | `500` / `8` | 有界提交队列 / 判定并发（同 uid 串行） |
+| | `BOT_JUDGE_DRAIN` / `BOT_UPDATE_WORKERS` | `10s` / `16` | 优雅关闭排空预算 / 库层 update worker 数（1..128） |
 | | `BOT_LOG_LEVEL` / `BOT_LOG_FORMAT` | `info` / `text` | 日志 |
 | | `BOT_ADMIN_TOKEN` | 空 | 非空开放 `/admin/*` |
 | | `BOT_VERSION` | `dev` | 构建注入 |

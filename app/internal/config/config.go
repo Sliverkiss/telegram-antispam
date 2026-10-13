@@ -65,8 +65,9 @@ type Config struct {
 	AIModel            string   // single-model compat (BOT_AI_MODEL)
 	AIModelSet         bool     // BOT_AI_MODEL was explicitly set in the env
 	AITimeout          time.Duration
-	AIReasoningEffort  string // "none" default; overrides the thinking-off field
-	AIPromptFile       string // BOT_AI_PROMPT_FILE: override the embedded judge prompt
+	AIJudgeTimeout     time.Duration // whole-chain budget for ONE judgment (BOT_AI_JUDGE_TIMEOUT)
+	AIReasoningEffort  string        // "none" default; overrides the thinking-off field
+	AIPromptFile       string        // BOT_AI_PROMPT_FILE: override the embedded judge prompt
 	RetryInterval      time.Duration
 	RetryMax           int
 	RetryQueue         int
@@ -90,6 +91,13 @@ type Config struct {
 	LogFormat   string
 	AdminToken  string
 	Version     string
+
+	// Judgement pool (amend6 A) -------------------------------------------------
+	JudgeAsync       bool          // BOT_JUDGE_ASYNC: false = legacy inline judging
+	JudgeQueue       int           // BOT_JUDGE_QUEUE: bounded submit queue
+	JudgeConcurrency int           // BOT_AI_CONCURRENCY: pool workers
+	JudgeDrain       time.Duration // BOT_JUDGE_DRAIN: graceful-shutdown budget
+	UpdateWorkers    int           // BOT_UPDATE_WORKERS: library WithWorkers (1..128)
 
 	// Notifications (amend4) ---------------------------------------------------
 	NotifyOnPunish     bool          // BOT_NOTIFY_ON_PUNISH
@@ -141,7 +149,8 @@ func Load() Config {
 		AIModels:           models,
 		AIModel:            envOr("BOT_AI_MODEL", "mimo-v2.6-pro-ultraspeed-studio"),
 		AIModelSet:         os.Getenv("BOT_AI_MODEL") != "",
-		AITimeout:          durationEnv("BOT_AI_TIMEOUT", 60*time.Second),
+		AITimeout:          durationEnv("BOT_AI_TIMEOUT", 90*time.Second),
+		AIJudgeTimeout:     durationEnv("BOT_AI_JUDGE_TIMEOUT", 150*time.Second),
 		AIReasoningEffort:  envOr("BOT_AI_REASONING_EFFORT", "none"),
 		AIPromptFile:       os.Getenv("BOT_AI_PROMPT_FILE"),
 		RetryInterval:      durationEnv("BOT_AI_RETRY_INTERVAL", 10*time.Second),
@@ -166,6 +175,13 @@ func Load() Config {
 		LogFormat:   envOr("BOT_LOG_FORMAT", "text"),
 		AdminToken:  os.Getenv("BOT_ADMIN_TOKEN"),
 		Version:     envOr("BOT_VERSION", "dev"),
+
+		// amend6 A: async judgement pool knobs.
+		JudgeAsync:       boolEnv("BOT_JUDGE_ASYNC", true),
+		JudgeQueue:       clampInt(intEnv("BOT_JUDGE_QUEUE", 500), 1, 100000),
+		JudgeConcurrency: clampInt(intEnv("BOT_AI_CONCURRENCY", 8), 1, 256),
+		JudgeDrain:       durationEnv("BOT_JUDGE_DRAIN", 10*time.Second),
+		UpdateWorkers:    clampInt(intEnv("BOT_UPDATE_WORKERS", 16), 1, 128),
 
 		NotifyOnPunish:     boolEnv("BOT_NOTIFY_ON_PUNISH", true),
 		NotifyOnError:      boolEnv("BOT_NOTIFY_ON_ERROR", true),
@@ -212,9 +228,11 @@ func Load() Config {
 
 // DefaultAIModelChain is the canonical primary → fallback chain, matching
 // .env.example and the README. It is the default when neither BOT_AI_MODELS
-// nor BOT_AI_MODEL is set.
+// nor BOT_AI_MODEL is set. amend6 B.3: ultraspeed-studio is LAST — it is
+// currently hanging (120s read timeout), so it must never waste the head of
+// the chain; BOT_AI_MODELS still overrides without a code change.
 func DefaultAIModelChain() []string {
-	return []string{"mimo-v2.6-pro-ultraspeed-studio", "mimo-v2.6-pro", "mimo-v2.6-flash"}
+	return []string{"mimo-v2.6-pro", "mimo-v2.6-flash", "mimo-v2.6-pro-ultraspeed-studio"}
 }
 
 // AIEffectiveModels returns the model fallback chain: BOT_AI_MODELS when set,
@@ -303,6 +321,7 @@ func (c Config) Redacted() map[string]string {
 		"BOT_AI_API_KEY":            redactToken(c.AIKey),
 		"BOT_AI_MODELS":             strings.Join(c.AIEffectiveModels(), ","),
 		"BOT_AI_TIMEOUT":            c.AITimeout.String(),
+		"BOT_AI_JUDGE_TIMEOUT":      c.AIJudgeTimeout.String(),
 		"BOT_AI_REASONING_EFFORT":   c.AIReasoningEffort,
 		"BOT_AI_PROMPT_FILE":        c.AIPromptFile,
 		"BOT_AI_RETRY_INTERVAL":     c.RetryInterval.String(),
@@ -322,10 +341,16 @@ func (c Config) Redacted() map[string]string {
 		"BOT_LOCAL_KEYWORDS":        strings.Join(c.LocalKeywords, ","),
 		"BOT_POLL_TIMEOUT":          strconv.Itoa(c.PollTimeout),
 		"BOT_WORKERS":               strconv.Itoa(c.Workers),
-		"BOT_LOG_LEVEL":             c.LogLevel,
-		"BOT_LOG_FORMAT":            c.LogFormat,
-		"BOT_ADMIN_TOKEN":           redactToken(c.AdminToken),
-		"BOT_TOKEN":                 redactToken(c.Token),
+		// amend6 A: judgement-pool contract
+		"BOT_JUDGE_ASYNC":    strconv.FormatBool(c.JudgeAsync),
+		"BOT_JUDGE_QUEUE":    strconv.Itoa(c.JudgeQueue),
+		"BOT_AI_CONCURRENCY": strconv.Itoa(c.JudgeConcurrency),
+		"BOT_JUDGE_DRAIN":    c.JudgeDrain.String(),
+		"BOT_UPDATE_WORKERS": strconv.Itoa(c.UpdateWorkers),
+		"BOT_LOG_LEVEL":      c.LogLevel,
+		"BOT_LOG_FORMAT":     c.LogFormat,
+		"BOT_ADMIN_TOKEN":    redactToken(c.AdminToken),
+		"BOT_TOKEN":          redactToken(c.Token),
 	}
 }
 
@@ -402,6 +427,10 @@ func UnrecognizedBotVars() []string {
 		"BOT_POLL_TIMEOUT":   true, "BOT_WORKERS": true,
 		"BOT_LOG_LEVEL": true, "BOT_LOG_FORMAT": true,
 		"BOT_ADMIN_TOKEN": true, "BOT_VERSION": true,
+		// amend6 A (judge pool) + B (whole-chain budget)
+		"BOT_JUDGE_ASYNC": true, "BOT_JUDGE_QUEUE": true,
+		"BOT_AI_CONCURRENCY": true, "BOT_JUDGE_DRAIN": true,
+		"BOT_UPDATE_WORKERS": true, "BOT_AI_JUDGE_TIMEOUT": true,
 		// amend4 (notify + admin cache)
 		"BOT_NOTIFY_ON_PUNISH": true, "BOT_NOTIFY_ON_ERROR": true,
 		"BOT_NOTIFY_LEVEL": true, "BOT_NOTIFY_RATE": true,
@@ -446,6 +475,18 @@ func intEnv(key string, def int) int {
 		return def
 	}
 	return n
+}
+
+// clampInt bounds a value into [lo, hi] (amend6 A: worker/queue counts must
+// never reach zero-or-negative or absurd values from a typo'd env var).
+func clampInt(v, lo, hi int) int {
+	if v < lo {
+		return lo
+	}
+	if v > hi {
+		return hi
+	}
+	return v
 }
 
 func boolEnv(key string, def bool) bool {
