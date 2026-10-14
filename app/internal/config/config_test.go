@@ -613,3 +613,57 @@ func TestJoinVerifyEnvOverrides(t *testing.T) {
 		}
 	}
 }
+
+// --- amend12: comment bio screen knobs ------------------------------------------
+
+// TestCommentBioDefaults: switch on, 30-minute flash window, 5000-entry cap.
+func TestCommentBioDefaults(t *testing.T) {
+	clearBOT(t)
+	c := Load()
+	if !c.CommentBioScreen {
+		t.Error("CommentBioScreen default should be true")
+	}
+	if c.CommentBioFlashTTL != 30*time.Minute {
+		t.Errorf("CommentBioFlashTTL = %s, want 30m", c.CommentBioFlashTTL)
+	}
+	if c.CommentBioFlashMax != 5000 {
+		t.Errorf("CommentBioFlashMax = %d, want 5000", c.CommentBioFlashMax)
+	}
+}
+
+// TestCommentBioEnvOverrides: disable + verbatim TTL + runaway-high clamp +
+// invalid cap fallback. 0 is a legal TTL (window off) via the
+// optional-zero clamp.
+func TestCommentBioEnvOverrides(t *testing.T) {
+	clearBOT(t)
+	t.Setenv("BOT_COMMENT_BIO_SCREEN", "false")
+	t.Setenv("BOT_COMMENT_BIO_FLASH_TTL", "720h") // runaway-high → clamp 24h
+	t.Setenv("BOT_COMMENT_BIO_FLASH_MAX", "0")    // invalid → 5000
+	c := Load()
+	if c.CommentBioScreen {
+		t.Error("BOT_COMMENT_BIO_SCREEN=false must disable")
+	}
+	if c.CommentBioFlashTTL != 24*time.Hour {
+		t.Errorf("CommentBioFlashTTL = %s, want clamped 24h", c.CommentBioFlashTTL)
+	}
+	if c.CommentBioFlashMax != 5000 {
+		t.Errorf("CommentBioFlashMax = %d, want fallback 5000", c.CommentBioFlashMax)
+	}
+	// Verbatim + zero-TTL semantics.
+	t.Setenv("BOT_COMMENT_BIO_SCREEN", "true")
+	t.Setenv("BOT_COMMENT_BIO_FLASH_TTL", "0")
+	t.Setenv("BOT_COMMENT_BIO_FLASH_MAX", "100")
+	c = Load()
+	if !c.CommentBioScreen || c.CommentBioFlashTTL != 0 || c.CommentBioFlashMax != 100 {
+		t.Fatalf("verbatim overrides: %+v", c)
+	}
+	// Redacted carries all three names (non-sensitive values shown verbatim).
+	r := c.Redacted()
+	for _, k := range []string{
+		"BOT_COMMENT_BIO_SCREEN", "BOT_COMMENT_BIO_FLASH_TTL", "BOT_COMMENT_BIO_FLASH_MAX",
+	} {
+		if _, ok := r[k]; !ok {
+			t.Errorf("Redacted missing %s", k)
+		}
+	}
+}

@@ -44,6 +44,11 @@ type Inspector interface {
 	// join_verify_timeout_total). Amend11 adds join_verify_skipped_total
 	// (timeouts that did NOT dispose: gone / unable_to_verify).
 	JoinVerifyView() JoinVerifyView
+	// Amend12: channel-post comment bio screen gauges
+	// (comment_bio_screen_enabled / comment_bio_triggered_total /
+	// comment_bio_flash_hits_total / comment_bio_flash_cached /
+	// comment_bio_flash_ttl).
+	CommentBioView() CommentBioView
 }
 
 // MsgTTLView is the amend8 chat-message-TTL gauges the server renders (plain
@@ -70,6 +75,16 @@ type JoinVerifyView struct {
 	PassedTotal  int64
 	TimeoutTotal int64
 	SkippedTotal int64
+}
+
+// CommentBioView is the amend12 channel-post comment bio screen gauges the
+// server renders (plain data so server does not import bot).
+type CommentBioView struct {
+	Enabled          bool
+	TriggeredTotal   int64
+	FlashHitsTotal   int64
+	FlashCachedTotal int64 // live 防刷 cache entries (post-TTL-prune)
+	FlashTTL         string
 }
 
 // AnnounceView is the amend7 announcement counters the server renders (plain
@@ -316,6 +331,14 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	body["join_verify_passed_total"] = jvv.PassedTotal
 	body["join_verify_timeout_total"] = jvv.TimeoutTotal
 	body["join_verify_skipped_total"] = jvv.SkippedTotal
+
+	// amend12: channel-post comment bio screen gauges.
+	cbv := s.Bot.CommentBioView()
+	body["comment_bio_screen_enabled"] = cbv.Enabled
+	body["comment_bio_triggered_total"] = cbv.TriggeredTotal
+	body["comment_bio_flash_hits_total"] = cbv.FlashHitsTotal
+	body["comment_bio_flash_cached"] = cbv.FlashCachedTotal
+	body["comment_bio_flash_ttl"] = cbv.FlashTTL
 	// The sweeper block only appears when the janitor has run at least once.
 	if s.Sweeper != nil {
 		at, next, droppedSus, droppedSigs, remaining, ran := s.Sweeper.SweepSnapshot()

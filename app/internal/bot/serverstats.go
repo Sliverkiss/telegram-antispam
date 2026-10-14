@@ -106,3 +106,18 @@ func (b *Bot) JoinVerifyView() server.JoinVerifyView {
 		SkippedTotal: b.JoinVerifySkippedTotal(),
 	}
 }
+
+// CommentBioView adapts the amend12 comment-bio gauges into the server's
+// plain view: (BOT_COMMENT_BIO_SCREEN, comment_bio_triggered_total,
+// comment_bio_flash_hits_total, comment_bio_flash_cached,
+// comment_bio_flash_ttl).
+func (b *Bot) CommentBioView() server.CommentBioView {
+	enabled, triggered, hits, cached := b.CommentBioStats()
+	return server.CommentBioView{
+		Enabled:          enabled,
+		TriggeredTotal:   triggered,
+		FlashHitsTotal:   hits,
+		FlashCachedTotal: cached,
+		FlashTTL:         b.CommentBioFlashConfig().String(),
+	}
+}

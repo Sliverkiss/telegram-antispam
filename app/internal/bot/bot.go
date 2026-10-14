@@ -121,18 +121,26 @@ type Bot struct {
 	// the switch.
 	joinVerify *joinVerifier
 
+	// commentFlash (amend12) is the 防刷 cache of AI-condemned bios: a repeat
+	// inside BOT_COMMENT_BIO_FLASH_TTL (default 30m) is kicked directly with
+	// zero AI calls. ALWAYS built (nil-safe when disabled) so the counters
+	// exist for /statusz.
+	commentFlash *commentBioFlash
+
 	startedAt time.Time
 
 	// Stats (atomic for /statusz while the poll loop is running).
-	pollCount    atomic.Int64
-	punishCount  atomic.Int64
-	deleteCount  atomic.Int64
-	deleteFails  atomic.Int64
-	aiCalls      atomic.Int64
-	aiFails      atomic.Int64
-	localRuleCnt atomic.Int64 // local rule terminal decisions
-	simhashHits  atomic.Int64
-	joinRuleHits atomic.Int64 // amend9 裸号必杀 direct disposals (dry-run excluded)
+	pollCount        atomic.Int64
+	punishCount      atomic.Int64
+	deleteCount      atomic.Int64
+	deleteFails      atomic.Int64
+	aiCalls          atomic.Int64
+	aiFails          atomic.Int64
+	localRuleCnt     atomic.Int64 // local rule terminal decisions
+	simhashHits      atomic.Int64
+	joinRuleHits     atomic.Int64 // amend9 裸号必杀 direct disposals (dry-run excluded)
+	commentTriggered atomic.Int64 // amend12 comment bio screens entered
+	commentFlashHits atomic.Int64 // amend12 防刷 direct kicks (zero-AI, dry-run excluded)
 }
 
 // New builds a Bot with defaults filled in.
@@ -166,6 +174,9 @@ func New(st store.Store, tg TelegramClient, classify AIClassifier, verify Verifi
 	// when armed AND StartJoinVerify is called (main / tests); the pending
 	// state and counters exist either way.
 	b.joinVerify = newJoinVerifier(b, joinVerifyConfig{maxPending: cfg.JoinVerifyMax})
+	// amend12: the 防刷 cache of AI-condemned comment bios (always built so
+	// the /statusz counters exist; the screen itself checks the switch).
+	b.commentFlash = newCommentBioFlash(cfg.CommentBioFlashTTL, cfg.CommentBioFlashMax)
 	return b
 }
 
@@ -288,6 +299,25 @@ func (b *Bot) ExtraStats() (localFallback, simhashHits int64) {
 // join_rule_hits_total counts real disposals only — dry-run logging does not.
 func (b *Bot) JoinRuleStats() (enabled bool, hits int64) {
 	return b.Cfg.JoinNakedPremium, b.joinRuleHits.Load()
+}
+
+// CommentBioStats returns the amend12 gauges: (BOT_COMMENT_BIO_SCREEN,
+// comment_bio_triggered_total, comment_bio_flash_hits_total, live 防刷 cache
+// size). Flash hits count real zero-AI disposals only (dry-run logging does
+// not); the window/size ride CommentBioFlashConfig.
+func (b *Bot) CommentBioStats() (enabled bool, triggered, flashHits, cached int64) {
+	if b.commentFlash == nil {
+		return b.Cfg.CommentBioScreen, b.commentTriggered.Load(), b.commentFlashHits.Load(), 0
+	}
+	return b.Cfg.CommentBioScreen, b.commentTriggered.Load(), b.commentFlashHits.Load(), int64(b.commentFlash.Len())
+}
+
+// CommentBioFlashConfig returns the live 防刷 window TTL (for /statusz).
+func (b *Bot) CommentBioFlashConfig() time.Duration {
+	if b.commentFlash == nil {
+		return 0
+	}
+	return b.commentFlash.ttl
 }
 
 // NotifySnapshotRaw is kept (see serverstats.go); the public NotifySnapshot
@@ -736,6 +766,14 @@ func (b *Bot) HandleMessage(ctx context.Context, m telegram.Message) {
 		}
 	}
 
+	// amend12: 频道帖子评论 → 审简介. A reply under a channel post's automatic
+	// forward triggers the comment-bio screen (getChat → link/@ gate → 防刷
+	// cache → AI bio review). Out-of-scope messages return false and the flow
+	// below proceeds byte-for-byte as before (非该判据覆盖的场景行为零变化).
+	if b.screenChannelPostComment(ctx, m) {
+		return
+	}
+
 	text, imageFileID, fileUniqueID := b.mediaContent(m)
 
 	// Judgeability (amend5 D.3): only "judgeable content" counts as the first
@@ -1018,8 +1056,14 @@ func (b *Bot) finishJudgment(ctx context.Context, in judgmentInput, verdict ai.V
 
 // commitAd punishes the ad verdict (delete the triggering message → ban/kick
 // → signature write → watchlist removal → record + notify).
+// amend12: a COMMENT ad verdict (condemned bio) additionally enters the 防刷
+// flash cache — a repeat of that bio inside the window is kicked directly
+// with zero AI calls (dry-run writes nothing).
 func (b *Bot) commitAd(ctx context.Context, in judgmentInput, verdict ai.Verdict, elapsed time.Duration, retries int) {
 	category := verdict.ControlledCategory()
+	if in.kind == "comment" {
+		b.commentBioFlashStore(in.text, category)
+	}
 	b.punishAndClear(ctx, punishInfo{
 		chatID:    in.chatID,
 		uid:       in.uid,
@@ -1028,7 +1072,7 @@ func (b *Bot) commitAd(ctx context.Context, in judgmentInput, verdict ai.Verdict
 		msgID:     in.messageID,
 		text:      in.text,
 		writeSig:  in.writeMsg || in.writeBio,
-		bioKind:   in.kind == "join",
+		bioKind:   in.kind == "join" || in.kind == "comment",
 	}, b.Cfg.Action, category, verdict.Reason,
 		notifyDetails{source: verdictSource(verdict), score: notify.ConfidenceScore(verdict.Confidence), elapsed: elapsed, retries: retries})
 }
@@ -1159,6 +1203,11 @@ func (b *Bot) localFallback(ctx context.Context, in judgmentInput, lastErr strin
 			"hits", strings.Join(res.Hits, ","),
 			"last_error", lastErr,
 			"category", "其他")
+		if in.kind == "comment" {
+			// amend12: a condemned comment bio concluded by the local-rule
+			// fallback enters the 防刷 cache too (every ad conclusion does).
+			b.commentBioFlashStore(in.text, "其他")
+		}
 		b.punishAndClear(ctx, punishInfo{
 			chatID:    in.chatID,
 			uid:       in.uid,
@@ -1167,7 +1216,7 @@ func (b *Bot) localFallback(ctx context.Context, in judgmentInput, lastErr strin
 			msgID:     in.messageID,
 			text:      in.text,
 			writeSig:  in.writeMsg || in.writeBio,
-			bioKind:   in.kind == "join",
+			bioKind:   in.kind == "join" || in.kind == "comment",
 		}, b.Cfg.Action, "其他", "本地规则兜底命中",
 			notifyDetails{source: "local", score: res.Score, retries: in.retries})
 		return
@@ -1282,7 +1331,8 @@ func (b *Bot) cmdStatus(ctx context.Context, m telegram.Message) {
 		"模型链 %s\n模型调用 %s（成功/总）· 回退 %d\n"+
 		"复核 %d 次（改判 %d）· 删除 %d（失败 %d）· 处置 %d\n"+
 		"AI 调用 %d / 失败 %d · 兜底 %d · SimHash 命中 %d · 待决队列 %d\n"+
-		"观察名单 %d · 签名库 bio %d / msg %d · 轮询 %d\n模式 %s",
+		"观察名单 %d · 签名库 bio %d / msg %d · 轮询 %d\n"+
+		"评论简介 触发 %d · 防刷命中 %d · 防刷窗口 %s\n模式 %s",
 		b.Cfg.Version, b.Uptime().Round(time.Second).String(), ai.PromptVersion,
 		b.Cfg.Store, b.Cfg.Retention.String(), b.Cfg.RetentionSliding,
 		strings.Join(b.Cfg.AIEffectiveModels(), "→"),
@@ -1290,6 +1340,7 @@ func (b *Bot) cmdStatus(ctx context.Context, m telegram.Message) {
 		sn.VerifyRounds, sn.VerifyFlipped, deleted, deleteFails, punished,
 		aiCalls, aiFails, localFB, simHits, pending,
 		suspects, bioSigs, msgSigs, poll,
+		b.commentTriggered.Load(), b.commentFlashHits.Load(), b.Cfg.CommentBioFlashTTL.String(),
 		map[bool]string{true: "干跑", false: "正常"}[b.Cfg.DryRun])
 	b.reply(ctx, m, text)
 }
@@ -1424,10 +1475,10 @@ func (b *Bot) endJudge(start time.Time) time.Duration {
 // "one judgment = one consumption". A message judgment that reached a
 // terminal not-ad/below-threshold outcome removes the user, so later
 // messages no longer hit the AI (the signature library still screens
-// everyone). Join-bio judgments never consume the slot (amend5 D.2: bio is
-// an independent screen; the first-message opportunity stays intact). It is
-// a no-op when the user is not on the watchlist (e.g. the /check command or
-// a second message after removal).
+// everyone). Join-bio (amend5 D.2) and comment-bio (amend12, same D.2
+// semantics: bio is an independent screen) judgments never consume the slot.
+// It is a no-op when the user is not on the watchlist (e.g. the /check
+// command or a second message after removal).
 func (b *Bot) consumeWatchlist(ctx context.Context, in judgmentInput) {
 	if in.kind != "message" {
 		return

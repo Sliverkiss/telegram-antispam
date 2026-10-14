@@ -138,6 +138,22 @@ type Config struct {
 	JoinVerifyAction  string        // BOT_JOIN_VERIFY_ACTION ("ban" | "kick")
 	JoinVerifyMsg     string        // BOT_JOIN_VERIFY_MSG (%s = @username/name)
 	JoinVerifyMax     int           // BOT_JOIN_VERIFY_MAX_PENDING
+
+	// Channel-post comment bio screen (amend12) ---------------------------------
+	// CommentBioScreen: a message replying to a linked-channel post's
+	// automatic forward in the discussion group triggers a bio check — the
+	// replier's bio carrying a link or @ goes to the AI bio review; an
+	// AI-condemned bio enters the flash cache below.
+	CommentBioScreen bool // BOT_COMMENT_BIO_SCREEN
+	// CommentBioFlashTTL: how long an AI-condemned bio stays in the flash
+	// (防刷) cache; a repeat inside the window is kicked directly with zero
+	// AI calls. 0 = window off (cache entries never expire by themselves);
+	// clamped to 24h. Default 30m.
+	CommentBioFlashTTL time.Duration // BOT_COMMENT_BIO_FLASH_TTL
+	// CommentBioFlashMax: flash cache capacity (oldest-first eviction past the
+	// cap; in-memory only — restart loses it, same semantics as join-verify
+	// pending). Default 5000.
+	CommentBioFlashMax int // BOT_COMMENT_BIO_FLASH_MAX
 }
 
 // Load reads the environment into a Config with defaults applied. It is pure
@@ -242,6 +258,11 @@ func Load() Config {
 		JoinVerifyAction:  envOr("BOT_JOIN_VERIFY_ACTION", "ban"),
 		JoinVerifyMsg:     envOr("BOT_JOIN_VERIFY_MSG", "👋 欢迎 %s！请在 300 秒内发一个贴纸，证明你不是机器人，否则会被移出本群～"),
 		JoinVerifyMax:     intEnv("BOT_JOIN_VERIFY_MAX_PENDING", 5000),
+
+		// amend12: channel-post comment bio screen (false = skipped entirely).
+		CommentBioScreen:   boolEnv("BOT_COMMENT_BIO_SCREEN", true),
+		CommentBioFlashTTL: clampDurationOptionalZero(durationEnv("BOT_COMMENT_BIO_FLASH_TTL", 30*time.Minute), 24*time.Hour),
+		CommentBioFlashMax: intEnv("BOT_COMMENT_BIO_FLASH_MAX", 5000),
 	}
 	c.Token = os.Getenv("BOT_TOKEN")
 	c.ChatsSet = os.Getenv("BOT_CHATS") != ""
@@ -279,6 +300,11 @@ func Load() Config {
 	// which would silently disable verification for all joiners).
 	if c.JoinVerifyMax < 1 {
 		c.JoinVerifyMax = 5000
+	}
+	// amend12: the flash cache cap must stay ≥1 (0 would silently reject
+	// every condemned-bio entry, i.e. disable 防刷 entirely).
+	if c.CommentBioFlashMax < 1 {
+		c.CommentBioFlashMax = 5000
 	}
 	return c
 }
@@ -372,43 +398,47 @@ func (c Config) Redacted() map[string]string {
 		"BOT_JOIN_VERIFY_ACTION":      c.JoinVerifyAction,
 		"BOT_JOIN_VERIFY_MSG":         c.JoinVerifyMsg,
 		"BOT_JOIN_VERIFY_MAX_PENDING": strconv.Itoa(c.JoinVerifyMax),
-		"BOT_MSG_TTL":                 c.MsgTTL.String(),
-		"BOT_STORE":                   c.Store,
-		"BOT_REDIS_URL":               redactURL(c.RedisURL),
-		"BOT_REDIS_INSECURE_TLS":      strconv.FormatBool(c.RedisInsecureTLS),
-		"BOT_DB_PATH":                 c.DBPath,
-		"BOT_DB_FSYNC":                strconv.FormatBool(c.DBFsync),
-		"BOT_RETENTION":               c.Retention.String(),
-		"BOT_RETENTION_SUSPECT":       fmtDura(c.RetentionSuspect),
-		"BOT_RETENTION_SIGNATURE":     fmtDura(c.RetentionSignature),
-		"BOT_RETENTION_SLIDING":       strconv.FormatBool(c.RetentionSliding),
-		"BOT_SWEEP_INTERVAL":          c.SweepInterval.String(),
-		"BOT_MAX_SUSPECTS":            strconv.Itoa(c.MaxSuspects),
-		"BOT_MAX_SIGNATURES":          strconv.Itoa(c.MaxSignatures),
-		"BOT_AI_BASE_URL":             c.AIBaseURL,
-		"BOT_AI_API_KEY":              redactToken(c.AIKey),
-		"BOT_AI_MODELS":               strings.Join(c.AIEffectiveModels(), ","),
-		"BOT_AI_TIMEOUT":              c.AITimeout.String(),
-		"BOT_AI_JUDGE_TIMEOUT":        c.AIJudgeTimeout.String(),
-		"BOT_AI_REASONING_EFFORT":     c.AIReasoningEffort,
-		"BOT_AI_PROMPT_FILE":          c.AIPromptFile,
-		"BOT_AI_RETRY_INTERVAL":       c.RetryInterval.String(),
-		"BOT_AI_RETRY_MAX_ATTEMPTS":   strconv.Itoa(c.RetryMax),
-		"BOT_AI_RETRY_QUEUE":          strconv.Itoa(c.RetryQueue),
-		"BOT_AI_MIN_CONFIDENCE":       strconv.FormatFloat(c.MinConfidence, 'f', 2, 64),
-		"BOT_AI_VERIFY_VOTES":         strconv.Itoa(c.VerifyVotes),
-		"BOT_AI_VERIFY_MODELS":        strings.Join(c.VerifyModels, ","),
-		"BOT_AI_VERIFY_MAJORITY":      strconv.Itoa(c.VerifyMajority),
-		"BOT_AI_VERIFY_TIMEOUT":       c.VerifyTimeout.String(),
-		"BOT_AI_FALLBACK_BASE_URL":    c.FallbackBaseURL,
-		"BOT_AI_FALLBACK_API_KEY":     redactToken(c.FallbackAPIKey),
-		"BOT_AI_FALLBACK_MODELS":      strings.Join(c.FallbackModels, ","),
-		"BOT_SIMHASH_DISTANCE":        strconv.Itoa(c.SimhashDistance),
-		"BOT_LOCAL_RULES_ENABLED":     strconv.FormatBool(c.LocalRulesEnabled),
-		"BOT_LOCAL_RULE_THRESHOLD":    strconv.Itoa(c.LocalRuleThreshold),
-		"BOT_LOCAL_KEYWORDS":          strings.Join(c.LocalKeywords, ","),
-		"BOT_POLL_TIMEOUT":            strconv.Itoa(c.PollTimeout),
-		"BOT_WORKERS":                 strconv.Itoa(c.Workers),
+		// amend12: comment bio screen contract
+		"BOT_COMMENT_BIO_SCREEN":    strconv.FormatBool(c.CommentBioScreen),
+		"BOT_COMMENT_BIO_FLASH_TTL": c.CommentBioFlashTTL.String(),
+		"BOT_COMMENT_BIO_FLASH_MAX": strconv.Itoa(c.CommentBioFlashMax),
+		"BOT_MSG_TTL":               c.MsgTTL.String(),
+		"BOT_STORE":                 c.Store,
+		"BOT_REDIS_URL":             redactURL(c.RedisURL),
+		"BOT_REDIS_INSECURE_TLS":    strconv.FormatBool(c.RedisInsecureTLS),
+		"BOT_DB_PATH":               c.DBPath,
+		"BOT_DB_FSYNC":              strconv.FormatBool(c.DBFsync),
+		"BOT_RETENTION":             c.Retention.String(),
+		"BOT_RETENTION_SUSPECT":     fmtDura(c.RetentionSuspect),
+		"BOT_RETENTION_SIGNATURE":   fmtDura(c.RetentionSignature),
+		"BOT_RETENTION_SLIDING":     strconv.FormatBool(c.RetentionSliding),
+		"BOT_SWEEP_INTERVAL":        c.SweepInterval.String(),
+		"BOT_MAX_SUSPECTS":          strconv.Itoa(c.MaxSuspects),
+		"BOT_MAX_SIGNATURES":        strconv.Itoa(c.MaxSignatures),
+		"BOT_AI_BASE_URL":           c.AIBaseURL,
+		"BOT_AI_API_KEY":            redactToken(c.AIKey),
+		"BOT_AI_MODELS":             strings.Join(c.AIEffectiveModels(), ","),
+		"BOT_AI_TIMEOUT":            c.AITimeout.String(),
+		"BOT_AI_JUDGE_TIMEOUT":      c.AIJudgeTimeout.String(),
+		"BOT_AI_REASONING_EFFORT":   c.AIReasoningEffort,
+		"BOT_AI_PROMPT_FILE":        c.AIPromptFile,
+		"BOT_AI_RETRY_INTERVAL":     c.RetryInterval.String(),
+		"BOT_AI_RETRY_MAX_ATTEMPTS": strconv.Itoa(c.RetryMax),
+		"BOT_AI_RETRY_QUEUE":        strconv.Itoa(c.RetryQueue),
+		"BOT_AI_MIN_CONFIDENCE":     strconv.FormatFloat(c.MinConfidence, 'f', 2, 64),
+		"BOT_AI_VERIFY_VOTES":       strconv.Itoa(c.VerifyVotes),
+		"BOT_AI_VERIFY_MODELS":      strings.Join(c.VerifyModels, ","),
+		"BOT_AI_VERIFY_MAJORITY":    strconv.Itoa(c.VerifyMajority),
+		"BOT_AI_VERIFY_TIMEOUT":     c.VerifyTimeout.String(),
+		"BOT_AI_FALLBACK_BASE_URL":  c.FallbackBaseURL,
+		"BOT_AI_FALLBACK_API_KEY":   redactToken(c.FallbackAPIKey),
+		"BOT_AI_FALLBACK_MODELS":    strings.Join(c.FallbackModels, ","),
+		"BOT_SIMHASH_DISTANCE":      strconv.Itoa(c.SimhashDistance),
+		"BOT_LOCAL_RULES_ENABLED":   strconv.FormatBool(c.LocalRulesEnabled),
+		"BOT_LOCAL_RULE_THRESHOLD":  strconv.Itoa(c.LocalRuleThreshold),
+		"BOT_LOCAL_KEYWORDS":        strings.Join(c.LocalKeywords, ","),
+		"BOT_POLL_TIMEOUT":          strconv.Itoa(c.PollTimeout),
+		"BOT_WORKERS":               strconv.Itoa(c.Workers),
 		// amend6 A: judgement-pool contract
 		"BOT_JUDGE_ASYNC":    strconv.FormatBool(c.JudgeAsync),
 		"BOT_JUDGE_QUEUE":    strconv.Itoa(c.JudgeQueue),
@@ -514,6 +544,9 @@ func UnrecognizedBotVars() []string {
 		"BOT_JOIN_VERIFY": true, "BOT_JOIN_VERIFY_TIMEOUT": true,
 		"BOT_JOIN_VERIFY_SCAN": true, "BOT_JOIN_VERIFY_ACTION": true,
 		"BOT_JOIN_VERIFY_MSG": true, "BOT_JOIN_VERIFY_MAX_PENDING": true,
+		// amend12 (channel-post comment bio screen)
+		"BOT_COMMENT_BIO_SCREEN": true, "BOT_COMMENT_BIO_FLASH_TTL": true,
+		"BOT_COMMENT_BIO_FLASH_MAX": true,
 	}
 	var out []string
 	for _, kv := range os.Environ() {

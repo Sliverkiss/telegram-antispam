@@ -94,6 +94,16 @@ type Message struct {
 	Sticker *Sticker
 	// ReplyToMessage is set when this message replies to another.
 	ReplyToMessage *Message
+	// IsAutomaticForward (amend12): true when this message IS the automatic
+	// forward of a linked-channel post into the linked discussion group. The
+	// comment screen needs it on the REPLIED-TO message (a comment on a
+	// channel post = a reply whose ReplyToMessage.IsAutomaticForward is true)
+	// to prove the reply targets a channel post rather than a plain message.
+	IsAutomaticForward bool
+	// SenderChat is set when the message was sent on behalf of a chat (e.g.
+	// the linked channel itself). Mapped for observability; the comment
+	// decision itself rides IsAutomaticForward.
+	SenderChat *Chat
 	// NewChatMembers lists users that just joined via this service message.
 	NewChatMembers []User
 	// LeftChatMember marks a leave service message.
@@ -193,6 +203,13 @@ func convMessage(m models.Message) Message {
 		Chat:      convChat(m.Chat),
 		Text:      m.Text,
 		Caption:   m.Caption,
+		// amend12: the channel-post comment screen keys off the replied-to
+		// message's is_automatic_forward (mapped recursively below).
+		IsAutomaticForward: m.IsAutomaticForward,
+	}
+	if m.SenderChat != nil {
+		sc := convChat(*m.SenderChat)
+		out.SenderChat = &sc
 	}
 	if m.From != nil {
 		u := convUser(*m.From)

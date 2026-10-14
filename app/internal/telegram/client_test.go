@@ -468,3 +468,74 @@ func TestStickerConversion(t *testing.T) {
 		t.Errorf("text = %q", out2.Message.Text)
 	}
 }
+
+// --- amend12: is_automatic_forward / sender_chat mapping ------------------------
+
+// TestIsAutomaticForwardConversion pins the comment-screen trigger field: a
+// reply whose replied-to message is the automatic forward of a linked-channel
+// post must carry IsAutomaticForward=true (on the REPLIED-TO message), while
+// the comment itself and a plain reply carry false. sender_chat maps alongside.
+func TestIsAutomaticForwardConversion(t *testing.T) {
+	raw := `{"update_id":45,"message":{"message_id":9,"chat":{"id":-100,"type":"supergroup"},"from":{"id":9,"is_bot":false,"first_name":"U"},"date":100,"text":"评论","reply_to_message":{"message_id":8,"chat":{"id":-100,"type":"supergroup"},"sender_chat":{"id":-1001324890214,"type":"channel","title":"chan"},"date":99,"is_automatic_forward":true,"text":"频道帖子"}}}`
+	out, err := convertUpdateJSON(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := out.Message
+	if m == nil || m.ReplyToMessage == nil {
+		t.Fatal("comment message must map with ReplyToMessage != nil")
+	}
+	if !m.ReplyToMessage.IsAutomaticForward {
+		t.Error("replied-to automatic forward must map IsAutomaticForward=true")
+	}
+	if m.IsAutomaticForward {
+		t.Error("the comment itself is not an automatic forward")
+	}
+	if m.ReplyToMessage.SenderChat == nil || m.ReplyToMessage.SenderChat.ID != -1001324890214 || m.ReplyToMessage.SenderChat.Type != "channel" {
+		t.Errorf("replied-to sender_chat = %+v", m.ReplyToMessage.SenderChat)
+	}
+	if m.ReplyToMessage.Text != "频道帖子" {
+		t.Errorf("replied-to text = %q", m.ReplyToMessage.Text)
+	}
+}
+
+// TestPlainReplyNotAutomaticForward: a reply to an ordinary group message
+// must keep IsAutomaticForward=false (the comment screen must NOT trigger).
+func TestPlainReplyNotAutomaticForward(t *testing.T) {
+	raw := `{"update_id":46,"message":{"message_id":10,"chat":{"id":-100,"type":"supergroup"},"from":{"id":9,"is_bot":false,"first_name":"U"},"date":100,"text":"普通回复","reply_to_message":{"message_id":9,"chat":{"id":-100,"type":"supergroup"},"from":{"id":8,"is_bot":false,"first_name":"V"},"date":99,"text":"普通消息"}}}`
+	out, err := convertUpdateJSON(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Message == nil || out.Message.ReplyToMessage == nil {
+		t.Fatal("reply must map with ReplyToMessage != nil")
+	}
+	if out.Message.ReplyToMessage.IsAutomaticForward {
+		t.Error("plain reply must NOT be flagged as an automatic forward")
+	}
+	if out.Message.ReplyToMessage.SenderChat != nil {
+		t.Errorf("plain reply sender_chat = %+v, want nil", out.Message.ReplyToMessage.SenderChat)
+	}
+}
+
+// TestAutomaticForwardItselfMaps: the automatic forward message itself (a
+// channel post arriving in the discussion group) maps its own
+// IsAutomaticForward + SenderChat (observability; the screen never triggers
+// on it because it is not a reply).
+func TestAutomaticForwardItselfMaps(t *testing.T) {
+	raw := `{"update_id":47,"message":{"message_id":11,"chat":{"id":-100,"type":"supergroup"},"sender_chat":{"id":-1001324890214,"type":"channel","title":"chan"},"date":100,"is_automatic_forward":true,"text":"频道帖子"}}`
+	out, err := convertUpdateJSON(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := out.Message
+	if m == nil {
+		t.Fatal("forward message must map")
+	}
+	if !m.IsAutomaticForward {
+		t.Error("automatic forward must map its own IsAutomaticForward=true")
+	}
+	if m.SenderChat == nil || m.SenderChat.ID != -1001324890214 {
+		t.Errorf("sender_chat = %+v", m.SenderChat)
+	}
+}

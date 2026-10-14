@@ -62,6 +62,9 @@ func (s *stubBot) JoinRuleView() JoinRuleView {
 func (s *stubBot) JoinVerifyView() JoinVerifyView {
 	return JoinVerifyView{Enabled: true, Pending: 2, PassedTotal: 9, TimeoutTotal: 3, SkippedTotal: 7}
 }
+func (s *stubBot) CommentBioView() CommentBioView {
+	return CommentBioView{Enabled: true, TriggeredTotal: 11, FlashHitsTotal: 4, FlashCachedTotal: 2, FlashTTL: "30m0s"}
+}
 
 // fakeSweep reports a fixed (already-run) sweep for /statusz rendering.
 type fakeSweep struct{}

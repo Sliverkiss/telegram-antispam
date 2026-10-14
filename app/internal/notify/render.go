@@ -61,7 +61,8 @@ func actionVerb(action string) string {
 
 // sourceSuffix implements the "末行后缀" rules: non-AI sources append their
 // marker; the high-risk category (儿童性内容) always appends. The upstream
-// sensitive interception (amend5 A) is the 5th source after AI/签名/投票/兜底.
+// sensitive interception (amend5 A) is the 5th source after AI/签名/投票/兜底;
+// the amend12 防刷 cache hit is the 6th.
 func sourceSuffix(d PunishDetails) string {
 	switch d.Source {
 	case "signature":
@@ -75,6 +76,8 @@ func sourceSuffix(d PunishDetails) string {
 		return ""
 	case "upstream_sensitive":
 		return " · 上游敏感拦截"
+	case "flash_cache":
+		return " · 防刷命中"
 	default:
 		return "" // ai: keep the line clean
 	}

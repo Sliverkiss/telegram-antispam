@@ -196,6 +196,9 @@ go run . -prompteval -prompteval.models=mimo-v2.6-pro
 | | `BOT_JOIN_VERIFY_ACTION` | `ban` | 超时处置：`ban`（默认，**真封禁**）/ `kick` |
 | | `BOT_JOIN_VERIFY_MSG` | 固定文案 | 欢迎消息（`%s` = @用户名或名字）；**不走 `BOT_MSG_TTL` 60s 自删**，验证结束即删 |
 | | `BOT_JOIN_VERIFY_MAX_PENDING` | `5000` | 待验证名单上限；超限 WARN 并走原流程 |
+| 评论简介 | `BOT_COMMENT_BIO_SCREEN` | `true` | amend12：群里回复**关联频道帖子**（reply 目标 `is_automatic_forward=true`）的消息触发评论者简介检查——简介带链接或 `@` → 送 AI 审简介（`mode=bio` 复用入群提示词）；判广告 → 标准处置链（punish + 通知频道 + 群内公告 + 写 bio 签名库）；判非广告 → 零处置、不消费观察名额；简介空/无链接无 `@`/非评论消息 → 原流程零变化 |
+| | `BOT_COMMENT_BIO_FLASH_TTL` | `30m` | **防刷窗口**（不是限流）：审核未过（判广告）的简介进缓存；窗口内遇到**重复**（normalized sha1 精确匹配）简介的直接踢、**零 AI 调用**；窗口过期重新送审（clamp：0=不自动过期 或 ≤24h） |
+| | `BOT_COMMENT_BIO_FLASH_MAX` | `5000` | 防刷缓存容量；超限最旧淘汰。只存内存，重启丢失 |
 | | `BOT_LOG_LEVEL` / `BOT_LOG_FORMAT` | `info` / `text` | 日志 |
 | | `BOT_ADMIN_TOKEN` | 空 | 非空开放 `/admin/*` |
 | | `BOT_VERSION` | `dev` | 构建注入 |
@@ -216,7 +219,9 @@ go run . -prompteval -prompteval.models=mimo-v2.6-pro
   `msg_ttl_scheduled_total`、`msg_ttl_deleted_total`、`msg_ttl_error_total`，
   amend9 项：`join_rule_enabled` / `join_rule_hits_total`，amend10 项：
   `join_verify_enabled` / `join_verify_pending` / `join_verify_passed_total` /
-  `join_verify_timeout_total`
+  `join_verify_timeout_total`，amend12 项：`comment_bio_screen_enabled` /
+  `comment_bio_triggered_total` / `comment_bio_flash_hits_total` /
+  `comment_bio_flash_cached` / `comment_bio_flash_ttl`
 - `/admin/signatures` → 需要 `BOT_ADMIN_TOKEN`（`Authorization: Bearer`），
   `GET`/`POST`/`DELETE` 维护 bio/msg 签名库
 
@@ -249,7 +254,7 @@ belmo 用 **Nixpacks** 构建，且部署引擎固定扫描仓库的 **`app/` �
 | `BOT_DRY_RUN` | 建议 | 首次部署填 `true`（只判定不处置），观察日志确认无误后改 `false` |
 | `BOT_ACTION` | 可选 | `kick`（默认，封后即解=踢出）/ `ban`（永久） |
 
-其余变量都有合理默认值，完整清单见 `app/.env.example`（72 个变量与代码契约一一对应）。
+其余变量都有合理默认值，完整清单见 `app/.env.example`（75 个变量与代码契约一一对应）。
 
 **部署后自检：**
 
