@@ -216,7 +216,16 @@ func defaultCfg() config.Config {
 		// amend9: the 裸号必杀 join rule defaults to armed (config.Load
 		// default true). No pre-amend9 test sets IsPremium anywhere, so the
 		// rule can only fire in the joinrule tests themselves.
-		JoinNakedPremium:   true,
+		JoinNakedPremium: true,
+		// amend10: join verification defaults OFF in the legacy test config —
+		// every pre-amend10 join test expects the direct watchlist/bio flow.
+		// The joinverify tests arm it explicitly.
+		JoinVerify:         false,
+		JoinVerifyTimeout:  300 * time.Second,
+		JoinVerifyScan:     5 * time.Second,
+		JoinVerifyAction:   "ban",
+		JoinVerifyMsg:      "👋 欢迎 %s！请在 300 秒内发一个贴纸，证明你不是机器人，否则会被移出本群～",
+		JoinVerifyMax:      5000,
 		NotifyOnError:      true,
 		NotifyLevel:        "error",
 		NotifyRatePerMin:   10000, // effectively unlimited in tests

@@ -125,6 +125,19 @@ type Config struct {
 	// JoinNakedPremium arms the "裸号必杀" join rule: premium + English name +
 	// empty bio + no profile photo → direct disposal (no AI round).
 	JoinNakedPremium bool // BOT_JOIN_NAKED_PREMIUM
+
+	// Join verification (amend10) ------------------------------------------------
+	// JoinVerify arms the 300-second sticker verification: every joiner (past
+	// watchlist + signature + naked-premium) gets a welcome message and must
+	// post A STICKER (message.sticker != nil — the only passing shape, no
+	// relaxation knob by explicit user demand) before the deadline, else
+	// ban + standard disposition chain.
+	JoinVerify        bool          // BOT_JOIN_VERIFY
+	JoinVerifyTimeout time.Duration // BOT_JOIN_VERIFY_TIMEOUT
+	JoinVerifyScan    time.Duration // BOT_JOIN_VERIFY_SCAN (timeout scan ticker)
+	JoinVerifyAction  string        // BOT_JOIN_VERIFY_ACTION ("ban" | "kick")
+	JoinVerifyMsg     string        // BOT_JOIN_VERIFY_MSG (%s = @username/name)
+	JoinVerifyMax     int           // BOT_JOIN_VERIFY_MAX_PENDING
 }
 
 // Load reads the environment into a Config with defaults applied. It is pure
@@ -219,6 +232,16 @@ func Load() Config {
 
 		// amend9: 裸号必杀 join rule (false = the rule is skipped entirely).
 		JoinNakedPremium: boolEnv("BOT_JOIN_NAKED_PREMIUM", true),
+
+		// amend10: join verification (300s sticker gate). The timeout/scan are
+		// clamped away from zero so a typo can never disable the deadline; the
+		// message default is the user-approved fixed wording.
+		JoinVerify:        boolEnv("BOT_JOIN_VERIFY", true),
+		JoinVerifyTimeout: clampDuration(durationEnv("BOT_JOIN_VERIFY_TIMEOUT", 300*time.Second), 1*time.Second, 24*time.Hour),
+		JoinVerifyScan:    clampDuration(durationEnv("BOT_JOIN_VERIFY_SCAN", 5*time.Second), 100*time.Millisecond, time.Minute),
+		JoinVerifyAction:  envOr("BOT_JOIN_VERIFY_ACTION", "ban"),
+		JoinVerifyMsg:     envOr("BOT_JOIN_VERIFY_MSG", "👋 欢迎 %s！请在 300 秒内发一个贴纸，证明你不是机器人，否则会被移出本群～"),
+		JoinVerifyMax:     intEnv("BOT_JOIN_VERIFY_MAX_PENDING", 5000),
 	}
 	c.Token = os.Getenv("BOT_TOKEN")
 	c.ChatsSet = os.Getenv("BOT_CHATS") != ""
@@ -246,6 +269,16 @@ func Load() Config {
 
 	if c.Action != "ban" && c.Action != "kick" {
 		c.Action = "ban"
+	}
+	// amend10: the verification disposal defaults to a REAL ban (explicit user
+	// wording — "封禁", not kick-and-readmit); any typo'd value stays ban.
+	if c.JoinVerifyAction != "ban" && c.JoinVerifyAction != "kick" {
+		c.JoinVerifyAction = "ban"
+	}
+	// amend10: the pending cap must stay ≥1 (0 = reject every registration,
+	// which would silently disable verification for all joiners).
+	if c.JoinVerifyMax < 1 {
+		c.JoinVerifyMax = 5000
 	}
 	return c
 }
@@ -329,47 +362,53 @@ func (c Config) Redacted() map[string]string {
 		"BOT_ADMIN_CACHE_TTL":      c.AdminCacheTTL.String(),
 		"BOT_ADMIN_CACHE_MAX":      strconv.Itoa(c.AdminCacheMax),
 		// amend7 announcement contract
-		"BOT_ANNOUNCE_KICK":    strconv.FormatBool(c.AnnounceKickEnabled),
-		"BOT_ANNOUNCE_TIMEOUT": c.AnnounceTimeout.String(),
-		// amend9 join rule contract
-		"BOT_JOIN_NAKED_PREMIUM":    strconv.FormatBool(c.JoinNakedPremium),
-		"BOT_MSG_TTL":               c.MsgTTL.String(),
-		"BOT_STORE":                 c.Store,
-		"BOT_REDIS_URL":             redactURL(c.RedisURL),
-		"BOT_REDIS_INSECURE_TLS":    strconv.FormatBool(c.RedisInsecureTLS),
-		"BOT_DB_PATH":               c.DBPath,
-		"BOT_DB_FSYNC":              strconv.FormatBool(c.DBFsync),
-		"BOT_RETENTION":             c.Retention.String(),
-		"BOT_RETENTION_SUSPECT":     fmtDura(c.RetentionSuspect),
-		"BOT_RETENTION_SIGNATURE":   fmtDura(c.RetentionSignature),
-		"BOT_RETENTION_SLIDING":     strconv.FormatBool(c.RetentionSliding),
-		"BOT_SWEEP_INTERVAL":        c.SweepInterval.String(),
-		"BOT_MAX_SUSPECTS":          strconv.Itoa(c.MaxSuspects),
-		"BOT_MAX_SIGNATURES":        strconv.Itoa(c.MaxSignatures),
-		"BOT_AI_BASE_URL":           c.AIBaseURL,
-		"BOT_AI_API_KEY":            redactToken(c.AIKey),
-		"BOT_AI_MODELS":             strings.Join(c.AIEffectiveModels(), ","),
-		"BOT_AI_TIMEOUT":            c.AITimeout.String(),
-		"BOT_AI_JUDGE_TIMEOUT":      c.AIJudgeTimeout.String(),
-		"BOT_AI_REASONING_EFFORT":   c.AIReasoningEffort,
-		"BOT_AI_PROMPT_FILE":        c.AIPromptFile,
-		"BOT_AI_RETRY_INTERVAL":     c.RetryInterval.String(),
-		"BOT_AI_RETRY_MAX_ATTEMPTS": strconv.Itoa(c.RetryMax),
-		"BOT_AI_RETRY_QUEUE":        strconv.Itoa(c.RetryQueue),
-		"BOT_AI_MIN_CONFIDENCE":     strconv.FormatFloat(c.MinConfidence, 'f', 2, 64),
-		"BOT_AI_VERIFY_VOTES":       strconv.Itoa(c.VerifyVotes),
-		"BOT_AI_VERIFY_MODELS":      strings.Join(c.VerifyModels, ","),
-		"BOT_AI_VERIFY_MAJORITY":    strconv.Itoa(c.VerifyMajority),
-		"BOT_AI_VERIFY_TIMEOUT":     c.VerifyTimeout.String(),
-		"BOT_AI_FALLBACK_BASE_URL":  c.FallbackBaseURL,
-		"BOT_AI_FALLBACK_API_KEY":   redactToken(c.FallbackAPIKey),
-		"BOT_AI_FALLBACK_MODELS":    strings.Join(c.FallbackModels, ","),
-		"BOT_SIMHASH_DISTANCE":      strconv.Itoa(c.SimhashDistance),
-		"BOT_LOCAL_RULES_ENABLED":   strconv.FormatBool(c.LocalRulesEnabled),
-		"BOT_LOCAL_RULE_THRESHOLD":  strconv.Itoa(c.LocalRuleThreshold),
-		"BOT_LOCAL_KEYWORDS":        strings.Join(c.LocalKeywords, ","),
-		"BOT_POLL_TIMEOUT":          strconv.Itoa(c.PollTimeout),
-		"BOT_WORKERS":               strconv.Itoa(c.Workers),
+		"BOT_ANNOUNCE_KICK":      strconv.FormatBool(c.AnnounceKickEnabled),
+		"BOT_ANNOUNCE_TIMEOUT":   c.AnnounceTimeout.String(),
+		"BOT_JOIN_NAKED_PREMIUM": strconv.FormatBool(c.JoinNakedPremium),
+		// amend10 join verification contract
+		"BOT_JOIN_VERIFY":             strconv.FormatBool(c.JoinVerify),
+		"BOT_JOIN_VERIFY_TIMEOUT":     c.JoinVerifyTimeout.String(),
+		"BOT_JOIN_VERIFY_SCAN":        c.JoinVerifyScan.String(),
+		"BOT_JOIN_VERIFY_ACTION":      c.JoinVerifyAction,
+		"BOT_JOIN_VERIFY_MSG":         c.JoinVerifyMsg,
+		"BOT_JOIN_VERIFY_MAX_PENDING": strconv.Itoa(c.JoinVerifyMax),
+		"BOT_MSG_TTL":                 c.MsgTTL.String(),
+		"BOT_STORE":                   c.Store,
+		"BOT_REDIS_URL":               redactURL(c.RedisURL),
+		"BOT_REDIS_INSECURE_TLS":      strconv.FormatBool(c.RedisInsecureTLS),
+		"BOT_DB_PATH":                 c.DBPath,
+		"BOT_DB_FSYNC":                strconv.FormatBool(c.DBFsync),
+		"BOT_RETENTION":               c.Retention.String(),
+		"BOT_RETENTION_SUSPECT":       fmtDura(c.RetentionSuspect),
+		"BOT_RETENTION_SIGNATURE":     fmtDura(c.RetentionSignature),
+		"BOT_RETENTION_SLIDING":       strconv.FormatBool(c.RetentionSliding),
+		"BOT_SWEEP_INTERVAL":          c.SweepInterval.String(),
+		"BOT_MAX_SUSPECTS":            strconv.Itoa(c.MaxSuspects),
+		"BOT_MAX_SIGNATURES":          strconv.Itoa(c.MaxSignatures),
+		"BOT_AI_BASE_URL":             c.AIBaseURL,
+		"BOT_AI_API_KEY":              redactToken(c.AIKey),
+		"BOT_AI_MODELS":               strings.Join(c.AIEffectiveModels(), ","),
+		"BOT_AI_TIMEOUT":              c.AITimeout.String(),
+		"BOT_AI_JUDGE_TIMEOUT":        c.AIJudgeTimeout.String(),
+		"BOT_AI_REASONING_EFFORT":     c.AIReasoningEffort,
+		"BOT_AI_PROMPT_FILE":          c.AIPromptFile,
+		"BOT_AI_RETRY_INTERVAL":       c.RetryInterval.String(),
+		"BOT_AI_RETRY_MAX_ATTEMPTS":   strconv.Itoa(c.RetryMax),
+		"BOT_AI_RETRY_QUEUE":          strconv.Itoa(c.RetryQueue),
+		"BOT_AI_MIN_CONFIDENCE":       strconv.FormatFloat(c.MinConfidence, 'f', 2, 64),
+		"BOT_AI_VERIFY_VOTES":         strconv.Itoa(c.VerifyVotes),
+		"BOT_AI_VERIFY_MODELS":        strings.Join(c.VerifyModels, ","),
+		"BOT_AI_VERIFY_MAJORITY":      strconv.Itoa(c.VerifyMajority),
+		"BOT_AI_VERIFY_TIMEOUT":       c.VerifyTimeout.String(),
+		"BOT_AI_FALLBACK_BASE_URL":    c.FallbackBaseURL,
+		"BOT_AI_FALLBACK_API_KEY":     redactToken(c.FallbackAPIKey),
+		"BOT_AI_FALLBACK_MODELS":      strings.Join(c.FallbackModels, ","),
+		"BOT_SIMHASH_DISTANCE":        strconv.Itoa(c.SimhashDistance),
+		"BOT_LOCAL_RULES_ENABLED":     strconv.FormatBool(c.LocalRulesEnabled),
+		"BOT_LOCAL_RULE_THRESHOLD":    strconv.Itoa(c.LocalRuleThreshold),
+		"BOT_LOCAL_KEYWORDS":          strings.Join(c.LocalKeywords, ","),
+		"BOT_POLL_TIMEOUT":            strconv.Itoa(c.PollTimeout),
+		"BOT_WORKERS":                 strconv.Itoa(c.Workers),
 		// amend6 A: judgement-pool contract
 		"BOT_JUDGE_ASYNC":    strconv.FormatBool(c.JudgeAsync),
 		"BOT_JUDGE_QUEUE":    strconv.Itoa(c.JudgeQueue),
@@ -471,6 +510,10 @@ func UnrecognizedBotVars() []string {
 		"BOT_ANNOUNCE_KICK": true, "BOT_ANNOUNCE_TIMEOUT": true,
 		// amend9 (裸号必杀 join rule)
 		"BOT_JOIN_NAKED_PREMIUM": true,
+		// amend10 (join verification: 300s sticker gate)
+		"BOT_JOIN_VERIFY": true, "BOT_JOIN_VERIFY_TIMEOUT": true,
+		"BOT_JOIN_VERIFY_SCAN": true, "BOT_JOIN_VERIFY_ACTION": true,
+		"BOT_JOIN_VERIFY_MSG": true, "BOT_JOIN_VERIFY_MAX_PENDING": true,
 	}
 	var out []string
 	for _, kv := range os.Environ() {

@@ -59,6 +59,9 @@ func (s *stubBot) MsgTTLView() MsgTTLView {
 func (s *stubBot) JoinRuleView() JoinRuleView {
 	return JoinRuleView{Enabled: true, Hits: 4}
 }
+func (s *stubBot) JoinVerifyView() JoinVerifyView {
+	return JoinVerifyView{Enabled: true, Pending: 2, PassedTotal: 9, TimeoutTotal: 3}
+}
 
 // fakeSweep reports a fixed (already-run) sweep for /statusz rendering.
 type fakeSweep struct{}
@@ -401,4 +404,25 @@ func TestAdminBadInput(t *testing.T) {
 		t.Errorf("bad kind = %d, want 400", resp.StatusCode)
 	}
 	resp.Body.Close()
+}
+
+// amend10: the /statusz join-verification block.
+func TestStatuszJoinVerifyBlock(t *testing.T) {
+	_, ts := newTestServer(t, "")
+	resp := get(t, ts.URL+"/statusz")
+	defer resp.Body.Close()
+	var body map[string]any
+	json.NewDecoder(resp.Body).Decode(&body)
+	if body["join_verify_enabled"] != true {
+		t.Errorf("join_verify_enabled = %v", body["join_verify_enabled"])
+	}
+	if body["join_verify_pending"] != float64(2) {
+		t.Errorf("join_verify_pending = %v", body["join_verify_pending"])
+	}
+	if body["join_verify_passed_total"] != float64(9) {
+		t.Errorf("join_verify_passed_total = %v", body["join_verify_passed_total"])
+	}
+	if body["join_verify_timeout_total"] != float64(3) {
+		t.Errorf("join_verify_timeout_total = %v", body["join_verify_timeout_total"])
+	}
 }

@@ -537,3 +537,79 @@ func TestValidateCapacityGuards(t *testing.T) {
 		t.Error("BOT_MAX_SUSPECTS=0 should fail validation")
 	}
 }
+
+// amend10: BOT_JOIN_VERIFY* contract — defaults (armed, 300s, 5s single
+// ticker, ban, fixed welcome wording, cap 5000) and env overrides including
+// the clamps and the invalid-action fallback.
+func TestJoinVerifyDefaults(t *testing.T) {
+	clearBOT(t)
+	c := Load()
+	if !c.JoinVerify {
+		t.Error("JoinVerify default should be true")
+	}
+	if c.JoinVerifyTimeout != 300*time.Second {
+		t.Errorf("JoinVerifyTimeout = %s, want 300s", c.JoinVerifyTimeout)
+	}
+	if c.JoinVerifyScan != 5*time.Second {
+		t.Errorf("JoinVerifyScan = %s, want 5s", c.JoinVerifyScan)
+	}
+	if c.JoinVerifyAction != "ban" {
+		t.Errorf("JoinVerifyAction = %q, want ban", c.JoinVerifyAction)
+	}
+	if c.JoinVerifyMsg != "👋 欢迎 %s！请在 300 秒内发一个贴纸，证明你不是机器人，否则会被移出本群～" {
+		t.Errorf("JoinVerifyMsg = %q", c.JoinVerifyMsg)
+	}
+	if c.JoinVerifyMax != 5000 {
+		t.Errorf("JoinVerifyMax = %d, want 5000", c.JoinVerifyMax)
+	}
+}
+
+func TestJoinVerifyEnvOverrides(t *testing.T) {
+	clearBOT(t)
+	t.Setenv("BOT_JOIN_VERIFY", "false")
+	t.Setenv("BOT_JOIN_VERIFY_TIMEOUT", "0")      // runaway-low → clamp 1s
+	t.Setenv("BOT_JOIN_VERIFY_SCAN", "1ns")       // clamp 100ms
+	t.Setenv("BOT_JOIN_VERIFY_ACTION", "explode") // invalid → ban
+	t.Setenv("BOT_JOIN_VERIFY_MSG", "自定义欢迎 %s")   // verbatim
+	t.Setenv("BOT_JOIN_VERIFY_MAX_PENDING", "0")  // invalid → 5000
+	c := Load()
+	if c.JoinVerify {
+		t.Error("BOT_JOIN_VERIFY=false must disable")
+	}
+	if c.JoinVerifyTimeout != 1*time.Second {
+		t.Errorf("JoinVerifyTimeout = %s, want clamped 1s", c.JoinVerifyTimeout)
+	}
+	if c.JoinVerifyScan != 100*time.Millisecond {
+		t.Errorf("JoinVerifyScan = %s, want clamped 100ms", c.JoinVerifyScan)
+	}
+	if c.JoinVerifyAction != "ban" {
+		t.Errorf("JoinVerifyAction = %q, want fallback ban", c.JoinVerifyAction)
+	}
+	if c.JoinVerifyMsg != "自定义欢迎 %s" {
+		t.Errorf("JoinVerifyMsg = %q, want verbatim", c.JoinVerifyMsg)
+	}
+	if c.JoinVerifyMax != 5000 {
+		t.Errorf("JoinVerifyMax = %d, want fallback 5000", c.JoinVerifyMax)
+	}
+	// kick is a legal action; a high timeout parses verbatim.
+	t.Setenv("BOT_JOIN_VERIFY", "true")
+	t.Setenv("BOT_JOIN_VERIFY_ACTION", "kick")
+	t.Setenv("BOT_JOIN_VERIFY_TIMEOUT", "600s")
+	t.Setenv("BOT_JOIN_VERIFY_SCAN", "2s")
+	t.Setenv("BOT_JOIN_VERIFY_MAX_PENDING", "100")
+	c = Load()
+	if !c.JoinVerify || c.JoinVerifyAction != "kick" || c.JoinVerifyTimeout != 600*time.Second ||
+		c.JoinVerifyScan != 2*time.Second || c.JoinVerifyMax != 100 {
+		t.Fatalf("verbatim overrides: %+v", c)
+	}
+	// Redacted carries all six names (non-sensitive values shown verbatim).
+	r := c.Redacted()
+	for _, k := range []string{
+		"BOT_JOIN_VERIFY", "BOT_JOIN_VERIFY_TIMEOUT", "BOT_JOIN_VERIFY_SCAN",
+		"BOT_JOIN_VERIFY_ACTION", "BOT_JOIN_VERIFY_MSG", "BOT_JOIN_VERIFY_MAX_PENDING",
+	} {
+		if _, ok := r[k]; !ok {
+			t.Errorf("Redacted missing %s", k)
+		}
+	}
+}

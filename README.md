@@ -171,6 +171,12 @@ go run . -prompteval -prompteval.models=mimo-v2.6-pro
 | 公告 | `BOT_ANNOUNCE_KICK` | `true` | 处置成功后在群内发 AI 生成的可爱送客短公告（异步不阻塞处置链；AI 失败走本地模板池；发送后按 `BOT_MSG_TTL` 自动删除） |
 | | `BOT_ANNOUNCE_TIMEOUT` | `8s` | 公告生成独立短超时（clamp 1s~20s，不重试） |
 | 裸号 | `BOT_JOIN_NAKED_PREMIUM` | `true` | 入群「裸号」必杀：Premium 会员 + 英文名 + 无简介 + 无头像，四条件 AND 全中直接处置（不经 AI；`is_premium` 入群时补一次 `getChatMember` 再核） |
+| 入群验证 | `BOT_JOIN_VERIFY` | `true` | 300 秒贴纸门：过前三层后的入群者收到固定欢迎消息，须在时限内发**贴纸**（只认 `message.sticker`；纯 emoji 文本/文字/图片一律不算，**无放宽开关**）才恢复原流程；期间该用户消息**绝不送 AI**；到期未验证走标准处置链（通知+群内公告）。pending 只存内存，重启丢失 |
+| | `BOT_JOIN_VERIFY_TIMEOUT` | `300s` | 验证时限（clamp 1s~24h） |
+| | `BOT_JOIN_VERIFY_SCAN` | `5s` | 超时扫描间隔（单 ticker 随进程关闭；clamp 100ms~1m） |
+| | `BOT_JOIN_VERIFY_ACTION` | `ban` | 超时处置：`ban`（默认，**真封禁**）/ `kick` |
+| | `BOT_JOIN_VERIFY_MSG` | 固定文案 | 欢迎消息（`%s` = @用户名或名字）；**不走 `BOT_MSG_TTL` 60s 自删**，验证结束即删 |
+| | `BOT_JOIN_VERIFY_MAX_PENDING` | `5000` | 待验证名单上限；超限 WARN 并走原流程 |
 | | `BOT_LOG_LEVEL` / `BOT_LOG_FORMAT` | `info` / `text` | 日志 |
 | | `BOT_ADMIN_TOKEN` | 空 | 非空开放 `/admin/*` |
 | | `BOT_VERSION` | `dev` | 构建注入 |
@@ -188,7 +194,10 @@ go run . -prompteval -prompteval.models=mimo-v2.6-pro
   `ai_verify_rounds` / `ai_verify_flipped`、`local_fallback_count`、
   `simhash_hits`、`pending_queue`、`prompt_version`、`last_sweep` / `next_sweep_in`
   （janitor 跑过才出现），以及 amend8 项：`msg_ttl`（当前配置值）、
-  `msg_ttl_scheduled_total`、`msg_ttl_deleted_total`、`msg_ttl_error_total`
+  `msg_ttl_scheduled_total`、`msg_ttl_deleted_total`、`msg_ttl_error_total`，
+  amend9 项：`join_rule_enabled` / `join_rule_hits_total`，amend10 项：
+  `join_verify_enabled` / `join_verify_pending` / `join_verify_passed_total` /
+  `join_verify_timeout_total`
 - `/admin/signatures` → 需要 `BOT_ADMIN_TOKEN`（`Authorization: Bearer`），
   `GET`/`POST`/`DELETE` 维护 bio/msg 签名库
 
@@ -274,6 +283,10 @@ cd app && go build ./... && go vet ./... && go test ./... -race -count=1
 
 ## 已知限制
 
+- **入群验证 pending 只存内存（amend10）**：`BOT_STORE=memory` 下进程重启会丢失
+  待验证名单——重启后那批已进群但未发贴纸的用户**不会再被超时处置**（观察名单
+  也一并丢失，靠签名库兜底）；残留的欢迎消息不做补偿删除（超 48h 也删不掉），
+  属已知代价。验证期间该用户的消息不送 AI、不判签名。
 - **bot 聊天消息 TTL（amend8）**：bot 发进群/私聊的消息按 `BOT_MSG_TTL`（默认 60s，
   `0`=永不删）自动删除——命令回复、退群提示、送客公告统一走它；**通知频道
   （`BOT_LOG_CHAT`）的推送永久保留，绝不删**。删除任务只存内存：**进程重启会丢失

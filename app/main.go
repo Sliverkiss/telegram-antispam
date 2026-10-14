@@ -158,6 +158,10 @@ func main() {
 	judgePoolCtx, stopJudgePool := context.WithCancel(context.Background())
 	b.StartJudgePool(judgePoolCtx)
 
+	// amend10: the join-verification deadline scanner (single ticker, dies
+	// with the process). No-op when BOT_JOIN_VERIFY=false.
+	b.StartJoinVerify()
+
 	// Notification subsystem (amend4): async bounded queue + worker; the
 	// sender is the plain-text NotifySender (no parse_mode, preview off).
 	notifier := notify.New(notify.Config{
@@ -225,9 +229,10 @@ func main() {
 		log.Info("shutdown_signal")
 		stopPoll()
 		stopJudgePool()
-		b.StopJudgePool() // drains up to BOT_JUDGE_DRAIN, logs judge_pool_stopped
-		b.StopAnnouncer() // drains in-flight announcements (BOT_JUDGE_DRAIN magnitude)
-		b.StopMsgTTL()    // drains in-flight TTL deletions (BOT_JUDGE_DRAIN magnitude)
+		b.StopJudgePool()  // drains up to BOT_JUDGE_DRAIN, logs judge_pool_stopped
+		b.StopJoinVerify() // closes the amend10 deadline scan ticker
+		b.StopAnnouncer()  // drains in-flight announcements (BOT_JUDGE_DRAIN magnitude)
+		b.StopMsgTTL()     // drains in-flight TTL deletions (BOT_JUDGE_DRAIN magnitude)
 		stopRetry()
 		retryQ.Stop()
 		janitorStop()

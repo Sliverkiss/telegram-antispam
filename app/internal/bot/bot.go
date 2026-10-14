@@ -111,6 +111,13 @@ type Bot struct {
 	// pushes are permanent by design. Built in New from the config.
 	msgTTL *msgDeleter
 
+	// joinVerify (amend10) is the 300-second sticker gate: every joiner past
+	// watchlist + signature + naked-premium gets a welcome message and must
+	// post a sticker before the deadline; until then their messages never
+	// reach the AI. The subsystem is ALWAYS built (nil-safe when disabled) so
+	// the state and counters exist for /statusz regardless of the switch.
+	joinVerify *joinVerifier
+
 	startedAt time.Time
 
 	// Stats (atomic for /statusz while the poll loop is running).
@@ -152,6 +159,10 @@ func New(st store.Store, tg TelegramClient, classify AIClassifier, verify Verifi
 	// command replies, the leave notice, and the announcement sends all go
 	// through it. Drain budget rides the BOT_JUDGE_DRAIN magnitude.
 	b.msgTTL = newMsgDeleter(tg, cfg.MsgTTL, cfg.JudgeDrain, log)
+	// amend10: the join verification subsystem. The scan ticker only starts
+	// when armed AND StartJoinVerify is called (main / tests); the pending
+	// state and counters exist either way.
+	b.joinVerify = newJoinVerifier(b, joinVerifyConfig{maxPending: cfg.JoinVerifyMax})
 	return b
 }
 
@@ -216,6 +227,33 @@ func (b *Bot) MsgTTLConfig() time.Duration {
 // StopMsgTTL drains in-flight TTL deletions (shutdown; BOT_JUDGE_DRAIN
 // magnitude budget). Idempotent, nil-safe.
 func (b *Bot) StopMsgTTL() { b.msgTTL.Stop() }
+
+// StartJoinVerify launches the amend10 deadline scan ticker (no-op when the
+// switch is off — the ticker would spin for nothing). main calls it next to
+// StartJudgePool; tests call it when they drive the expiry path.
+func (b *Bot) StartJoinVerify() {
+	if b.joinVerify == nil || !b.Cfg.JoinVerify {
+		return
+	}
+	b.joinVerify.Start()
+}
+
+// StopJoinVerify closes the deadline scan ticker (shutdown; idempotent,
+// nil-safe). In-flight deadline disposals run to completion — their chain
+// is the standard synchronous punish().
+func (b *Bot) StopJoinVerify() { b.joinVerify.Stop() }
+
+// JoinVerifyStats returns the amend10 /statusz gauges:
+// (BOT_JOIN_VERIFY, join_verify_pending, join_verify_passed_total,
+// join_verify_timeout_total). Timeout counts real disposals only (dry-run
+// excluded, per the amend10 contract).
+func (b *Bot) JoinVerifyStats() (enabled bool, pending, passed, timeouts int64) {
+	if b.joinVerify == nil {
+		return b.Cfg.JoinVerify, 0, 0, 0
+	}
+	pending, passed, timeouts = b.joinVerify.Stats()
+	return b.Cfg.JoinVerify, pending, passed, timeouts
+}
 
 // Stats returns a snapshot for /statusz.
 func (b *Bot) Stats() (poll, punished, aiCalls, aiFails int64) {
@@ -329,6 +367,13 @@ func (b *Bot) handleChatMember(ctx context.Context, cm *telegram.ChatMemberUpdat
 	}
 	oldStatus := cm.OldChatMember.Status
 	newStatus := cm.NewChatMember.Status
+	// amend10 D: a pending joiner leaving (left/kicked) clears their entry —
+	// no disposal of empty air, welcome message deleted, idempotent.
+	if newStatus == "left" || newStatus == "kicked" || newStatus == "restricted" {
+		if !b.Cfg.IsAdminUser(cm.NewChatMember.User.ID) {
+			b.joinVerify.clearOnLeft(cm.NewChatMember.User.ID)
+		}
+	}
 	if (oldStatus == "left" || oldStatus == "") && newStatus == "member" {
 		b.HandleNewMembers(ctx, cm.Chat.ID, []telegram.User{cm.NewChatMember.User}, 0)
 	}
@@ -493,10 +538,30 @@ func (b *Bot) screenNewMember(ctx context.Context, chatID int64, u telegram.User
 		}
 	}
 
+	// amend10 入群验证: the sticker gate, positioned AFTER the naked-premium
+	// kill and BEFORE any AI round (user-mandated order). When armed and
+	// registration succeeds (welcome sent), this function RETURNS: the bio AI
+	// round is NOT skipped — the bio is parked on the pending entry and
+	// submitted when the sticker verification passes (joinverify.go). When
+	// registration is refused (over cap / send failure), the joiner falls
+	// through to the normal flow below.
+	if b.Cfg.JoinVerify && b.joinVerify.register(ctx, chatID, u.ID, u.Username, u.FirstName, bio, joinMsgID) {
+		return
+	}
+
 	// Not hit + non-empty bio → AI (bio mode: the same must-kill list plus the
 	// self-promotion clause). Async: the update handler returns immediately;
 	// the join key serializes this judgment ahead of the same user's first
-	// judgeable message (amend6 A.3).
+	// judgeable message (amend6 A.3). No bio → already watchlisted above;
+	// their first message will be judged then (amend10 F.2).
+	b.submitJoinBio(ctx, chatID, joinMsgID, u, bio)
+}
+
+// submitJoinBio sends the join-bio AI judgment (bio mode) when the bio is
+// non-empty. Shared by the direct path (verification disabled / registration
+// refused) and the amend10 pass path (sticker verified → the parked bio round
+// resumes exactly as it would have run without the gate).
+func (b *Bot) submitJoinBio(ctx context.Context, chatID, joinMsgID int64, u telegram.User, bio string) {
 	if strings.TrimSpace(bio) == "" {
 		return
 	}
@@ -573,6 +638,26 @@ func (b *Bot) HandleMessage(ctx context.Context, m telegram.Message) {
 	if b.Cfg.IsAdminUser(uid) {
 		b.Log.Debug("skip_admin_user", "chat", chatID, "uid", uid)
 		return
+	}
+
+	// amend10: a pending join verification consumes sticker messages (the
+	// passing shape — same chat required) and BLOCKS everything else from
+	// this user: while unverified, no AI call, no watchlist consumption, no
+	// signature matching on their messages (到期仍按未验证处置 — the
+	// deadline, not the content, decides). Cleared entries fall through.
+	if b.Cfg.JoinVerify && b.joinVerify != nil {
+		if b.joinVerify.isPending(uid) {
+			if b.joinVerify.handleStickerMessage(m) {
+				return
+			}
+			// Pending + non-passing message (incl. pure emoji text, photos,
+			// words): not consumed, not judged — swallowed until the deadline
+			// disposes them or a sticker passes.
+			b.Log.Debug("join_verify_blocked_message",
+				"chat", chatID, "uid", uid,
+				"summary", "验证未通过期间不送 AI")
+			return
+		}
 	}
 
 	text, imageFileID, fileUniqueID := b.mediaContent(m)
@@ -1186,6 +1271,24 @@ func (b *Bot) sendChat(ctx context.Context, chatID int64, text string) (int64, e
 // Announcer so announcement sends ride the same amend8 TTL path).
 func (b *Bot) SendChat(ctx context.Context, chatID int64, text string) (int64, error) {
 	return b.sendChat(ctx, chatID, text)
+}
+
+// sendChatNoTTL is the amend10 welcome-message send: plain SendMessage, NO
+// TTL registration (the welcome must survive the whole verification window;
+// it is deleted when the verification ends, not on a timer). THE ONLY caller
+// is joinVerifier.register — tests assert its messages stay out of the TTL
+// registry while sendChat messages are in it.
+func (b *Bot) sendChatNoTTL(ctx context.Context, chatID int64, text string) (int64, error) {
+	return b.msgTTL.SendChatNoTTL(ctx, chatID, text)
+}
+
+// verifyTimeout resolves the amend10 deadline (BOT_JOIN_VERIFY_TIMEOUT,
+// defensive fallback when zero).
+func (b *Bot) verifyTimeout() time.Duration {
+	if b.Cfg.JoinVerifyTimeout <= 0 {
+		return DefaultJoinVerifyTimeout
+	}
+	return b.Cfg.JoinVerifyTimeout
 }
 
 func (b *Bot) replyHelpful(ctx context.Context, m telegram.Message, text string) {

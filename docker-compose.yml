@@ -83,3 +83,10 @@ services:
       - BOT_ADMIN_TOKEN=${BOT_ADMIN_TOKEN:-}
       - BOT_VERSION=${BOT_VERSION:-dev}      # amend9: 裸号必杀 join rule (premium + English name + no bio + no photo)
       - BOT_JOIN_NAKED_PREMIUM=${BOT_JOIN_NAKED_PREMIUM:-true}
+      # amend10: join verification (300s sticker gate)
+      - BOT_JOIN_VERIFY=${BOT_JOIN_VERIFY:-true}
+      - BOT_JOIN_VERIFY_TIMEOUT=${BOT_JOIN_VERIFY_TIMEOUT:-300s}
+      - BOT_JOIN_VERIFY_SCAN=${BOT_JOIN_VERIFY_SCAN:-5s}
+      - BOT_JOIN_VERIFY_ACTION=${BOT_JOIN_VERIFY_ACTION:-ban}
+      - BOT_JOIN_VERIFY_MSG=${BOT_JOIN_VERIFY_MSG:-👋 欢迎 %s！请在 300 秒内发一个贴纸，证明你不是机器人，否则会被移出本群～}
+      - BOT_JOIN_VERIFY_MAX_PENDING=${BOT_JOIN_VERIFY_MAX_PENDING:-5000}

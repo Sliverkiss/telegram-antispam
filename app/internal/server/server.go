@@ -39,6 +39,10 @@ type Inspector interface {
 	// Amend9: 裸号必杀 join-rule gauges (join_rule_enabled /
 	// join_rule_hits_total).
 	JoinRuleView() JoinRuleView
+	// Amend10: join-verification gauges (join_verify_enabled /
+	// join_verify_pending / join_verify_passed_total /
+	// join_verify_timeout_total).
+	JoinVerifyView() JoinVerifyView
 }
 
 // MsgTTLView is the amend8 chat-message-TTL gauges the server renders (plain
@@ -55,6 +59,15 @@ type MsgTTLView struct {
 type JoinRuleView struct {
 	Enabled bool
 	Hits    int64
+}
+
+// JoinVerifyView is the amend10 join-verification gauges the server renders
+// (plain data so server does not import bot).
+type JoinVerifyView struct {
+	Enabled      bool
+	Pending      int64
+	PassedTotal  int64
+	TimeoutTotal int64
 }
 
 // AnnounceView is the amend7 announcement counters the server renders (plain
@@ -293,6 +306,13 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	jrv := s.Bot.JoinRuleView()
 	body["join_rule_enabled"] = jrv.Enabled
 	body["join_rule_hits_total"] = jrv.Hits
+
+	// amend10: join-verification gauges.
+	jvv := s.Bot.JoinVerifyView()
+	body["join_verify_enabled"] = jvv.Enabled
+	body["join_verify_pending"] = jvv.Pending
+	body["join_verify_passed_total"] = jvv.PassedTotal
+	body["join_verify_timeout_total"] = jvv.TimeoutTotal
 	// The sweeper block only appears when the janitor has run at least once.
 	if s.Sweeper != nil {
 		at, next, droppedSus, droppedSigs, remaining, ran := s.Sweeper.SweepSnapshot()

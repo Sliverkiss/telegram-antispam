@@ -434,3 +434,37 @@ func TestGetChatMapsHasPhoto(t *testing.T) {
 		})
 	}
 }
+
+// amend10: message.sticker conversion — the join verification's passing shape
+// depends on Sticker != nil, so the mapping must be pinned (a sticker message
+// maps; a pure-emoji text message maps with Sticker == nil).
+func TestStickerConversion(t *testing.T) {
+	raw := `{"update_id":43,"message":{"message_id":7,"chat":{"id":-100,"type":"supergroup"},"from":{"id":9,"is_bot":false,"first_name":"U"},"date":100,"sticker":{"file_id":"f1","file_unique_id":"u1","is_animated":true,"is_video":false,"emoji":"🐉"}}}`
+	out, err := convertUpdateJSON(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Message == nil || out.Message.Sticker == nil {
+		t.Fatal("sticker message must map with Sticker != nil")
+	}
+	s := out.Message.Sticker
+	if s.FileID != "f1" || s.FileUniqueID != "u1" || !s.IsAnimated || s.IsVideo || s.Emoji != "🐉" {
+		t.Errorf("sticker fields = %+v", s)
+	}
+	// A pure-emoji TEXT message: same chat/user, text instead of sticker —
+	// must map with Sticker == nil (iron rule 1: 只认贴纸).
+	rawText := `{"update_id":44,"message":{"message_id":8,"chat":{"id":-100,"type":"supergroup"},"from":{"id":9,"is_bot":false,"first_name":"U"},"date":101,"text":"😀🐉🔥✨🤡"}}`
+	out2, err := convertUpdateJSON(rawText)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out2.Message == nil {
+		t.Fatal("text message must map")
+	}
+	if out2.Message.Sticker != nil {
+		t.Errorf("pure emoji TEXT must map with Sticker == nil, got %+v", out2.Message.Sticker)
+	}
+	if out2.Message.Text != "😀🐉🔥✨🤡" {
+		t.Errorf("text = %q", out2.Message.Text)
+	}
+}

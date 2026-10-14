@@ -78,6 +78,10 @@ type Message struct {
 	Photo []PhotoSize
 	// Document is set for file documents (image documents are judged too).
 	Document *Document
+	// Sticker is set when the message is a sticker (amend10: the join
+	// verification ONLY accepts sticker messages — a bool, not a struct: the
+	// verification decision needs nothing beyond presence).
+	Sticker *Sticker
 	// ReplyToMessage is set when this message replies to another.
 	ReplyToMessage *Message
 	// NewChatMembers lists users that just joined via this service message.
@@ -101,6 +105,18 @@ type Document struct {
 	FileName string
 	MimeType string
 	FileSize int64
+}
+
+// Sticker is a placeholder for the message.sticker object (amend10). The join
+// verification only reads presence, so only the identity fields are kept —
+// keeping the domain surface minimal avoids re-implementing the whole Bot API
+// sticker union (mask/video/custom-emoji variants).
+type Sticker struct {
+	FileID       string
+	FileUniqueID string
+	IsAnimated   bool
+	IsVideo      bool
+	Emoji        string
 }
 
 // User is the subset of a Telegram user.
@@ -187,6 +203,15 @@ func convMessage(m models.Message) Message {
 			FileName: m.Document.FileName,
 			MimeType: m.Document.MimeType,
 			FileSize: int64(m.Document.FileSize),
+		}
+	}
+	if m.Sticker != nil {
+		out.Sticker = &Sticker{
+			FileID:       m.Sticker.FileID,
+			FileUniqueID: m.Sticker.FileUniqueID,
+			IsAnimated:   m.Sticker.IsAnimated,
+			IsVideo:      m.Sticker.IsVideo,
+			Emoji:        m.Sticker.Emoji,
 		}
 	}
 	if m.ReplyToMessage != nil {

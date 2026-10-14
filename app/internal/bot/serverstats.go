@@ -91,3 +91,16 @@ func (b *Bot) JoinRuleView() server.JoinRuleView {
 	enabled, hits := b.JoinRuleStats()
 	return server.JoinRuleView{Enabled: enabled, Hits: hits}
 }
+
+// JoinVerifyView adapts the amend10 join-verification gauges into the
+// server's plain view: (BOT_JOIN_VERIFY, join_verify_pending,
+// join_verify_passed_total, join_verify_timeout_total).
+func (b *Bot) JoinVerifyView() server.JoinVerifyView {
+	enabled, pending, passed, timeouts := b.JoinVerifyStats()
+	return server.JoinVerifyView{
+		Enabled:      enabled,
+		Pending:      pending,
+		PassedTotal:  passed,
+		TimeoutTotal: timeouts,
+	}
+}

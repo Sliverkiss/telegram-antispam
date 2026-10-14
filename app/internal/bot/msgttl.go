@@ -104,6 +104,24 @@ func (m *msgDeleter) SendChat(ctx context.Context, chatID int64, text string) (i
 	if err != nil {
 		return 0, err
 	}
+	return m.schedule(ctx, chatID, msgID)
+}
+
+// SendChatNoTTL is the amend10 escape hatch for messages that must NOT ride
+// the global TTL: it sends exactly like SendChat but never registers a
+// delayed delete. The ONE consumer is the join-verification welcome message,
+// whose lifetime is bound to the verification (deleted on pass / timeout /
+// leave), not to BOT_MSG_TTL — a 60s TTL would delete the instruction before
+// the joiner ever reads it. Tests assert the message is NOT in the TTL
+// registry. Nothing else about the global default behavior changes.
+func (m *msgDeleter) SendChatNoTTL(ctx context.Context, chatID int64, text string) (int64, error) {
+	return m.tg.SendMessage(ctx, chatID, text)
+}
+
+// schedule registers the delayed deletion for a successfully sent message
+// (async, idempotent). Split from SendChat so the no-TTL path (SendChatNoTTL)
+// shares nothing with it beyond the send itself.
+func (m *msgDeleter) schedule(_ context.Context, chatID int64, msgID int64) (int64, error) {
 	if !m.Enabled() || msgID <= 0 {
 		return msgID, nil
 	}
