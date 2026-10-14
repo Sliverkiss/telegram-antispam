@@ -99,6 +99,12 @@ type Bot struct {
 	// disabled → the legacy inline path. main wires it after New.
 	judgePool *judgePool
 
+	// Announcer posts the amend7 in-group kick announcement after a
+	// successful disposal (async, own goroutine per disposal — never on the
+	// judgment pool, never blocking the punishment chain). nil → no
+	// announcements (tests default).
+	Announcer *Announcer
+
 	startedAt time.Time
 
 	// Stats (atomic for /statusz while the poll loop is running).
@@ -171,6 +177,16 @@ func (b *Bot) JudgePoolDrainBudget() time.Duration {
 	}
 	return b.judgePool.drain
 }
+
+// AnnounceStats returns the amend7 /statusz counters: (enabled, sent,
+// fallback, errors). The nil receiver means the subsystem is unwired.
+func (b *Bot) AnnounceStats() (enabled bool, sent, fallback, errs int64) {
+	return b.Announcer.Stats()
+}
+
+// StopAnnouncer drains in-flight announcements (shutdown; BOT_JUDGE_DRAIN
+// magnitude budget, same as the judge pool). Idempotent, nil-safe.
+func (b *Bot) StopAnnouncer() { b.Announcer.Stop() }
 
 // Stats returns a snapshot for /statusz.
 func (b *Bot) Stats() (poll, punished, aiCalls, aiFails int64) {
@@ -1229,10 +1245,13 @@ func (b *Bot) punish(ctx context.Context, pi punishInfo, action, category, reaso
 	for _, id := range msgIDs {
 		b.deleteOne(ctx, pi.chatID, id)
 	}
-	b.ban(ctx, pi.chatID, pi.uid, action)
+	disposed := b.ban(ctx, pi.chatID, pi.uid, action)
 	b.Store.RemoveSuspect(ctx, pi.uid)
 	b.recordPunishment(ctx, pi.chatID, pi.uid, action, category, reason)
 	b.pushPunishNotice(pi, action, category, nd)
+	if disposed {
+		b.announceKick(ctx, pi, action, category)
+	}
 }
 
 // punishAndClear deletes only the triggering message (msgID), bans/kicks, writes
@@ -1242,10 +1261,15 @@ func (b *Bot) punishAndClear(ctx context.Context, pi punishInfo, action, categor
 	if pi.msgID > 0 {
 		b.deleteOne(ctx, pi.chatID, pi.msgID)
 	}
-	b.ban(ctx, pi.chatID, pi.uid, action)
+	disposed := b.ban(ctx, pi.chatID, pi.uid, action)
 	if b.Cfg.DryRun {
 		// Dry-run: zero writes — no signature, no watchlist removal, no record,
-		// no notification.
+		// no notification. The announcement still logs announce_dry_run via
+		// Announcer.Announce's dryRun branch (zero sends, matching every other
+		// write action).
+		if disposed {
+			b.Announcer.Announce(ctx, pi.chatID, pi.uid, pi.msgID, pi.username, pi.firstName, category, true)
+		}
 		return
 	}
 	if pi.writeSig && strings.TrimSpace(pi.text) != "" {
@@ -1261,6 +1285,19 @@ func (b *Bot) punishAndClear(ctx context.Context, pi punishInfo, action, categor
 	b.Store.RemoveSuspect(ctx, pi.uid)
 	b.recordPunishment(ctx, pi.chatID, pi.uid, action, category, reason)
 	b.pushPunishNotice(pi, action, category, nd)
+	if disposed {
+		b.announceKick(ctx, pi, action, category)
+	}
+}
+
+// announceKick submits the amend7 in-group announcement after a successful
+// disposal (async — own goroutine, idempotent per chat+uid+messageID;
+// kick/ban both count; dry-run is decided inside Announcer).
+func (b *Bot) announceKick(ctx context.Context, pi punishInfo, action, category string) {
+	// messageID: the join path may carry no triggering message — the dedupe
+	// key falls back to the suspect removal timestamp bucket via 0, which
+	// still unique-keys per chat+uid pair inside the TTL window.
+	b.Announcer.Announce(ctx, pi.chatID, pi.uid, pi.msgID, pi.username, pi.firstName, category, b.Cfg.DryRun)
 }
 
 // pushPunishNotice renders and submits the §1.1 disposition notification.
@@ -1374,15 +1411,19 @@ func (b *Bot) notifyTGWriteError(chatID, messageID, uid int64, method string, ap
 	})
 }
 
-func (b *Bot) ban(ctx context.Context, chatID, uid int64, action string) {
+// ban executes the disposal; it returns true when the kick/ban actually
+// took effect (the amend7 announcement only fires on a real disposal — a
+// banChatMember failure means the user is still in the group, so announcing
+// "已送走" would be wrong).
+func (b *Bot) ban(ctx context.Context, chatID, uid int64, action string) bool {
 	if b.Cfg.DryRun {
 		b.Log.Info("dry_run_skip_dispose", "chat", chatID, "uid", uid, "action", action)
-		return
+		return true // dry-run "disposal": announce path logs announce_dry_run
 	}
 	if err := b.TG.BanChatMember(ctx, chatID, uid); err != nil {
 		b.Log.Error("ban_error", "chat", chatID, "uid", uid, "err", err.Error())
 		b.notifyTGWriteError(chatID, 0, uid, "banChatMember", apiErrOrNil(err), "")
-		return
+		return false
 	}
 	if action == "kick" {
 		if err := b.TG.UnbanChatMember(ctx, chatID, uid); err != nil {
@@ -1392,6 +1433,7 @@ func (b *Bot) ban(ctx context.Context, chatID, uid int64, action string) {
 	}
 	b.punishCount.Add(1)
 	b.Log.Info("punished", "chat", chatID, "uid", uid, "action", action)
+	return true
 }
 
 func (b *Bot) recordPunishment(ctx context.Context, chatID, uid int64, action, category, reason string) {

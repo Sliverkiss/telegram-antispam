@@ -60,3 +60,15 @@ func (b *Bot) JudgePoolView() server.JudgePoolView {
 		UpdateWorkers:  b.Cfg.UpdateWorkers,
 	}
 }
+
+// AnnounceView adapts the amend7 announcement counters into the server's
+// plain view.
+func (b *Bot) AnnounceView() server.AnnounceView {
+	enabled, sent, fallback, errs := b.AnnounceStats()
+	return server.AnnounceView{
+		Enabled:       enabled,
+		SentTotal:     sent,
+		FallbackTotal: fallback,
+		ErrorTotal:    errs,
+	}
+}

@@ -30,6 +30,18 @@ type Inspector interface {
 	// Amend6 A: async judgement-pool gauges (nil-safe zero view when the
 	// escape hatch is on).
 	JudgePoolView() JudgePoolView
+	// Amend7: kick-announcement counters (nil-safe zero view when the
+	// subsystem is unwired).
+	AnnounceView() AnnounceView
+}
+
+// AnnounceView is the amend7 announcement counters the server renders (plain
+// data so server does not import bot).
+type AnnounceView struct {
+	Enabled       bool
+	SentTotal     int64
+	FallbackTotal int64
+	ErrorTotal    int64
 }
 
 // JudgePoolView is the judge-pool counters the server renders (plain data so
@@ -239,6 +251,13 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	body["judge_enqueued_total"] = jv.EnqueuedTotal
 	body["judge_queue_full_total"] = jv.QueueFullTotal
 	body["update_workers"] = jv.UpdateWorkers
+
+	// amend7: kick announcement gauges.
+	av := s.Bot.AnnounceView()
+	body["announce_enabled"] = av.Enabled
+	body["announce_sent_total"] = av.SentTotal
+	body["announce_fallback_total"] = av.FallbackTotal
+	body["announce_error_total"] = av.ErrorTotal
 	// The sweeper block only appears when the janitor has run at least once.
 	if s.Sweeper != nil {
 		at, next, droppedSus, droppedSigs, remaining, ran := s.Sweeper.SweepSnapshot()

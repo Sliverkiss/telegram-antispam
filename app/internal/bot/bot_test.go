@@ -25,6 +25,8 @@ import (
 
 // fakeTG records every call for sequence assertions.
 type fakeTG struct {
+	mu sync.Mutex // guards the record slices (announce goroutines write concurrently)
+
 	chat    map[int64]telegram.ChatInfo
 	member  map[string]telegram.ChatMember // "chat:uid"
 	bans    []string                       // "ban" / "unban"
@@ -43,6 +45,9 @@ type fakeTG struct {
 	// deleteScript controls successive DeleteMessage results (nil entry = ok).
 	deleteScript []error
 	deleteCalls  int
+
+	// sendErr (amend7 tests): when set, every SendMessage returns it.
+	sendErr error
 }
 
 func newFakeTG() *fakeTG {
@@ -56,6 +61,8 @@ func newFakeTG() *fakeTG {
 }
 
 func (f *fakeTG) GetChatMember(_ context.Context, chatID, userID int64) (telegram.ChatMember, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.seq = append(f.seq, "getchatmember")
 	if m, ok := f.member[fkey(chatID, userID)]; ok {
 		return m, nil
@@ -63,20 +70,28 @@ func (f *fakeTG) GetChatMember(_ context.Context, chatID, userID int64) (telegra
 	return telegram.ChatMember{Status: "member"}, nil
 }
 func (f *fakeTG) GetChat(_ context.Context, chatID int64) (telegram.ChatInfo, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.seq = append(f.seq, "getchat")
 	return f.chat[chatID], nil
 }
 func (f *fakeTG) BanChatMember(_ context.Context, chatID, userID int64) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.seq = append(f.seq, "ban")
 	f.bans = append(f.bans, "ban")
 	return nil
 }
 func (f *fakeTG) UnbanChatMember(_ context.Context, chatID, userID int64) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.seq = append(f.seq, "unban")
 	f.bans = append(f.bans, "unban")
 	return nil
 }
 func (f *fakeTG) DeleteMessage(_ context.Context, chatID, messageID int64) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.seq = append(f.seq, "delete")
 	f.deleteCalls++
 	i := f.deleteCalls - 1
@@ -87,17 +102,26 @@ func (f *fakeTG) DeleteMessage(_ context.Context, chatID, messageID int64) error
 	return nil
 }
 func (f *fakeTG) SendMessage(_ context.Context, chatID int64, text string) (int64, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.seq = append(f.seq, "send")
+	if f.sendErr != nil {
+		return 0, f.sendErr
+	}
 	f.sends = append(f.sends, text)
 	return 1, nil
 }
 func (f *fakeTG) LeaveChat(_ context.Context, chatID int64) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.seq = append(f.seq, "leave")
 	f.leaves = append(f.leaves, chatID)
 	return nil
 }
 func (f *fakeTG) GetFileMetadata(_ context.Context, fileID string) (telegram.FileMeta, error) {
+	f.mu.Lock()
 	f.seq = append(f.seq, "getfile")
+	f.mu.Unlock()
 	if err, ok := f.fileErr[fileID]; ok {
 		return telegram.FileMeta{}, err
 	}
@@ -107,8 +131,10 @@ func (f *fakeTG) GetFileMetadata(_ context.Context, fileID string) (telegram.Fil
 	return telegram.FileMeta{FileID: fileID, FilePath: "photos/" + fileID + ".jpg", FileSize: 8}, nil
 }
 func (f *fakeTG) DownloadFile(_ context.Context, meta telegram.FileMeta, _ int64) ([]byte, error) {
+	f.mu.Lock()
 	f.seq = append(f.seq, "download")
 	f.downloadN++
+	f.mu.Unlock()
 	if f.downloadErr != nil {
 		return nil, f.downloadErr
 	}

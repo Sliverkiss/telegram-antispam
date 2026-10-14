@@ -168,6 +168,9 @@ go run . -prompteval -prompteval.models=mimo-v2.6-pro
 | 判定池 | `BOT_JUDGE_ASYNC` | `true` | 判定异步池总开关（false = 旧行内同步，一行回滚） |
 | | `BOT_JUDGE_QUEUE` / `BOT_AI_CONCURRENCY` | `500` / `8` | 有界提交队列 / 判定并发（同 uid 串行） |
 | | `BOT_JUDGE_DRAIN` / `BOT_UPDATE_WORKERS` | `10s` / `16` | 优雅关闭排空预算 / 库层 update worker 数（1..128） |
+| 公告 | `BOT_ANNOUNCE_KICK` | `true` | 处置成功后在群内发 AI 生成的可爱送客短公告（异步不阻塞处置链；AI 失败走本地模板池） |
+| | `BOT_ANNOUNCE_TIMEOUT` | `8s` | 公告生成独立短超时（clamp 1s~20s，不重试） |
+| | `BOT_ANNOUNCE_TTL` | `0` | 公告延迟删除（如 `10m`）；`0` = 永久保留 |
 | | `BOT_LOG_LEVEL` / `BOT_LOG_FORMAT` | `info` / `text` | 日志 |
 | | `BOT_ADMIN_TOKEN` | 空 | 非空开放 `/admin/*` |
 | | `BOT_VERSION` | `dev` | 构建注入 |
@@ -217,7 +220,7 @@ belmo 用 **Nixpacks** 构建，且部署引擎固定扫描仓库的 **`app/` �
 | `BOT_DRY_RUN` | 建议 | 首次部署填 `true`（只判定不处置），观察日志确认无误后改 `false` |
 | `BOT_ACTION` | 可选 | `kick`（默认，封后即解=踢出）/ `ban`（永久） |
 
-其余变量都有合理默认值，完整清单见 `app/.env.example`（64 个变量与代码契约一一对应）。
+其余变量都有合理默认值，完整清单见 `app/.env.example`（73 个变量与代码契约一一对应）。
 
 **部署后自检：**
 

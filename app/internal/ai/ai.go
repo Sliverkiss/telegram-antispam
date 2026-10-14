@@ -128,6 +128,9 @@ type Client struct {
 	// lastBody captures the most recent response body (bounded) so a 200
 	// status whose body is an error envelope can still be classified.
 	lastBody *bodyCapture
+	// announceTO overrides the announce timeout (BOT_ANNOUNCE_TIMEOUT;
+	// zero → AnnounceTimeoutDefault with clamping).
+	announceTO time.Duration
 }
 
 // bodyCapture remembers the tail of the last response body (bounded, 4KB —
@@ -258,6 +261,10 @@ func NewClient(cfg ClientConfig) *Client {
 	ocfg.HTTPClient = doer
 	return &Client{cfg: cfg, client: openai.NewClientWithConfig(ocfg), lastBody: cap}
 }
+
+// SetAnnounceTimeout overrides the announce per-attempt timeout
+// (BOT_ANNOUNCE_TIMEOUT; the caller passes the already-loaded config value).
+func (c *Client) SetAnnounceTimeout(d time.Duration) { c.announceTO = d }
 
 // asRoundTripper adapts an HTTPDoer to a RoundTripper when it is not already
 // an *http.Client.

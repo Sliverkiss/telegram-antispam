@@ -112,6 +112,11 @@ type Config struct {
 	NotifyDrain        time.Duration // BOT_NOTIFY_DRAIN
 	AdminCacheTTL      time.Duration // BOT_ADMIN_CACHE_TTL
 	AdminCacheMax      int           // BOT_ADMIN_CACHE_MAX
+
+	// Kick announcement (amend7) ------------------------------------------------
+	AnnounceKickEnabled bool          // BOT_ANNOUNCE_KICK
+	AnnounceTimeout     time.Duration // BOT_ANNOUNCE_TIMEOUT (clamped 1s..20s)
+	AnnounceTTL         time.Duration // BOT_ANNOUNCE_TTL (0 = keep forever)
 }
 
 // Load reads the environment into a Config with defaults applied. It is pure
@@ -195,6 +200,13 @@ func Load() Config {
 		NotifyDrain:        durationEnv("BOT_NOTIFY_DRAIN", 5*time.Second),
 		AdminCacheTTL:      durationEnv("BOT_ADMIN_CACHE_TTL", 5*time.Minute),
 		AdminCacheMax:      intEnv("BOT_ADMIN_CACHE_MAX", 5000),
+
+		// amend7: kick announcement knobs. The timeout is clamped 1s..20s
+		// (announcement generation is decorative — it must never wait like a
+		// judgment); TTL 0 = the announcement stays in the group forever.
+		AnnounceKickEnabled: boolEnv("BOT_ANNOUNCE_KICK", true),
+		AnnounceTimeout:     clampDuration(durationEnv("BOT_ANNOUNCE_TIMEOUT", 8*time.Second), 1*time.Second, 20*time.Second),
+		AnnounceTTL:         durationEnv("BOT_ANNOUNCE_TTL", 0),
 	}
 	c.Token = os.Getenv("BOT_TOKEN")
 	c.ChatsSet = os.Getenv("BOT_CHATS") != ""
@@ -292,18 +304,22 @@ func (c Config) Redacted() map[string]string {
 		"BOT_DELETE_JOIN_MSG":   strconv.FormatBool(c.DeleteJoinMsg),
 		"BOT_LOG_CHAT":          strconv.FormatInt(c.LogChat, 10),
 		// amend4 notification + admin-cache contract
-		"BOT_NOTIFY_ON_PUNISH":      strconv.FormatBool(c.NotifyOnPunish),
-		"BOT_NOTIFY_ON_ERROR":       strconv.FormatBool(c.NotifyOnError),
-		"BOT_NOTIFY_LEVEL":          c.NotifyLevel,
-		"BOT_NOTIFY_RATE":           strconv.Itoa(c.NotifyRatePerMin),
-		"BOT_NOTIFY_QUEUE":          strconv.Itoa(c.NotifyQueue),
-		"BOT_NOTIFY_DEDUPE_WINDOW":  c.NotifyDedupeWindow.String(),
-		"BOT_NOTIFY_MAX_LEN":        strconv.Itoa(c.NotifyMaxLen),
-		"BOT_NOTIFY_TEXT_LEN":       strconv.Itoa(c.NotifyTextLen),
-		"BOT_NOTIFY_INCLUDE_TEXT":   strconv.FormatBool(c.NotifyIncludeText),
-		"BOT_NOTIFY_DRAIN":          c.NotifyDrain.String(),
-		"BOT_ADMIN_CACHE_TTL":       c.AdminCacheTTL.String(),
-		"BOT_ADMIN_CACHE_MAX":       strconv.Itoa(c.AdminCacheMax),
+		"BOT_NOTIFY_ON_PUNISH":     strconv.FormatBool(c.NotifyOnPunish),
+		"BOT_NOTIFY_ON_ERROR":      strconv.FormatBool(c.NotifyOnError),
+		"BOT_NOTIFY_LEVEL":         c.NotifyLevel,
+		"BOT_NOTIFY_RATE":          strconv.Itoa(c.NotifyRatePerMin),
+		"BOT_NOTIFY_QUEUE":         strconv.Itoa(c.NotifyQueue),
+		"BOT_NOTIFY_DEDUPE_WINDOW": c.NotifyDedupeWindow.String(),
+		"BOT_NOTIFY_MAX_LEN":       strconv.Itoa(c.NotifyMaxLen),
+		"BOT_NOTIFY_TEXT_LEN":      strconv.Itoa(c.NotifyTextLen),
+		"BOT_NOTIFY_INCLUDE_TEXT":  strconv.FormatBool(c.NotifyIncludeText),
+		"BOT_NOTIFY_DRAIN":         c.NotifyDrain.String(),
+		"BOT_ADMIN_CACHE_TTL":      c.AdminCacheTTL.String(),
+		"BOT_ADMIN_CACHE_MAX":      strconv.Itoa(c.AdminCacheMax),
+		// amend7 announcement contract
+		"BOT_ANNOUNCE_KICK":         strconv.FormatBool(c.AnnounceKickEnabled),
+		"BOT_ANNOUNCE_TIMEOUT":      c.AnnounceTimeout.String(),
+		"BOT_ANNOUNCE_TTL":          c.AnnounceTTL.String(),
 		"BOT_CMD_AUTODELETE_SEC":    strconv.Itoa(c.CmdAutodeleteSec),
 		"BOT_STORE":                 c.Store,
 		"BOT_REDIS_URL":             redactURL(c.RedisURL),
@@ -438,6 +454,9 @@ func UnrecognizedBotVars() []string {
 		"BOT_NOTIFY_MAX_LEN": true, "BOT_NOTIFY_TEXT_LEN": true,
 		"BOT_NOTIFY_INCLUDE_TEXT": true, "BOT_NOTIFY_DRAIN": true,
 		"BOT_ADMIN_CACHE_TTL": true, "BOT_ADMIN_CACHE_MAX": true,
+		// amend7 (kick announcement)
+		"BOT_ANNOUNCE_KICK": true, "BOT_ANNOUNCE_TIMEOUT": true,
+		"BOT_ANNOUNCE_TTL": true,
 	}
 	var out []string
 	for _, kv := range os.Environ() {
@@ -480,6 +499,19 @@ func intEnv(key string, def int) int {
 // clampInt bounds a value into [lo, hi] (amend6 A: worker/queue counts must
 // never reach zero-or-negative or absurd values from a typo'd env var).
 func clampInt(v, lo, hi int) int {
+	if v < lo {
+		return lo
+	}
+	if v > hi {
+		return hi
+	}
+	return v
+}
+
+// clampDuration bounds a duration into [lo, hi] (amend7: the announcement
+// timeout is decorative — a typo like 90s must not make it wait like a
+// judgment; an explicit 0/negative stays at the low bound).
+func clampDuration(v, lo, hi time.Duration) time.Duration {
 	if v < lo {
 		return lo
 	}

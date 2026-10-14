@@ -50,6 +50,9 @@ func (s *stubBot) JudgePoolView() JudgePoolView {
 	return JudgePoolView{Async: true, Concurrency: 8, Queued: 2, Inflight: 1,
 		QueueCap: 500, EnqueuedTotal: 42, QueueFullTotal: 0, UpdateWorkers: 16}
 }
+func (s *stubBot) AnnounceView() AnnounceView {
+	return AnnounceView{Enabled: true, SentTotal: 5, FallbackTotal: 2, ErrorTotal: 0}
+}
 
 // fakeSweep reports a fixed (already-run) sweep for /statusz rendering.
 type fakeSweep struct{}
@@ -225,6 +228,27 @@ func TestStatuszNotifyBlock(t *testing.T) {
 	}
 	if body["notify.target_ok"] != true {
 		t.Error("top-level notify.target_ok should be set once checked")
+	}
+}
+
+// TestStatuszAnnounceBlock pins the amend7 /statusz announce gauges.
+func TestStatuszAnnounceBlock(t *testing.T) {
+	_, ts := newTestServer(t, "")
+	resp := get(t, ts.URL+"/statusz")
+	defer resp.Body.Close()
+	var body map[string]any
+	json.NewDecoder(resp.Body).Decode(&body)
+	if body["announce_enabled"] != true {
+		t.Errorf("announce_enabled = %v", body["announce_enabled"])
+	}
+	if body["announce_sent_total"] != float64(5) {
+		t.Errorf("announce_sent_total = %v", body["announce_sent_total"])
+	}
+	if body["announce_fallback_total"] != float64(2) {
+		t.Errorf("announce_fallback_total = %v", body["announce_fallback_total"])
+	}
+	if body["announce_error_total"] != float64(0) {
+		t.Errorf("announce_error_total = %v", body["announce_error_total"])
 	}
 }
 

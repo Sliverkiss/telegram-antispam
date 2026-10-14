@@ -127,6 +127,33 @@ func TestLoadDefaults(t *testing.T) {
 	if c.AdminCacheTTL != 5*time.Minute || c.AdminCacheMax != 5000 {
 		t.Errorf("admin cache = %s/%d", c.AdminCacheTTL, c.AdminCacheMax)
 	}
+	// amend7: kick announcement defaults.
+	if !c.AnnounceKickEnabled {
+		t.Error("AnnounceKickEnabled default should be true")
+	}
+	if c.AnnounceTimeout != 8*time.Second {
+		t.Errorf("AnnounceTimeout = %s, want 8s", c.AnnounceTimeout)
+	}
+	if c.AnnounceTTL != 0 {
+		t.Errorf("AnnounceTTL = %s, want 0 (keep forever)", c.AnnounceTTL)
+	}
+}
+
+func TestAnnounceEnvOverrides(t *testing.T) {
+	clearBOT(t)
+	t.Setenv("BOT_ANNOUNCE_KICK", "false")
+	t.Setenv("BOT_ANNOUNCE_TIMEOUT", "90s") // judgment-scale typo → clamp to 20s
+	t.Setenv("BOT_ANNOUNCE_TTL", "10m")
+	c := Load()
+	if c.AnnounceKickEnabled {
+		t.Error("BOT_ANNOUNCE_KICK=false must disable")
+	}
+	if c.AnnounceTimeout != 20*time.Second {
+		t.Errorf("AnnounceTimeout = %s, want clamped 20s", c.AnnounceTimeout)
+	}
+	if c.AnnounceTTL != 10*time.Minute {
+		t.Errorf("AnnounceTTL = %s, want 10m", c.AnnounceTTL)
+	}
 }
 
 func TestLoadEnv(t *testing.T) {
