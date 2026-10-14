@@ -84,3 +84,10 @@ func (b *Bot) MsgTTLView() server.MsgTTLView {
 		ErrorTotal:     errs,
 	}
 }
+
+// JoinRuleView adapts the amend9 裸号必杀 gauges into the server's plain
+// view: (BOT_JOIN_NAKED_PREMIUM, join_rule_hits_total).
+func (b *Bot) JoinRuleView() server.JoinRuleView {
+	enabled, hits := b.JoinRuleStats()
+	return server.JoinRuleView{Enabled: enabled, Hits: hits}
+}

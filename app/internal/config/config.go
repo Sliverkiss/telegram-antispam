@@ -120,6 +120,11 @@ type Config struct {
 	// Kick announcement (amend7) ------------------------------------------------
 	AnnounceKickEnabled bool          // BOT_ANNOUNCE_KICK
 	AnnounceTimeout     time.Duration // BOT_ANNOUNCE_TIMEOUT (clamped 1s..20s)
+
+	// Join rule (amend9) ---------------------------------------------------------
+	// JoinNakedPremium arms the "裸号必杀" join rule: premium + English name +
+	// empty bio + no profile photo → direct disposal (no AI round).
+	JoinNakedPremium bool // BOT_JOIN_NAKED_PREMIUM
 }
 
 // Load reads the environment into a Config with defaults applied. It is pure
@@ -211,6 +216,9 @@ func Load() Config {
 		// judgment). The announcement TTL is the unified BOT_MSG_TTL (amend8).
 		AnnounceKickEnabled: boolEnv("BOT_ANNOUNCE_KICK", true),
 		AnnounceTimeout:     clampDuration(durationEnv("BOT_ANNOUNCE_TIMEOUT", 8*time.Second), 1*time.Second, 20*time.Second),
+
+		// amend9: 裸号必杀 join rule (false = the rule is skipped entirely).
+		JoinNakedPremium: boolEnv("BOT_JOIN_NAKED_PREMIUM", true),
 	}
 	c.Token = os.Getenv("BOT_TOKEN")
 	c.ChatsSet = os.Getenv("BOT_CHATS") != ""
@@ -321,8 +329,10 @@ func (c Config) Redacted() map[string]string {
 		"BOT_ADMIN_CACHE_TTL":      c.AdminCacheTTL.String(),
 		"BOT_ADMIN_CACHE_MAX":      strconv.Itoa(c.AdminCacheMax),
 		// amend7 announcement contract
-		"BOT_ANNOUNCE_KICK":         strconv.FormatBool(c.AnnounceKickEnabled),
-		"BOT_ANNOUNCE_TIMEOUT":      c.AnnounceTimeout.String(),
+		"BOT_ANNOUNCE_KICK":    strconv.FormatBool(c.AnnounceKickEnabled),
+		"BOT_ANNOUNCE_TIMEOUT": c.AnnounceTimeout.String(),
+		// amend9 join rule contract
+		"BOT_JOIN_NAKED_PREMIUM":    strconv.FormatBool(c.JoinNakedPremium),
 		"BOT_MSG_TTL":               c.MsgTTL.String(),
 		"BOT_STORE":                 c.Store,
 		"BOT_REDIS_URL":             redactURL(c.RedisURL),
@@ -459,6 +469,8 @@ func UnrecognizedBotVars() []string {
 		"BOT_ADMIN_CACHE_TTL": true, "BOT_ADMIN_CACHE_MAX": true,
 		// amend7 (kick announcement; the TTL is the amend8 BOT_MSG_TTL)
 		"BOT_ANNOUNCE_KICK": true, "BOT_ANNOUNCE_TIMEOUT": true,
+		// amend9 (裸号必杀 join rule)
+		"BOT_JOIN_NAKED_PREMIUM": true,
 	}
 	var out []string
 	for _, kv := range os.Environ() {

@@ -170,6 +170,7 @@ go run . -prompteval -prompteval.models=mimo-v2.6-pro
 | | `BOT_JUDGE_DRAIN` / `BOT_UPDATE_WORKERS` | `10s` / `16` | 优雅关闭排空预算 / 库层 update worker 数（1..128） |
 | 公告 | `BOT_ANNOUNCE_KICK` | `true` | 处置成功后在群内发 AI 生成的可爱送客短公告（异步不阻塞处置链；AI 失败走本地模板池；发送后按 `BOT_MSG_TTL` 自动删除） |
 | | `BOT_ANNOUNCE_TIMEOUT` | `8s` | 公告生成独立短超时（clamp 1s~20s，不重试） |
+| 裸号 | `BOT_JOIN_NAKED_PREMIUM` | `true` | 入群「裸号」必杀：Premium 会员 + 英文名 + 无简介 + 无头像，四条件 AND 全中直接处置（不经 AI；`is_premium` 入群时补一次 `getChatMember` 再核） |
 | | `BOT_LOG_LEVEL` / `BOT_LOG_FORMAT` | `info` / `text` | 日志 |
 | | `BOT_ADMIN_TOKEN` | 空 | 非空开放 `/admin/*` |
 | | `BOT_VERSION` | `dev` | 构建注入 |

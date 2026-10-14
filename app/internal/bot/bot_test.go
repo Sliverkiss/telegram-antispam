@@ -212,7 +212,11 @@ func defaultCfg() config.Config {
 		RetryInterval:      10 * 1_000_000_000, // 1s in ns (unused unless retryq wired)
 		RetryMax:           5,
 		// amend4: notify defaults (overridden per-test).
-		NotifyOnPunish:     true,
+		NotifyOnPunish: true,
+		// amend9: the 裸号必杀 join rule defaults to armed (config.Load
+		// default true). No pre-amend9 test sets IsPremium anywhere, so the
+		// rule can only fire in the joinrule tests themselves.
+		JoinNakedPremium:   true,
 		NotifyOnError:      true,
 		NotifyLevel:        "error",
 		NotifyRatePerMin:   10000, // effectively unlimited in tests

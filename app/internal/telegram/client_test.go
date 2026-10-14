@@ -358,3 +358,79 @@ func TestClientUpdateWorkersConfigured(t *testing.T) {
 		t.Errorf("default workers option = %d, want 0 (library default of 1 applies)", got)
 	}
 }
+
+// --- amend9 A: User.IsPremium + ChatInfo.HasPhoto mapping ---------------------
+
+// TestUserIsPremiumMappedBothStates pins the amend9 token contract:
+// new_chat_members / getChatMember / From all surface is_premium, which the
+// Bot API only sends when true (absent = false, never a third state).
+func TestUserIsPremiumMappedBothStates(t *testing.T) {
+	// premium=true: the field is present in the payload.
+	raw := `{"update_id":7,"message":{"message_id":1,"chat":{"id":-100,"type":"supergroup"},"from":{"id":9,"is_bot":false,"first_name":"F","is_premium":true},"new_chat_members":[{"id":10,"is_bot":false,"first_name":"Lynne","last_name":"Bla","is_premium":true}]}}`
+	out, err := convertUpdateJSON(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !out.Message.From.IsPremium {
+		t.Error("from.is_premium=true must map through")
+	}
+	if len(out.Message.NewChatMembers) != 1 || !out.Message.NewChatMembers[0].IsPremium {
+		t.Fatal("new_chat_members[0].is_premium=true must map through")
+	}
+	if out.Message.NewChatMembers[0].FirstName != "Lynne" || out.Message.NewChatMembers[0].LastName != "Bla" {
+		t.Errorf("new_chat_members[0] = %+v", out.Message.NewChatMembers[0])
+	}
+
+	// premium=false: the field is omitted entirely (measured against the live
+	// API — 财源广进 returns no is_premium).
+	raw = `{"update_id":8,"message":{"message_id":2,"chat":{"id":-100,"type":"supergroup"},"from":{"id":9,"is_bot":false,"first_name":"财"},"new_chat_members":[{"id":11,"is_bot":false,"first_name":"财源广进"}]}}`
+	out, err = convertUpdateJSON(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Message.From.IsPremium {
+		t.Error("omitted is_premium must decode as false (From)")
+	}
+	if out.Message.NewChatMembers[0].IsPremium {
+		t.Error("omitted is_premium must decode as false (new_chat_members)")
+	}
+
+	// chat_member (getChatMember shape): the member variant carries it too.
+	raw = `{"update_id":9,"chat_member":{"chat":{"id":-100,"type":"supergroup"},"from":{"id":1,"is_bot":false,"first_name":"u"},"date":1,"old_chat_member":{"status":"left","user":{"id":10}},"new_chat_member":{"status":"member","user":{"id":10,"first_name":"Lynne","is_premium":true}}}}`
+	out, err = convertUpdateJSON(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !out.ChatMember.NewChatMember.User.IsPremium {
+		t.Error("getChatMember user.is_premium=true must map through")
+	}
+}
+
+// TestGetChatMapsHasPhoto pins getChat photo → ChatInfo.HasPhoto (non-empty
+// photo object = true; absent = false).
+func TestGetChatMapsHasPhoto(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		payload map[string]any
+		want    bool
+	}{
+		{"photo present", map[string]any{"id": 555, "bio": "", "photo": map[string]any{"small_file_id": "f1", "small_file_unique_id": "u1"}}, true},
+		{"photo absent", map[string]any{"id": 555, "bio": "hi"}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c, _ := newTestServer(t, func(method string) (any, error) {
+				if method != "getChat" {
+					t.Errorf("method = %s", method)
+				}
+				return tc.payload, nil
+			}, true)
+			info, err := c.GetChat(context.Background(), 555)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if info.HasPhoto != tc.want {
+				t.Errorf("HasPhoto = %v, want %v", info.HasPhoto, tc.want)
+			}
+		})
+	}
+}

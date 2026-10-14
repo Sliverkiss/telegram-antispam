@@ -56,6 +56,9 @@ func (s *stubBot) AnnounceView() AnnounceView {
 func (s *stubBot) MsgTTLView() MsgTTLView {
 	return MsgTTLView{TTL: "1m0s", ScheduledTotal: 3, DeletedTotal: 2, ErrorTotal: 1}
 }
+func (s *stubBot) JoinRuleView() JoinRuleView {
+	return JoinRuleView{Enabled: true, Hits: 4}
+}
 
 // fakeSweep reports a fixed (already-run) sweep for /statusz rendering.
 type fakeSweep struct{}
@@ -273,6 +276,21 @@ func TestStatuszMsgTTLBlock(t *testing.T) {
 	}
 	if body["msg_ttl_error_total"] != float64(1) {
 		t.Errorf("msg_ttl_error_total = %v", body["msg_ttl_error_total"])
+	}
+}
+
+// TestStatuszJoinRuleBlock pins the amend9 /statusz join-rule gauges.
+func TestStatuszJoinRuleBlock(t *testing.T) {
+	_, ts := newTestServer(t, "")
+	resp := get(t, ts.URL+"/statusz")
+	defer resp.Body.Close()
+	var body map[string]any
+	json.NewDecoder(resp.Body).Decode(&body)
+	if body["join_rule_enabled"] != true {
+		t.Errorf("join_rule_enabled = %v", body["join_rule_enabled"])
+	}
+	if body["join_rule_hits_total"] != float64(4) {
+		t.Errorf("join_rule_hits_total = %v", body["join_rule_hits_total"])
 	}
 }
 

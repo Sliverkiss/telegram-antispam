@@ -36,6 +36,9 @@ type Inspector interface {
 	// Amend8: chat-message TTL gauges (msg_ttl / msg_ttl_scheduled_total /
 	// msg_ttl_deleted_total / msg_ttl_error_total).
 	MsgTTLView() MsgTTLView
+	// Amend9: 裸号必杀 join-rule gauges (join_rule_enabled /
+	// join_rule_hits_total).
+	JoinRuleView() JoinRuleView
 }
 
 // MsgTTLView is the amend8 chat-message-TTL gauges the server renders (plain
@@ -45,6 +48,13 @@ type MsgTTLView struct {
 	ScheduledTotal int64
 	DeletedTotal   int64
 	ErrorTotal     int64
+}
+
+// JoinRuleView is the amend9 裸号必杀 gauges the server renders (plain data
+// so server does not import bot).
+type JoinRuleView struct {
+	Enabled bool
+	Hits    int64
 }
 
 // AnnounceView is the amend7 announcement counters the server renders (plain
@@ -278,6 +288,11 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	body["msg_ttl_scheduled_total"] = mv.ScheduledTotal
 	body["msg_ttl_deleted_total"] = mv.DeletedTotal
 	body["msg_ttl_error_total"] = mv.ErrorTotal
+
+	// amend9: 裸号必杀 join-rule gauges.
+	jrv := s.Bot.JoinRuleView()
+	body["join_rule_enabled"] = jrv.Enabled
+	body["join_rule_hits_total"] = jrv.Hits
 	// The sweeper block only appears when the janitor has run at least once.
 	if s.Sweeper != nil {
 		at, next, droppedSus, droppedSigs, remaining, ran := s.Sweeper.SweepSnapshot()

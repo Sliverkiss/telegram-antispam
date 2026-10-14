@@ -81,4 +81,5 @@ services:
       - BOT_ANNOUNCE_KICK=${BOT_ANNOUNCE_KICK:-true}
       - BOT_ANNOUNCE_TIMEOUT=${BOT_ANNOUNCE_TIMEOUT:-8s}
       - BOT_ADMIN_TOKEN=${BOT_ADMIN_TOKEN:-}
-      - BOT_VERSION=${BOT_VERSION:-dev}
+      - BOT_VERSION=${BOT_VERSION:-dev}      # amend9: 裸号必杀 join rule (premium + English name + no bio + no photo)
+      - BOT_JOIN_NAKED_PREMIUM=${BOT_JOIN_NAKED_PREMIUM:-true}

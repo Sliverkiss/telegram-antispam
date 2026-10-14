@@ -122,6 +122,7 @@ type Bot struct {
 	aiFails      atomic.Int64
 	localRuleCnt atomic.Int64 // local rule terminal decisions
 	simhashHits  atomic.Int64
+	joinRuleHits atomic.Int64 // amend9 裸号必杀 direct disposals (dry-run excluded)
 }
 
 // New builds a Bot with defaults filled in.
@@ -229,6 +230,12 @@ func (b *Bot) DeleteStats() (deleted, failed int64) {
 // ExtraStats returns the amend3 counters for /status and /statusz.
 func (b *Bot) ExtraStats() (localFallback, simhashHits int64) {
 	return b.localRuleCnt.Load(), b.simhashHits.Load()
+}
+
+// JoinRuleStats returns the amend9 gauges: (enabled, hits).
+// join_rule_hits_total counts real disposals only — dry-run logging does not.
+func (b *Bot) JoinRuleStats() (enabled bool, hits int64) {
+	return b.Cfg.JoinNakedPremium, b.joinRuleHits.Load()
 }
 
 // NotifySnapshotRaw is kept (see serverstats.go); the public NotifySnapshot
@@ -387,11 +394,23 @@ func (b *Bot) screenNewMember(ctx context.Context, chatID int64, u telegram.User
 	// Bio comes from getChat (Bot API only exposes bio there). Empty/err is
 	// non-fatal — we keep the watchlist record and move on.
 	bio := ""
+	hasPhoto := false
 	info, err := b.TG.GetChat(ctx, u.ID)
 	if err != nil {
 		b.Log.Warn("getchat_error", "uid", u.ID, "err", err.Error())
 	} else {
 		bio = info.Bio
+		hasPhoto = info.HasPhoto
+	}
+	// amend9: is_premium is re-fetched UNCONDITIONALLY via getChatMember —
+	// whether new_chat_members carries the field is unverified, and the API
+	// only returns it when true. Failure of the re-fetch is non-fatal: the
+	// update's own flag (OR) still stands.
+	premium := u.IsPremium
+	if m, err := b.TG.GetChatMember(ctx, chatID, u.ID); err != nil {
+		b.Log.Warn("getchatmember_premium_error", "uid", u.ID, "err", err.Error())
+	} else if m.User.IsPremium {
+		premium = true
 	}
 	sp := store.Suspect{
 		UID:       u.ID,
@@ -405,7 +424,7 @@ func (b *Bot) screenNewMember(ctx context.Context, chatID int64, u telegram.User
 		b.Log.Error("add_suspect_error", "uid", u.ID, "err", err.Error())
 		return
 	}
-	b.Log.Info("join_recorded", "chat", chatID, "uid", u.ID, "username", u.Username, "has_bio", bio != "")
+	b.Log.Info("join_recorded", "chat", chatID, "uid", u.ID, "username", u.Username, "has_bio", bio != "", "premium", premium, "has_photo", hasPhoto)
 
 	// Signature check over bio + username + first_name (normalized), with
 	// simhash near-duplicate matching (防改字绕过).
@@ -430,6 +449,47 @@ func (b *Bot) screenNewMember(ctx context.Context, chatID int64, u telegram.User
 				b.deleteOne(ctx, chatID, joinMsgID)
 			}
 			return
+		}
+	}
+
+	// amend9 裸号必杀: after the signature check (higher confidence, and its
+	// notification carries the bio evidence), before any AI round. Four-way
+	// AND — one miss and the flow falls through to the AI/bio path.
+	if b.Cfg.JoinNakedPremium {
+		if hit, why := joinRuleHit(premium, u.FirstName, u.LastName, bio, hasPhoto); hit {
+			if b.Cfg.DryRun {
+				b.Log.Info("join_rule_dry_run", "chat", chatID, "uid", u.ID, "why", why)
+				return
+			}
+			b.Log.Info("join_rule_hit",
+				"chat", chatID,
+				"uid", u.ID,
+				"premium", true,
+				"english", true,
+				"no_bio", true,
+				"no_photo", true,
+				"why", why)
+			b.joinRuleHits.Add(1)
+			b.punish(ctx, punishInfo{
+				chatID:    chatID,
+				uid:       u.ID,
+				username:  u.Username,
+				firstName: u.FirstName,
+				text:      why,
+			}, b.Cfg.Action, "join_rule", "广告", notifyDetails{source: "join_rule", score: 100}, nil)
+			if b.Cfg.DeleteJoinMsg && joinMsgID > 0 {
+				b.deleteOne(ctx, chatID, joinMsgID)
+			}
+			return
+		} else if reason := missReason(premium, isEnglishName(u.FirstName, u.LastName), strings.TrimSpace(bio) == "", hasPhoto); reason != "" {
+			b.Log.Debug("join_rule_miss_reason",
+				"chat", chatID,
+				"uid", u.ID,
+				"premium", premium,
+				"english", isEnglishName(u.FirstName, u.LastName),
+				"no_bio", strings.TrimSpace(bio) == "",
+				"no_photo", !hasPhoto,
+				"miss", reason)
 		}
 	}
 

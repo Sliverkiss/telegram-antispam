@@ -138,6 +138,10 @@ func TestLoadDefaults(t *testing.T) {
 	if c.MsgTTL != 60*time.Second {
 		t.Errorf("MsgTTL = %s, want 60s", c.MsgTTL)
 	}
+	// amend9: the 裸号必杀 join rule defaults to armed.
+	if !c.JoinNakedPremium {
+		t.Error("JoinNakedPremium default should be true")
+	}
 }
 
 func TestAnnounceEnvOverrides(t *testing.T) {
@@ -150,6 +154,25 @@ func TestAnnounceEnvOverrides(t *testing.T) {
 	}
 	if c.AnnounceTimeout != 20*time.Second {
 		t.Errorf("AnnounceTimeout = %s, want clamped 20s", c.AnnounceTimeout)
+	}
+}
+
+// amend9: BOT_JOIN_NAKED_PREMIUM contract — default true, false disables the
+// 裸号必杀 join rule entirely.
+func TestJoinNakedPremiumEnvOverrides(t *testing.T) {
+	clearBOT(t)
+	t.Setenv("BOT_JOIN_NAKED_PREMIUM", "false")
+	c := Load()
+	if c.JoinNakedPremium {
+		t.Error("BOT_JOIN_NAKED_PREMIUM=false must disable the join rule")
+	}
+	if r := c.Redacted()["BOT_JOIN_NAKED_PREMIUM"]; r != "false" {
+		t.Errorf("Redacted BOT_JOIN_NAKED_PREMIUM = %q, want \"false\"", r)
+	}
+	t.Setenv("BOT_JOIN_NAKED_PREMIUM", "true")
+	c = Load()
+	if !c.JoinNakedPremium {
+		t.Error("BOT_JOIN_NAKED_PREMIUM=true must re-arm")
 	}
 }
 

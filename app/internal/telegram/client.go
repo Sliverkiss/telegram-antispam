@@ -110,6 +110,9 @@ type User struct {
 	FirstName string
 	LastName  string
 	Username  string
+	// IsPremium: Telegram only sends is_premium when true (amend9; measured
+	// against the live API). false therefore means "not premium or omitted".
+	IsPremium bool
 }
 
 // Chat is the subset of a Telegram chat.
@@ -126,6 +129,10 @@ type ChatInfo struct {
 	LastName  string
 	Username  string
 	Bio       string
+	// HasPhoto is getChat's photo being non-empty (amend9; the profile-photo
+	// leg of the join rule — preferred over getUserProfilePhotos because it
+	// rides the bio call we already make).
+	HasPhoto bool
 }
 
 // ---------------------------------------------------------------------------
@@ -197,7 +204,7 @@ func convMessage(m models.Message) Message {
 }
 
 func convUser(u models.User) User {
-	return User{ID: u.ID, IsBot: u.IsBot, FirstName: u.FirstName, LastName: u.LastName, Username: u.Username}
+	return User{ID: u.ID, IsBot: u.IsBot, FirstName: u.FirstName, LastName: u.LastName, Username: u.Username, IsPremium: u.IsPremium}
 }
 
 func convChat(c models.Chat) Chat {
@@ -403,7 +410,7 @@ func (c *Client) GetChat(ctx context.Context, chatID int64) (ChatInfo, error) {
 	if info == nil {
 		return ChatInfo{}, nil
 	}
-	return ChatInfo{ID: info.ID, FirstName: info.FirstName, LastName: info.LastName, Username: info.Username, Bio: info.Bio}, nil
+	return ChatInfo{ID: info.ID, FirstName: info.FirstName, LastName: info.LastName, Username: info.Username, Bio: info.Bio, HasPhoto: info.Photo != nil}, nil
 }
 
 // GetChatMember returns the member state of userID in chatID.
