@@ -111,11 +111,14 @@ type Bot struct {
 	// pushes are permanent by design. Built in New from the config.
 	msgTTL *msgDeleter
 
-	// joinVerify (amend10) is the 300-second sticker gate: every joiner past
-	// watchlist + signature + naked-premium gets a welcome message and must
-	// post a sticker before the deadline; until then their messages never
-	// reach the AI. The subsystem is ALWAYS built (nil-safe when disabled) so
-	// the state and counters exist for /statusz regardless of the switch.
+	// joinVerify (amend10/amend11) is the 300-second sticker gate. amend11
+	// moved it AFTER the join-bio AI judgment: the welcome + registration
+	// hang off the final NON-AD conclusion (onJoinVerdictNonAd), an AD
+	// conclusion disposes with no welcome, and a failing judgment retries
+	// with no welcome until it concludes. A no-bio joiner is welcomed at
+	// join time directly. The subsystem is ALWAYS built (nil-safe when
+	// disabled) so the state and counters exist for /statusz regardless of
+	// the switch.
 	joinVerify *joinVerifier
 
 	startedAt time.Time
@@ -243,16 +246,27 @@ func (b *Bot) StartJoinVerify() {
 // is the standard synchronous punish().
 func (b *Bot) StopJoinVerify() { b.joinVerify.Stop() }
 
-// JoinVerifyStats returns the amend10 /statusz gauges:
+// JoinVerifyStats returns the amend10/amend11 /statusz gauges:
 // (BOT_JOIN_VERIFY, join_verify_pending, join_verify_passed_total,
 // join_verify_timeout_total). Timeout counts real disposals only (dry-run
-// excluded, per the amend10 contract).
+// and skipped outcomes excluded, per the amend10/11 contracts). The skipped
+// counter surfaces via JoinVerifySkippedTotal (join_verify_skipped_total).
 func (b *Bot) JoinVerifyStats() (enabled bool, pending, passed, timeouts int64) {
 	if b.joinVerify == nil {
 		return b.Cfg.JoinVerify, 0, 0, 0
 	}
-	pending, passed, timeouts = b.joinVerify.Stats()
+	pending, passed, timeouts, _ = b.joinVerify.Stats()
 	return b.Cfg.JoinVerify, pending, passed, timeouts
+}
+
+// JoinVerifySkippedTotal returns join_verify_skipped_total (amend11 C:
+// timeouts that did NOT dispose — reason gone / unable_to_verify).
+func (b *Bot) JoinVerifySkippedTotal() int64 {
+	if b.joinVerify == nil {
+		return 0
+	}
+	_, _, _, skipped := b.joinVerify.Stats()
+	return skipped
 }
 
 // Stats returns a snapshot for /statusz.
@@ -367,8 +381,10 @@ func (b *Bot) handleChatMember(ctx context.Context, cm *telegram.ChatMemberUpdat
 	}
 	oldStatus := cm.OldChatMember.Status
 	newStatus := cm.NewChatMember.Status
-	// amend10 D: a pending joiner leaving (left/kicked) clears their entry —
-	// no disposal of empty air, welcome message deleted, idempotent.
+	// amend11 B.1: a pending joiner removed by ANYONE (left / kicked /
+	// restricted / banned — the update carries no reliable author, 含别的
+	// bot) is cleared with zero disposal: pending removed, welcome deleted,
+	// the 300s deadline can no longer reach them. Idempotent.
 	if newStatus == "left" || newStatus == "kicked" || newStatus == "restricted" {
 		if !b.Cfg.IsAdminUser(cm.NewChatMember.User.ID) {
 			b.joinVerify.clearOnLeft(cm.NewChatMember.User.ID)
@@ -538,29 +554,30 @@ func (b *Bot) screenNewMember(ctx context.Context, chatID int64, u telegram.User
 		}
 	}
 
-	// amend10 入群验证: the sticker gate, positioned AFTER the naked-premium
-	// kill and BEFORE any AI round (user-mandated order). When armed and
-	// registration succeeds (welcome sent), this function RETURNS: the bio AI
-	// round is NOT skipped — the bio is parked on the pending entry and
-	// submitted when the sticker verification passes (joinverify.go). When
-	// registration is refused (over cap / send failure), the joiner falls
-	// through to the normal flow below.
-	if b.Cfg.JoinVerify && b.joinVerify.register(ctx, chatID, u.ID, u.Username, u.FirstName, bio, joinMsgID) {
+	// amend11 入群验证 (order core): the sticker gate sits AFTER the join-bio
+	// judgment, not here. 无简介 → nothing to judge → welcome directly. 有简介
+	// → the AI round below concludes first; the welcome + registration hang
+	// off the final NON-AD conclusion (onJoinVerdictNonAd — reached by the
+	// first round, any retry round, or the local-rule fallback alike). An AD
+	// conclusion disposes (punishAndClear, no welcome); a failing judgment
+	// retries with no welcome until it concludes.
+	if b.Cfg.JoinVerify && strings.TrimSpace(bio) == "" {
+		b.joinVerify.onJoinVerdictNonAd(ctx, chatID, u.ID, u.Username, u.FirstName)
 		return
 	}
 
-	// Not hit + non-empty bio → AI (bio mode: the same must-kill list plus the
+	// 有简介 → AI (bio mode: the same must-kill list plus the
 	// self-promotion clause). Async: the update handler returns immediately;
 	// the join key serializes this judgment ahead of the same user's first
-	// judgeable message (amend6 A.3). No bio → already watchlisted above;
-	// their first message will be judged then (amend10 F.2).
+	// judgeable message (amend6 A.3). The non-ad conclusion of this round
+	// (or of its retries / local-rule fallback) is the welcome exit.
 	b.submitJoinBio(ctx, chatID, joinMsgID, u, bio)
 }
 
 // submitJoinBio sends the join-bio AI judgment (bio mode) when the bio is
-// non-empty. Shared by the direct path (verification disabled / registration
-// refused) and the amend10 pass path (sticker verified → the parked bio round
-// resumes exactly as it would have run without the gate).
+// non-empty. The verifier is NOT consulted here — the welcome waits for the
+// final non-ad conclusion (onJoinVerdictNonAd, fired by finishJudgment /
+// localFallback).
 func (b *Bot) submitJoinBio(ctx context.Context, chatID, joinMsgID int64, u telegram.User, bio string) {
 	if strings.TrimSpace(bio) == "" {
 		return
@@ -579,6 +596,63 @@ func (b *Bot) submitJoinBio(ctx context.Context, chatID, joinMsgID int64, u tele
 		writeBio:   true,
 		enqueuedAt: b.now(),
 	})
+}
+
+// onJoinVerdictNonAd is the amend11 order core: the FINAL NON-AD conclusion
+// of the join screening (AI verdict / vote override / local-rule fallback
+// pass — every lane funnels here, and the idempotent woken map makes
+// multi-round retries a no-op). It is the ONLY place a welcome message is
+// sent and the ONLY place the sticker gate registers a joiner. Before the
+// welcome, a health check confirms the joiner is still in the group
+// (getChatMember: left/kicked → skip, reason=gone) and not already disposed
+// by us (suspect record gone).
+func (v *joinVerifier) onJoinVerdictNonAd(ctx context.Context, chatID int64, uid int64, username, firstName string) {
+	b := v.b
+	if !b.Cfg.JoinVerify {
+		return
+	}
+	// Idempotent: the first lane to arrive owns the welcome; later arrivals
+	// (retry re-entry, local fallback after a stale retry round) are no-ops —
+	// the user was already welcomed or the gate explicitly refused them.
+	v.mu.Lock()
+	if v.woken[uid] {
+		v.mu.Unlock()
+		return
+	}
+	v.woken[uid] = true
+	v.mu.Unlock()
+
+	// 登记前体检 (amend11 A): no welcome for a joiner that is already gone.
+	m, err := b.TG.GetChatMember(ctx, chatID, uid)
+	if err == nil && (m.Status == "left" || m.Status == "kicked") {
+		v.skippedTotal.Add(1)
+		b.Log.Info("join_verify_welcome_skipped",
+			"chat", chatID,
+			"uid", uid,
+			"reason", "gone",
+			"summary", "结论落地时人已不在群：不欢迎、不登记")
+		return
+	}
+	if err != nil {
+		// Query failed: NOT a skip — fail-open toward the welcome (the
+		// deadline re-check will re-confirm before any disposal).
+		b.Log.Warn("join_verify_welcome_check_error",
+			"chat", chatID,
+			"uid", uid,
+			"err", err.Error(),
+			"summary", "登记前体检查询失败：按欢迎处理，到期处置前会再确认")
+	}
+	// Already disposed by us → the suspect record is gone; the user would
+	// have been disposed by the chain (which also clears pending). Skip.
+	if ok, _ := b.Store.IsSuspect(ctx, uid); !ok {
+		b.Log.Debug("join_verify_welcome_skipped",
+			"chat", chatID,
+			"uid", uid,
+			"reason", "disposed",
+			"summary", "已被本方处置：不再欢迎")
+		return
+	}
+	v.register(ctx, chatID, uid, username, firstName)
 }
 
 // ---------------------------------------------------------------------------
@@ -640,11 +714,13 @@ func (b *Bot) HandleMessage(ctx context.Context, m telegram.Message) {
 		return
 	}
 
-	// amend10: a pending join verification consumes sticker messages (the
+	// amend10/11: a pending join verification consumes sticker messages (the
 	// passing shape — same chat required) and BLOCKS everything else from
 	// this user: while unverified, no AI call, no watchlist consumption, no
 	// signature matching on their messages (到期仍按未验证处置 — the
-	// deadline, not the content, decides). Cleared entries fall through.
+	// deadline, not the content, decides). Cleared entries fall through; the
+	// user is pending only AFTER the join screening concluded non-ad
+	// (amend11 order), so there is no parked bio round to resume on pass.
 	if b.Cfg.JoinVerify && b.joinVerify != nil {
 		if b.joinVerify.isPending(uid) {
 			if b.joinVerify.handleStickerMessage(m) {
@@ -875,6 +951,13 @@ func (b *Bot) finishJudgment(ctx context.Context, in judgmentInput, verdict ai.V
 		"prompt_version", ai.PromptVersion)
 
 	if !verdict.IsAd {
+		// amend11 order core: a JOIN non-ad verdict is the final non-ad
+		// conclusion of the join screening — THIS is the welcome exit (the
+		// woken map makes every later re-arrival a no-op). Message verdicts
+		// do not touch the gate.
+		if in.kind == "join" {
+			b.joinVerify.onJoinVerdictNonAd(ctx, in.chatID, in.uid, in.username, in.firstName)
+		}
 		// One judgment = one consumption (amend5 D): a completed non-ad verdict
 		// removes the user from the watchlist. Vote-unresolved and retrying
 		// judgments keep observing (the verdict is not final yet). Join-bio
@@ -917,6 +1000,11 @@ func (b *Bot) finishJudgment(ctx context.Context, in judgmentInput, verdict ai.V
 		b.commitAd(ctx, in, verdict, elapsed, in.retries)
 	case "not_ad":
 		b.AIStats.NoteVerify(true) // vote overrode the primary verdict
+		// amend11: a join verdict overridden to not_ad is ALSO a final
+		// non-ad conclusion → the welcome exit.
+		if in.kind == "join" {
+			b.joinVerify.onJoinVerdictNonAd(ctx, in.chatID, in.uid, in.username, in.firstName)
+		}
 		// Vote concluded "not ad": the judgment is final, so the one-shot
 		// watchlist slot is consumed (amend5 D; join/bio excluded per D.2).
 		b.consumeWatchlist(ctx, in)
@@ -1094,6 +1182,11 @@ func (b *Bot) localFallback(ctx context.Context, in judgmentInput, lastErr strin
 		"threshold", res.Threshold,
 		"hits", strings.Join(res.Hits, ","),
 		"last_error", lastErr)
+	// amend11 A: the local-rule fallback of a JOIN judgment is the terminal
+	// non-ad conclusion — the welcome exit (idempotent via the woken map).
+	if in.kind == "join" {
+		b.joinVerify.onJoinVerdictNonAd(ctx, in.chatID, in.uid, in.username, in.firstName)
+	}
 	b.consumeWatchlist(ctx, in)
 }
 
@@ -1436,12 +1529,17 @@ type notifyDetails struct {
 
 // punish deletes the triggering message (if non-zero) then bans/kicks, records,
 // notifies. It is the join path (no tracked list; caller passes an explicit id).
+// amend11 B.2: OUR OWN chain disposing a pending joiner clears the gate
+// immediately — the 300s deadline must never dispose them a second time.
 func (b *Bot) punish(ctx context.Context, pi punishInfo, action, category, reason string, nd notifyDetails, msgIDs []int64) {
 	for _, id := range msgIDs {
 		b.deleteOne(ctx, pi.chatID, id)
 	}
 	disposed := b.ban(ctx, pi.chatID, pi.uid, action)
 	b.Store.RemoveSuspect(ctx, pi.uid)
+	if disposed {
+		b.joinVerify.clearDisposedUid(pi.uid)
+	}
 	b.recordPunishment(ctx, pi.chatID, pi.uid, action, category, reason)
 	b.pushPunishNotice(pi, action, category, nd)
 	if disposed {
@@ -1478,6 +1576,11 @@ func (b *Bot) punishAndClear(ctx context.Context, pi punishInfo, action, categor
 		}
 	}
 	b.Store.RemoveSuspect(ctx, pi.uid)
+	// amend11 B.2 (same as punish): our own disposal clears the gate — the
+	// deadline can no longer reach this user.
+	if disposed {
+		b.joinVerify.clearDisposedUid(pi.uid)
+	}
 	b.recordPunishment(ctx, pi.chatID, pi.uid, action, category, reason)
 	b.pushPunishNotice(pi, action, category, nd)
 	if disposed {

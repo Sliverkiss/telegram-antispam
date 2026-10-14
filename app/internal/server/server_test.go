@@ -60,7 +60,7 @@ func (s *stubBot) JoinRuleView() JoinRuleView {
 	return JoinRuleView{Enabled: true, Hits: 4}
 }
 func (s *stubBot) JoinVerifyView() JoinVerifyView {
-	return JoinVerifyView{Enabled: true, Pending: 2, PassedTotal: 9, TimeoutTotal: 3}
+	return JoinVerifyView{Enabled: true, Pending: 2, PassedTotal: 9, TimeoutTotal: 3, SkippedTotal: 7}
 }
 
 // fakeSweep reports a fixed (already-run) sweep for /statusz rendering.
@@ -406,7 +406,7 @@ func TestAdminBadInput(t *testing.T) {
 	resp.Body.Close()
 }
 
-// amend10: the /statusz join-verification block.
+// amend10/11: the /statusz join-verification block.
 func TestStatuszJoinVerifyBlock(t *testing.T) {
 	_, ts := newTestServer(t, "")
 	resp := get(t, ts.URL+"/statusz")
@@ -424,5 +424,8 @@ func TestStatuszJoinVerifyBlock(t *testing.T) {
 	}
 	if body["join_verify_timeout_total"] != float64(3) {
 		t.Errorf("join_verify_timeout_total = %v", body["join_verify_timeout_total"])
+	}
+	if body["join_verify_skipped_total"] != float64(7) {
+		t.Errorf("join_verify_skipped_total = %v", body["join_verify_skipped_total"])
 	}
 }

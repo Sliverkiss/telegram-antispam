@@ -1,13 +1,18 @@
 package bot
 
-// amend10 join-verification tests. Everything offline: fakeTG / fakeAI /
-// fakeTTLTG, no long-polling, no real token (iron rule 3). The 13 assertions
-// of TASK_antispam_amend10.md §F:
+// amend10/amend11 join-verification tests. Everything offline: fakeTG /
+// fakeAI / fakeTTLTG, no long-polling, no real token (iron rule 3).
 //
-//	 F.1 join → welcome sent + pending + NO AI call;
-//	 F.2 sticker passes → pending cleared, welcome deleted, then the parked
-//	     bio round reaches the AI (有简介) / no-bio stays watchlisted awaiting
-//	     the first message (无简介);
+// amend11 re-ordered the gate (判定走完才欢迎): a bio joiner is welcomed only
+// after the join-bio AI judgment concludes NON-AD (first round, retry round,
+// or local-rule fallback); an AD conclusion disposes with no welcome; a
+// failing judgment retries with no welcome. No-bio joiners are welcomed at
+// join time. The amend10 §F assertions still hold where the order did not
+// move them:
+//
+//	 F.1 join → welcome sent + pending + NO AI call (no-bio joiner);
+//	 F.2 sticker passes → pending cleared, welcome deleted (the bio round
+//	     ALREADY ran before the welcome — there is nothing parked to resume);
 //	 F.3 只认贴纸： a real sticker passes; pure emoji TEXT / plain text /
 //	     photos NEVER pass (the standalone regression test — iron rule 1);
 //	 F.4 timeout → exactly one real ban (no unban), the notify evidence line
@@ -152,15 +157,26 @@ func TestJoinVerifyWelcomeLabelFallback(t *testing.T) {
 	}
 }
 
-// --- F.2 sticker passes → cleared + welcome deleted + bio AI / watchlist -------
+// --- F.2 sticker passes → cleared + welcome deleted -----------------------------
 
-// 有简介: after the sticker passes, the PARKED bio round reaches the AI.
+// 有简介 (amend11 order): the bio round runs BEFORE the welcome — a non-ad
+// verdict is what arms the gate. The sticker then clears the entry; nothing
+// is parked to resume (the join screen already concluded).
 func TestJoinVerifyPassThenBioAI(t *testing.T) {
 	cfg := verifyCfg()
 	b, tg, fa := verifyJoin(t, cfg, 703, "bioU", "阿三", "我的正常简介", false)
-	// Before the sticker: the bio round is parked (zero AI).
-	if fa.callCount() != 0 {
-		t.Fatalf("parked bio must not run before verification: %d", fa.callCount())
+	// amend11: the bio judgment runs FIRST (inline path — pool not started),
+	// and its non-ad conclusion is what sends the welcome.
+	waitFor(t, func() bool { return fa.callCount() == 1 }, "bio judgment before the welcome")
+	if fa.lastMode != "bio" {
+		t.Fatalf("join round must be bio mode, got %q", fa.lastMode)
+	}
+	if fa.lastContent.Text != "我的正常简介" {
+		t.Fatalf("bio content = %q", fa.lastContent.Text)
+	}
+	waitFor(t, func() bool { return len(tg.sendsSnapshot()) == 1 }, "welcome after non-ad verdict")
+	if _, pending, _, _ := b.JoinVerifyStats(); pending != 1 {
+		t.Fatalf("non-ad conclusion must register pending: %d", pending)
 	}
 	b.HandleMessage(context.Background(), stickerMsg(-500, 703, 900))
 	if _, pending, passed, _ := b.JoinVerifyStats(); pending != 0 || passed != 1 {
@@ -169,14 +185,6 @@ func TestJoinVerifyPassThenBioAI(t *testing.T) {
 	// Welcome deleted on pass (msg id 1 from fakeTG.SendMessage).
 	if got := tg.deleteList(); len(got) != 1 || got[0] != "1" {
 		t.Fatalf("welcome must be deleted on pass: %v", got)
-	}
-	// The parked bio round now runs (inline path — pool not started).
-	waitFor(t, func() bool { return fa.callCount() == 1 }, "parked bio judgment after pass")
-	if fa.lastMode != "bio" {
-		t.Fatalf("parked round must be bio mode, got %q", fa.lastMode)
-	}
-	if fa.lastContent.Text != "我的正常简介" {
-		t.Fatalf("bio content = %q", fa.lastContent.Text)
 	}
 	if len(tg.banList()) != 0 {
 		t.Fatalf("clean bio verdict must not dispose: %v", tg.banList())
@@ -555,7 +563,7 @@ func TestJoinVerifyHandlerFastReturn(t *testing.T) {
 	}
 }
 
-// --- F.8b over-cap: registration refused → the original flow ----------------------
+// --- F.8b over-cap: registration refused → no gate for that joiner ----------------
 
 func TestJoinVerifyOverCapFallsThrough(t *testing.T) {
 	cfg := verifyCfg()
@@ -568,17 +576,24 @@ func TestJoinVerifyOverCapFallsThrough(t *testing.T) {
 	ctx := context.Background()
 	b.HandleNewMembers(ctx, -500, []telegram.User{u(740, false, "cap1", "一")}, 0)
 	b.HandleNewMembers(ctx, -500, []telegram.User{u(741, false, "cap2", "二")}, 0)
+	// Both bio judgments ran (amend11: the AI round precedes the gate).
+	waitFor(t, func() bool { return fa.callCount() == 2 }, "both bio judgments")
+	// The FIRST joiner (non-ad conclusion → registration) occupies the cap.
+	waitFor(t, func() bool { return len(tg.sendsSnapshot()) == 1 }, "first joiner welcome")
 	if _, pending, _, _ := b.JoinVerifyStats(); pending != 1 {
 		t.Fatalf("pending = %d, want 1 (cap=1)", pending)
 	}
 	if got := tg.sendsSnapshot(); len(got) != 1 {
 		t.Fatalf("only the first joiner gets a welcome: %v", got)
 	}
-	// The over-cap joiner falls through to the bio AI round immediately.
-	waitFor(t, func() bool { return fa.callCount() == 1 }, "over-cap joiner bio judgment")
-	if fa.lastContent.Text != "第二个人的简介" {
-		t.Fatalf("over-cap bio content = %q", fa.lastContent.Text)
+	// The over-cap joiner's non-ad conclusion arrived but registration was
+	// refused → they are simply NOT gated (no welcome, no pending, no trap);
+	// their messages screen normally.
+	if isP := b.joinVerify.isPending(741); isP {
+		t.Fatal("over-cap joiner must not be pending")
 	}
+	b.HandleMessage(ctx, adMsg(-500, 741, 907, "正常发言"))
+	waitFor(t, func() bool { return fa.callCount() == 3 }, "over-cap joiner message judged normally")
 }
 
 // --- welcome send failure → gate skipped (never trap the joiner) -------------------
@@ -599,27 +614,52 @@ func TestJoinVerifyWelcomeSendErrorSkipsGate(t *testing.T) {
 	waitFor(t, func() bool { return fa.callCount() == 1 }, "send-failure bio judgment")
 }
 
-// --- re-join supersedes: old welcome deleted, fresh deadline ----------------------
+// --- re-join while pending: idempotent — ONE welcome, ONE entry ------------------
 
-func TestJoinVerifyRejoinSupersedesEntry(t *testing.T) {
+// amend11 铁律 2（幂等）: a duplicate join (service-message replay / re-join
+// while the entry is still live) must not send a second welcome or re-register
+// the deadline. The pass deletes THE welcome.
+func TestJoinVerifyRejoinWhilePendingIdempotent(t *testing.T) {
 	cfg := verifyCfg()
-	tg := newFakeTTLTG() // incrementing ids: first welcome=1, second=2
+	tg := newFakeTTLTG() // incrementing ids: first welcome=1
 	tg.chat[743] = telegram.ChatInfo{ID: 743, Bio: ""}
 	b := testBot(t, tg, &fakeAI{}, cfg)
 	ctx := context.Background()
 	b.HandleNewMembers(ctx, -500, []telegram.User{u(743, false, "reU", "阿辛")}, 0)
+	waitFor(t, func() bool { return len(tg.sendsSnapshot()) == 1 }, "first welcome")
 	b.HandleNewMembers(ctx, -500, []telegram.User{u(743, false, "reU", "阿辛")}, 0)
 	if _, pending, _, _ := b.JoinVerifyStats(); pending != 1 {
-		t.Fatalf("re-join keeps ONE entry: %d", pending)
+		t.Fatalf("duplicate join keeps ONE entry: %d", pending)
 	}
-	// The FIRST welcome was deleted when superseded; the second stays.
-	if got := tg.deletePairsSnapshot(); len(got) != 1 || got[0] != "-500:1" {
-		t.Fatalf("superseded welcome must be deleted: %v", got)
+	if got := tg.sendsSnapshot(); len(got) != 1 {
+		t.Fatalf("duplicate join must not send a second welcome: %v", got)
 	}
-	// The new entry passes on a sticker and deletes the SECOND welcome.
+	// The entry passes on a sticker and deletes THE (single) welcome.
 	b.HandleMessage(ctx, stickerMsg(-500, 743, 950))
-	if got := tg.deletePairsSnapshot(); len(got) != 2 || got[1] != "-500:2" {
-		t.Fatalf("active welcome must be deleted on pass: %v", got)
+	if got := tg.deletePairsSnapshot(); len(got) != 1 || got[0] != "-500:1" {
+		t.Fatalf("the welcome must be deleted on pass: %v", got)
+	}
+}
+
+// re-join AFTER a completed episode: the woken pin was cleared at pass, so
+// the second no-bio join gets a fresh welcome (not silently swallowed).
+func TestJoinVerifyRejoinAfterEpisodeWelcomesAgain(t *testing.T) {
+	cfg := verifyCfg()
+	tg := newFakeTTLTG()
+	tg.chat[744] = telegram.ChatInfo{ID: 744, Bio: ""}
+	b := testBot(t, tg, &fakeAI{}, cfg)
+	ctx := context.Background()
+	b.HandleNewMembers(ctx, -500, []telegram.User{u(744, false, "again", "阿子")}, 0)
+	waitFor(t, func() bool { return len(tg.sendsSnapshot()) == 1 }, "first welcome")
+	b.HandleMessage(ctx, stickerMsg(-500, 744, 951))
+	if _, pending, passed, _ := b.JoinVerifyStats(); pending != 0 || passed != 1 {
+		t.Fatalf("first episode must pass: pending=%d passed=%d", pending, passed)
+	}
+	// Second join (e.g. left and came back): fresh welcome + fresh pending.
+	b.HandleNewMembers(ctx, -500, []telegram.User{u(744, false, "again", "阿子")}, 0)
+	waitFor(t, func() bool { return len(tg.sendsSnapshot()) == 2 }, "second welcome after re-join")
+	if _, pending, _, _ := b.JoinVerifyStats(); pending != 1 {
+		t.Fatalf("re-join after a passed episode must re-register: %d", pending)
 	}
 }
 

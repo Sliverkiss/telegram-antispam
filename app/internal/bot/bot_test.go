@@ -48,6 +48,17 @@ type fakeTG struct {
 
 	// sendErr (amend7 tests): when set, every SendMessage returns it.
 	sendErr error
+
+	// memberErr (amend11 tests): when non-nil, every GetChatMember returns it
+	// (the fail-open path: the timeout re-check cannot see the member state).
+	memberErr error
+
+	// banErr (amend11 tests): when non-nil, every BanChatMember returns it
+	// (the non-fatal disposal-error path: USER_NOT_PARTICIPANT etc).
+	banErr error
+
+	// memberCallN counts GetChatMember calls (amend11 retry assertions).
+	memberCallN int
 }
 
 func newFakeTG() *fakeTG {
@@ -64,6 +75,10 @@ func (f *fakeTG) GetChatMember(_ context.Context, chatID, userID int64) (telegra
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.seq = append(f.seq, "getchatmember")
+	f.memberCallN++
+	if f.memberErr != nil {
+		return telegram.ChatMember{}, f.memberErr
+	}
 	if m, ok := f.member[fkey(chatID, userID)]; ok {
 		return m, nil
 	}
@@ -80,7 +95,7 @@ func (f *fakeTG) BanChatMember(_ context.Context, chatID, userID int64) error {
 	defer f.mu.Unlock()
 	f.seq = append(f.seq, "ban")
 	f.bans = append(f.bans, "ban")
-	return nil
+	return f.banErr
 }
 func (f *fakeTG) UnbanChatMember(_ context.Context, chatID, userID int64) error {
 	f.mu.Lock()

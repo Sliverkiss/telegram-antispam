@@ -59,10 +59,20 @@ type ChatMemberUpdate struct {
 }
 
 // ChatMember describes one membership state, flattened from the library's
-// discriminated union so a caller only reads Status / User.
+// discriminated union so a caller only reads Status / User. The restricted
+// variant additionally carries the permission legs amend11 needs to decide
+// whether a restricted member can still complete the sticker verification;
+// they are zero for every other status.
 type ChatMember struct {
 	Status string // member, left, kicked, administrator, creator, restricted
 	User   User
+	// IsMember: for status=restricted, whether the user is actually IN the
+	// chat (restricted can also describe a user who already left).
+	IsMember bool
+	// CanSendMessages / CanSendOtherMessages are the restricted member's
+	// text / sticker-sending permissions (Bot API fields of the same name).
+	CanSendMessages      bool
+	CanSendOtherMessages bool
 }
 
 // Message is the subset of a Telegram message used by the bot.
@@ -268,6 +278,11 @@ func convChatMember(m models.ChatMember) ChatMember {
 	case models.ChatMemberTypeRestricted:
 		if m.Restricted != nil {
 			users = append(users, m.Restricted.User)
+			// Permission legs (amend11 C): a restricted member that cannot
+			// send messages/stickers can never complete the verification.
+			out.IsMember = m.Restricted.IsMember
+			out.CanSendMessages = m.Restricted.CanSendMessages
+			out.CanSendOtherMessages = m.Restricted.CanSendOtherMessages
 		}
 	case models.ChatMemberTypeLeft:
 		if m.Left != nil {

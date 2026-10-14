@@ -41,7 +41,8 @@ type Inspector interface {
 	JoinRuleView() JoinRuleView
 	// Amend10: join-verification gauges (join_verify_enabled /
 	// join_verify_pending / join_verify_passed_total /
-	// join_verify_timeout_total).
+	// join_verify_timeout_total). Amend11 adds join_verify_skipped_total
+	// (timeouts that did NOT dispose: gone / unable_to_verify).
 	JoinVerifyView() JoinVerifyView
 }
 
@@ -61,13 +62,14 @@ type JoinRuleView struct {
 	Hits    int64
 }
 
-// JoinVerifyView is the amend10 join-verification gauges the server renders
-// (plain data so server does not import bot).
+// JoinVerifyView is the amend10/amend11 join-verification gauges the server
+// renders (plain data so server does not import bot).
 type JoinVerifyView struct {
 	Enabled      bool
 	Pending      int64
 	PassedTotal  int64
 	TimeoutTotal int64
+	SkippedTotal int64
 }
 
 // AnnounceView is the amend7 announcement counters the server renders (plain
@@ -307,12 +309,13 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	body["join_rule_enabled"] = jrv.Enabled
 	body["join_rule_hits_total"] = jrv.Hits
 
-	// amend10: join-verification gauges.
+	// amend10/11: join-verification gauges.
 	jvv := s.Bot.JoinVerifyView()
 	body["join_verify_enabled"] = jvv.Enabled
 	body["join_verify_pending"] = jvv.Pending
 	body["join_verify_passed_total"] = jvv.PassedTotal
 	body["join_verify_timeout_total"] = jvv.TimeoutTotal
+	body["join_verify_skipped_total"] = jvv.SkippedTotal
 	// The sweeper block only appears when the janitor has run at least once.
 	if s.Sweeper != nil {
 		at, next, droppedSus, droppedSigs, remaining, ran := s.Sweeper.SweepSnapshot()

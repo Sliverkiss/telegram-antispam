@@ -1,38 +1,50 @@
-// The amend10 join verification: the 300-second sticker gate.
+// The amend10/amend11 join verification: the 300-second sticker gate.
 //
-// Flow position (user-mandated order, strict): 观察名单 → 签名库 →
-// 四条件裸号必杀 (amend9) → 【THIS】入群验证 → AI. When armed, every joiner
-// that survives the earlier layers gets a welcome message and must post A
-// STICKER before BOT_JOIN_VERIFY_TIMEOUT expires. Until they do, their
-// messages NEVER reach the AI; the deadline expiry disposes them through the
-// STANDARD punishment chain (notify + in-group announcement ride it).
+// ORDER (amend11, user-mandated, strict): 观察名单 → 签名库 → 四条件裸号必杀
+// (amend9) → AI 简介判定 → 【THIS】入群验证 →（无简介）等发言. The welcome
+// message and the pending registration hang off the FINAL non-ad conclusion of
+// the join-bio judgment (first AI round, a retry round, or the local-rule
+// fallback — all funnel through Bot.onJoinVerdictNonAd): an AD conclusion
+// disposes the joiner with NO welcome and NO registration; a failing/timed-out
+// judgment goes to the existing retry queue with NO welcome and NO
+// registration while it is pending. A joiner with NO bio has nothing to judge:
+// the welcome is sent directly at join time.
 //
-// Hard contracts (TASK_antispam_amend10.md):
-//   - Passing shape: message.sticker != nil, NOTHING else. Pure-emoji TEXT,
-//     photos, words, voice, video, forwards do not pass — and there is NO
-//     relaxation knob, by explicit user demand ("必须要贴纸"). A regression
-//     test pins the pure-emoji-text case so a future edit cannot widen it.
-//   - Passing requires the uid in pending AND the chatID matching (a sticker
-//     in ANOTHER group does not verify).
-//   - The welcome message does NOT ride the amend8 60s TTL: it must stay
-//     readable for the whole window. It is deleted exactly when the
-//     verification ends (pass / timeout disposal / user left). It goes
-//     through sendChatNoTTL — the ONE send path that skips the TTL registry.
+// Hard contracts (TASK_antispam_amend11.md):
+//   - Idempotent welcome: one welcome / one registration per user. The
+//     joinVerify woken map pins this across multiple retry rounds and the
+//     local-rule fallback.
+//   - Pre-registration health check (登记前体检): before welcoming, a
+//     getChatMember confirms the joiner is still IN the group. left/kicked →
+//     no welcome, no registration (join_verify_welcome_skipped reason=gone);
+//     already disposed by us → skip. Over-cap / welcome-send failure → the
+//     gate is skipped for that joiner (never a silent trap).
+//   - Passing shape: message.sticker != nil, same chat, NOTHING else (no
+//     relaxation knob; a regression test pins the pure-emoji-text case).
+//     While a user is pending, their messages never reach the AI.
+//   - The welcome message does NOT ride the amend8 60s TTL (sendChatNoTTL);
+//     it is deleted exactly when the verification ends.
+//   - Timeout robustness (amend11 C — Telegram notifications DO get lost):
+//     BEFORE the timeout disposal, a getChatMember re-check decides —
+//     left/kicked → clear only, never dispose (join_verify_timeout_skipped
+//     reason=gone); restricted and unable to send → clear only, WARN
+//     (reason=unable_to_verify); normal member → dispose; query failing
+//     after 2 retries → still dispose (fail-open, WARN).
+//   - Clear paths are idempotent and NEVER dispose: chat_member
+//     left/kicked/restricted (any kicker, including other bots), OUR OWN
+//     punishment chain disposing a pending user (clearDisposedUid — hook in
+//     the punish chains), pass, and the timeout outcome itself.
 //   - Timeout disposal: the standard punish() chain with
-//     action=BOT_JOIN_VERIFY_ACTION (default "ban" — a real ban, not
-//     kick-and-readmit), source="join_verify", category="其他", score=100,
-//     evidence line "🔎 入群 300 秒未验证（未发贴纸）"; the welcome message
-//     deletion rides the chain's explicit msgIDs.
-//   - dry-run: join_verify_dry_run log only, no kick, counter excluded.
+//     action=BOT_JOIN_VERIFY_ACTION (default "ban"), source="join_verify",
+//     category="其他", score=100, evidence "🔎 入群 300 秒未验证（未发贴纸）".
+//     A disposal API error (USER_NOT_PARTICIPANT / not found / permission) is
+//     non-fatal: WARN + pending still cleared (no retry storm, no crash).
+//   - dry-run: join_verify_dry_run log only, no kick, counters excluded.
 //   - The deadline is enforced by ONE background scan ticker
 //     (BOT_JOIN_VERIFY_SCAN), never a time.AfterFunc per joiner; the ticker
-//     dies with Stop (tied to bot shutdown). The scan reads a now() hook so
-//     tests can time-travel without sleeping.
+//     dies with Stop. The scan reads a stubbed clock so tests time-travel.
 //   - Pending state is in-memory with a mutex and a hard cap
-//     (BOT_JOIN_VERIFY_MAX_PENDING; over-cap registration is refused with a
-//     WARN — the joiner then falls through to the normal flow, never dropped
-//     silently). A restart loses pending: welcome residues are not
-//     compensated (README 已知限制).
+//     (BOT_JOIN_VERIFY_MAX_PENDING). A restart loses pending (README 已知限制).
 package bot
 
 import (
@@ -66,11 +78,10 @@ func joinVerifyEvidence() string {
 	return fmt.Sprintf("🔎 入群 %d 秒未验证（未发贴纸）", int(DefaultJoinVerifyTimeout/time.Second))
 }
 
-// pendingVerify is one joiner awaiting their sticker. bio/joinMsgID park the
-// join-bio AI round that the gate suspended (F.2: on pass, the flow resumes
-// exactly as it would have run without the gate — 有简介 → AI 判简介；
-// 无简介 → the watchlist record from screenNewMember waits for the first
-// message).
+// pendingVerify is one joiner awaiting their sticker. amend11 removed the
+// amend10 bio/joinMsgID parking: the gate now sits AFTER the join-bio
+// judgment, so there is nothing left to suspend — a pending joiner has
+// already cleared the AI screen.
 type pendingVerify struct {
 	uid          int64
 	chatID       int64
@@ -79,11 +90,10 @@ type pendingVerify struct {
 	firstName    string
 	username     string
 	registeredAt time.Time
-	bio          string
-	joinMsgID    int64
 }
 
-// joinVerifier holds the pending set, the scan ticker and the counters.
+// joinVerifier holds the pending set, the woken map, the scan ticker and the
+// counters.
 type joinVerifier struct {
 	b *Bot
 
@@ -91,6 +101,13 @@ type joinVerifier struct {
 
 	mu      sync.Mutex
 	pending map[int64]*pendingVerify // uid → entry (one group at a time)
+	// woken pins the idempotent welcome: uid → the gate already got its
+	// final non-ad conclusion (welcome sent, refused, or skipped). Set the
+	// FIRST time onJoinVerdictNonAd fires for the user; every later round
+	// (retry re-entry, local-rule fallback) is a no-op. Cleared when the
+	// episode ends (pass / left / disposed / expired), so a FUTURE re-join
+	// after this episode is welcomed fresh.
+	woken map[int64]bool
 
 	// scanNow is the clock the deadline scan and register deadline stamping
 	// read. Tests stub it via setScanClock; production is time.Now. Held in
@@ -103,6 +120,9 @@ type joinVerifier struct {
 	// stats (atomic, /statusz)
 	passedTotal  atomic.Int64
 	timeoutTotal atomic.Int64
+	// skippedTotal counts every timeout that did NOT dispose (gone /
+	// unable_to_verify) plus welcome-time skips (join_verify_skipped_total).
+	skippedTotal atomic.Int64
 }
 
 // joinVerifyConfig carries the BOT_JOIN_VERIFY_MAX_PENDING knob (extracted
@@ -121,6 +141,7 @@ func newJoinVerifier(b *Bot, cfg joinVerifyConfig) *joinVerifier {
 		b:          b,
 		maxPending: max,
 		pending:    map[int64]*pendingVerify{},
+		woken:      map[int64]bool{},
 		stopped:    make(chan struct{}),
 	}
 	v.scanNow.Store(func() time.Time { return time.Now() })
@@ -139,12 +160,13 @@ func (v *joinVerifier) now() time.Time {
 func (v *joinVerifier) setScanClock(f func() time.Time) { v.scanNow.Store(f) }
 
 // Stats returns the /statusz gauges: pending count, passed total, timeout
-// total. Timeout counts real disposals only — dry-run is excluded.
-func (v *joinVerifier) Stats() (pending, passed, timeouts int64) {
+// total, skipped total. Timeout counts real disposals only — dry-run and
+// skipped outcomes are excluded.
+func (v *joinVerifier) Stats() (pending, passed, timeouts, skipped int64) {
 	v.mu.Lock()
 	n := int64(len(v.pending))
 	v.mu.Unlock()
-	return n, v.passedTotal.Load(), v.timeoutTotal.Load()
+	return n, v.passedTotal.Load(), v.timeoutTotal.Load(), v.skippedTotal.Load()
 }
 
 // isPending reports whether uid is awaiting verification.
@@ -209,6 +231,7 @@ func (v *joinVerifier) scanDeadlines() {
 		if now.After(p.deadline) {
 			due = append(due, p)
 			delete(v.pending, uid)
+			delete(v.woken, uid)
 		}
 	}
 	v.mu.Unlock()
@@ -217,9 +240,12 @@ func (v *joinVerifier) scanDeadlines() {
 	}
 }
 
-// expireOne disposes one timed-out joiner through the standard chain. The
-// welcome message is deleted via the chain's explicit msgIDs (join path
-// semantics: punish takes the id, no tracked list).
+// expireOne runs the amend11 C timeout decision for one timed-out joiner:
+// re-check getChatMember first (notifications get lost — never trust only
+// chat_member), then dispose / clear-only accordingly. The entry is ALREADY
+// off the pending map when this runs (the deadline, not this function,
+// removed it) — every path below only cleans up the welcome message and the
+// counters.
 func (v *joinVerifier) expireOne(p *pendingVerify) {
 	if v.b.Cfg.DryRun {
 		v.b.Log.Info("join_verify_dry_run",
@@ -227,6 +253,27 @@ func (v *joinVerifier) expireOne(p *pendingVerify) {
 			"uid", p.uid,
 			"action", v.b.Cfg.JoinVerifyAction,
 			"summary", "干跑：只打日志不踢，计数不计入")
+		v.deleteWelcome(p)
+		return
+	}
+	switch v.timeoutMembership(context.Background(), p) {
+	case "dispose":
+	case "gone":
+		v.skippedTotal.Add(1)
+		v.b.Log.Info("join_verify_timeout_skipped",
+			"chat", p.chatID,
+			"uid", p.uid,
+			"reason", "gone",
+			"summary", "到期时人已不在群：只清理欢迎消息，绝不处置")
+		v.deleteWelcome(p)
+		return
+	case "unable_to_verify":
+		v.skippedTotal.Add(1)
+		v.b.Log.Warn("join_verify_timeout_skipped",
+			"chat", p.chatID,
+			"uid", p.uid,
+			"reason", "unable_to_verify",
+			"summary", "到期时人被限制无法发言：无法完成验证，只清理不处置")
 		v.deleteWelcome(p)
 		return
 	}
@@ -245,6 +292,61 @@ func (v *joinVerifier) expireOne(p *pendingVerify) {
 		notifyDetails{source: "join_verify", score: 100}, []int64{p.welcomeMsgID})
 }
 
+// timeoutMembership performs the pre-disposal re-check (amend11 C): initial
+// query + up to 2 retries at 1s intervals; still failing → fail-open. The
+// result is the expireOne decision lane:
+//
+//	dispose          normal member (or the query failed after retries —
+//	                 the user's principle: 不能不处置)
+//	gone             left/kicked (or restricted with is_member=false)
+//	unable_to_verify restricted and cannot send messages or stickers
+func (v *joinVerifier) timeoutMembership(ctx context.Context, p *pendingVerify) string {
+	var m telegram.ChatMember
+	var err error
+	for attempt := 0; attempt < 3; attempt++ {
+		if attempt > 0 {
+			select {
+			case <-ctx.Done():
+				return "dispose"
+			case <-time.After(time.Second):
+			}
+		}
+		m, err = v.b.TG.GetChatMember(ctx, p.chatID, p.uid)
+		if err == nil {
+			return classifyTimeoutMembership(m)
+		}
+		v.b.Log.Warn("join_verify_member_check_error",
+			"chat", p.chatID,
+			"uid", p.uid,
+			"attempt", attempt+1,
+			"err", err.Error())
+	}
+	// Fail-open (amend11 C: 查询失败 → 仍按超时处置 + WARN — the user's
+	// explicit "不能不处置" overrides lost-signal caution here).
+	v.b.Log.Warn("join_verify_member_check_failed",
+		"chat", p.chatID,
+		"uid", p.uid,
+		"summary", "成员状态查询连续失败：fail-open，仍按超时处置")
+	return "dispose"
+}
+
+// classifyTimeoutMembership maps one getChatMember result onto the expireOne
+// decision lane (pure; unit-testable without a TG fake).
+func classifyTimeoutMembership(m telegram.ChatMember) string {
+	switch m.Status {
+	case "left", "kicked":
+		return "gone"
+	case "restricted":
+		if !m.IsMember {
+			return "gone"
+		}
+		if !m.CanSendMessages || !m.CanSendOtherMessages {
+			return "unable_to_verify"
+		}
+	}
+	return "dispose"
+}
+
 // deleteWelcome deletes the welcome message of a pending entry (pass /
 // dry-run / leave cleanup path; deleteOne is a no-op for msgID ≤ 0).
 func (v *joinVerifier) deleteWelcome(p *pendingVerify) {
@@ -255,12 +357,11 @@ func (v *joinVerifier) deleteWelcome(p *pendingVerify) {
 }
 
 // register adds a joiner to the pending set and sends the welcome message.
-// bio/joinMsgID park the suspended join-bio AI round (submitted on pass).
-// It returns false when over the cap (the joiner falls through to the normal
-// flow — still watchlisted and screened, never silently dropped) or when the
-// welcome send fails hard (no welcome → no gate: the joiner would be stuck
-// for 300s with no way to know why, so verification is skipped for them).
-func (v *joinVerifier) register(ctx context.Context, chatID, uid int64, username, firstName, bio string, joinMsgID int64) bool {
+// It returns false when over the cap (the joiner falls through — nothing was
+// pending for them, the gate simply does not exist) or when the welcome send
+// fails hard (no welcome → no gate: the joiner would be stuck for 300s with
+// no way to know why).
+func (v *joinVerifier) register(ctx context.Context, chatID, uid int64, username, firstName string) bool {
 	v.mu.Lock()
 	if len(v.pending) >= v.maxPending {
 		v.mu.Unlock()
@@ -285,7 +386,8 @@ func (v *joinVerifier) register(ctx context.Context, chatID, uid int64, username
 	msgID, err := v.b.sendChatNoTTL(ctx, chatID, v.welcomeText(username, firstName))
 	if err != nil {
 		v.b.Log.Warn("join_verify_welcome_error",
-			"chat", chatID, "uid", uid, "err", err.Error(),
+			"chat", chatID,
+			"uid", uid, "err", err.Error(),
 			"summary", "欢迎消息发送失败：跳过验证，走原流程")
 		return false
 	}
@@ -298,8 +400,6 @@ func (v *joinVerifier) register(ctx context.Context, chatID, uid int64, username
 		firstName:    firstName,
 		username:     username,
 		registeredAt: v.now(),
-		bio:          bio,
-		joinMsgID:    joinMsgID,
 	}
 	v.mu.Unlock()
 	v.b.Log.Info("join_verify_pending_added",
@@ -354,6 +454,7 @@ func (v *joinVerifier) handleStickerMessage(m telegram.Message) bool {
 	}
 	if ok {
 		delete(v.pending, uid)
+		delete(v.woken, uid)
 	}
 	v.mu.Unlock()
 	if !ok {
@@ -365,19 +466,13 @@ func (v *joinVerifier) handleStickerMessage(m telegram.Message) bool {
 		"uid", uid,
 		"ms", v.now().Sub(p.registeredAt).Milliseconds())
 	v.deleteWelcome(p)
-	// F.2: the gate ends here — resume the join flow exactly as it would have
-	// run without the gate. 有简介 → the parked bio round goes to the AI
-	// (async, join-key serialized ahead of the first message); 无简介 → nothing
-	// to submit: the watchlist record from screenNewMember simply waits for
-	// the first judgeable message.
-	v.b.submitJoinBio(context.Background(), p.chatID, p.joinMsgID,
-		telegram.User{ID: p.uid, Username: p.username, FirstName: p.firstName}, p.bio)
 	return true
 }
 
-// clearOnLeft removes a pending entry when the user left/was kicked, and
-// deletes the residual welcome message (退群清理：不再处置，不踢空气).
-// Idempotent: clearing an absent uid is a silent no-op.
+// clearOnLeft removes a pending entry when the user left / was kicked / got
+// restricted by anyone (含别的 bot — the update carries no reliable author),
+// and deletes the residual welcome message: zero disposal (不踢空气),
+// idempotent, and the 300s deadline can no longer reach the cleared entry.
 func (v *joinVerifier) clearOnLeft(uid int64) {
 	v.mu.Lock()
 	p, ok := v.pending[uid]
@@ -386,10 +481,38 @@ func (v *joinVerifier) clearOnLeft(uid int64) {
 		return
 	}
 	delete(v.pending, uid)
+	delete(v.woken, uid)
 	v.mu.Unlock()
 	v.b.Log.Info("join_verify_cleared",
 		"uid", uid,
 		"chat", p.chatID,
-		"summary", "退群清理：不再处置，欢迎消息已删")
+		"reason", "kicked_by_other",
+		"summary", "被他人/别的方式移出：清 pending、删欢迎，零处置")
+	v.deleteWelcome(p)
+}
+
+// clearDisposedUid clears a pending entry after OUR OWN punishment chain
+// disposed the user (amend11 B.2 — e.g. the join-bio verdict came back ad
+// after the registration, or a signature hit raced ahead). The punish chain
+// already deleted the welcome message via its explicit msgIDs when the
+// disposal came from the verifier itself; on other chains the message would
+// have been created only by this subsystem, so deleting here too is safe
+// (deleteOne tolerates an already-deleted id). Idempotent no-op for an
+// absent uid; NEVER a disposal.
+func (v *joinVerifier) clearDisposedUid(uid int64) {
+	v.mu.Lock()
+	p, ok := v.pending[uid]
+	if !ok {
+		v.mu.Unlock()
+		return
+	}
+	delete(v.pending, uid)
+	delete(v.woken, uid)
+	v.mu.Unlock()
+	v.b.Log.Info("join_verify_cleared",
+		"uid", uid,
+		"chat", p.chatID,
+		"reason", "disposed_by_us",
+		"summary", "本方处置链已处置该用户：立刻清 pending，到期不再处置")
 	v.deleteWelcome(p)
 }

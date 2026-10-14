@@ -28,7 +28,8 @@ func TestHermesJoinVerifyStickerOnly(t *testing.T) {
 	cfg.JoinVerifyTimeout = 3 * time.Second
 	cfg.JoinVerifyScan = 50 * time.Millisecond
 	cfg.MsgTTL = 0
-	fa := &fakeAI{}
+	// amend11 顺序：简介判定先走，非广告结论落地后才欢迎+登记。
+	fa := &fakeAI{verdict: fakeVerdict(false, "无", 0.9)}
 	b := testBot(t, tg, fa, cfg)
 	b.StartJoinVerify()
 	defer b.StopJoinVerify()
@@ -43,8 +44,8 @@ func TestHermesJoinVerifyStickerOnly(t *testing.T) {
 	if s := tg.sendsSnapshot()[0]; !strings.Contains(s, "欢迎") || !strings.Contains(s, "贴纸") {
 		t.Fatalf("欢迎文案不对: %q", s)
 	}
-	if fa.callCount() != 0 {
-		t.Fatalf("验证期间不该送 AI，却被调 %d 次", fa.callCount())
+	if fa.callCount() != 1 {
+		t.Fatalf("有简介者必须先过一次简介 AI 判定（判定走完才欢迎），却被调 %d 次", fa.callCount())
 	}
 	if sched, _, _ := b.MsgTTLStats(); sched != 0 {
 		t.Fatalf("欢迎消息不该登记 60 秒 TTL，scheduled=%d", sched)
@@ -186,31 +187,32 @@ func TestHermesJoinVerifyGatesAIUntilPassed(t *testing.T) {
 	cfg.JoinVerify = true
 	cfg.JoinVerifyTimeout = 3 * time.Second
 	cfg.JoinVerifyScan = 50 * time.Millisecond
-	fa := &fakeAI{}
+	// amend11：简介判定先走（非广告结论 → 欢迎登记），之后验证期间零 AI。
+	fa := &fakeAI{verdict: fakeVerdict(false, "无", 0.9)}
 	b := testBot(t, tg, fa, cfg)
 	b.StartJoinVerify()
 	defer b.StopJoinVerify()
 	ctx := context.Background()
 
 	b.HandleNewMembers(ctx, -500, []telegram.User{u(uid, false, "gate", "阿强")}, 0)
-	time.Sleep(120 * time.Millisecond)
-	if fa.callCount() != 0 {
-		t.Fatalf("入群简介不该在验证通过前送 AI，却被调 %d 次", fa.callCount())
-	}
+	waitFor(t, func() bool { return fa.callCount() == 1 }, "简介判定（先于欢迎）")
+	waitFor(t, func() bool { return len(tg.sendsSnapshot()) >= 1 }, "非广告结论后的欢迎")
 	// 验证期间发广告文本也不判
 	b.HandleUpdate(ctx, cmdUpdate(adMsg(-500, uid, 31, "加V赚钱 一天6k 懂的来")))
 	time.Sleep(120 * time.Millisecond)
-	if fa.callCount() != 0 {
+	if fa.callCount() != 1 {
 		t.Fatalf("验证期间的消息不该送 AI，却被调 %d 次", fa.callCount())
 	}
-	// 贴纸通过 → 恢复（简介判定）
+	// 贴纸通过 → 验证结束（后续消息照常送 AI）
 	sm := adMsg(-500, uid, 32, "")
 	sm.Sticker = &telegram.Sticker{FileID: "st2", FileUniqueID: "stu2"}
 	b.HandleUpdate(ctx, cmdUpdate(sm))
-	waitFor(t, func() bool { return fa.callCount() >= 1 }, "通过后恢复 AI 审核")
-	if _, pending, passed, _ := b.JoinVerifyStats(); pending != 0 || passed != 1 {
-		t.Fatalf("通过状态不对：pending=%d passed=%d", pending, passed)
-	}
+	waitFor(t, func() bool {
+		_, pending, passed, _ := b.JoinVerifyStats()
+		return pending == 0 && passed == 1
+	}, "贴纸通过")
+	b.HandleUpdate(ctx, cmdUpdate(adMsg(-500, uid, 33, "大家好")))
+	waitFor(t, func() bool { return fa.callCount() == 2 }, "通过后消息照常送 AI")
 }
 
 // --- 5. 别群贴纸不管用 -------------------------------------------------------
