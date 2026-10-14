@@ -53,6 +53,9 @@ func (s *stubBot) JudgePoolView() JudgePoolView {
 func (s *stubBot) AnnounceView() AnnounceView {
 	return AnnounceView{Enabled: true, SentTotal: 5, FallbackTotal: 2, ErrorTotal: 0}
 }
+func (s *stubBot) MsgTTLView() MsgTTLView {
+	return MsgTTLView{TTL: "1m0s", ScheduledTotal: 3, DeletedTotal: 2, ErrorTotal: 1}
+}
 
 // fakeSweep reports a fixed (already-run) sweep for /statusz rendering.
 type fakeSweep struct{}
@@ -249,6 +252,27 @@ func TestStatuszAnnounceBlock(t *testing.T) {
 	}
 	if body["announce_error_total"] != float64(0) {
 		t.Errorf("announce_error_total = %v", body["announce_error_total"])
+	}
+}
+
+// TestStatuszMsgTTLBlock pins the amend8 /statusz msg_ttl gauges.
+func TestStatuszMsgTTLBlock(t *testing.T) {
+	_, ts := newTestServer(t, "")
+	resp := get(t, ts.URL+"/statusz")
+	defer resp.Body.Close()
+	var body map[string]any
+	json.NewDecoder(resp.Body).Decode(&body)
+	if body["msg_ttl"] != "1m0s" {
+		t.Errorf("msg_ttl = %v", body["msg_ttl"])
+	}
+	if body["msg_ttl_scheduled_total"] != float64(3) {
+		t.Errorf("msg_ttl_scheduled_total = %v", body["msg_ttl_scheduled_total"])
+	}
+	if body["msg_ttl_deleted_total"] != float64(2) {
+		t.Errorf("msg_ttl_deleted_total = %v", body["msg_ttl_deleted_total"])
+	}
+	if body["msg_ttl_error_total"] != float64(1) {
+		t.Errorf("msg_ttl_error_total = %v", body["msg_ttl_error_total"])
 	}
 }
 

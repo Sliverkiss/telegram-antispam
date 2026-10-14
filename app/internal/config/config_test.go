@@ -134,8 +134,9 @@ func TestLoadDefaults(t *testing.T) {
 	if c.AnnounceTimeout != 8*time.Second {
 		t.Errorf("AnnounceTimeout = %s, want 8s", c.AnnounceTimeout)
 	}
-	if c.AnnounceTTL != 0 {
-		t.Errorf("AnnounceTTL = %s, want 0 (keep forever)", c.AnnounceTTL)
+	// amend8: the unified chat-message TTL defaults to 60s.
+	if c.MsgTTL != 60*time.Second {
+		t.Errorf("MsgTTL = %s, want 60s", c.MsgTTL)
 	}
 }
 
@@ -143,7 +144,6 @@ func TestAnnounceEnvOverrides(t *testing.T) {
 	clearBOT(t)
 	t.Setenv("BOT_ANNOUNCE_KICK", "false")
 	t.Setenv("BOT_ANNOUNCE_TIMEOUT", "90s") // judgment-scale typo → clamp to 20s
-	t.Setenv("BOT_ANNOUNCE_TTL", "10m")
 	c := Load()
 	if c.AnnounceKickEnabled {
 		t.Error("BOT_ANNOUNCE_KICK=false must disable")
@@ -151,8 +151,35 @@ func TestAnnounceEnvOverrides(t *testing.T) {
 	if c.AnnounceTimeout != 20*time.Second {
 		t.Errorf("AnnounceTimeout = %s, want clamped 20s", c.AnnounceTimeout)
 	}
-	if c.AnnounceTTL != 10*time.Minute {
-		t.Errorf("AnnounceTTL = %s, want 10m", c.AnnounceTTL)
+}
+
+// amend8: BOT_MSG_TTL contract — 0 = never delete (survives verbatim), a
+// runaway positive value clamps to 24h, and the absorbed legacy knobs
+// (BOT_CMD_AUTODELETE_SEC / BOT_ANNOUNCE_TTL) are gone from the contract.
+func TestMsgTTLEnvOverrides(t *testing.T) {
+	clearBOT(t)
+	t.Setenv("BOT_MSG_TTL", "0")
+	c := Load()
+	if c.MsgTTL != 0 {
+		t.Errorf("BOT_MSG_TTL=0 must mean never-delete, got %s", c.MsgTTL)
+	}
+	t.Setenv("BOT_MSG_TTL", "720h")
+	c = Load()
+	if c.MsgTTL != 24*time.Hour {
+		t.Errorf("BOT_MSG_TTL=720h must clamp to 24h, got %s", c.MsgTTL)
+	}
+	t.Setenv("BOT_MSG_TTL", "5m")
+	c = Load()
+	if c.MsgTTL != 5*time.Minute {
+		t.Errorf("BOT_MSG_TTL=5m should parse verbatim, got %s", c.MsgTTL)
+	}
+	// The absorbed knobs must surface as unrecognized (typo guard).
+	t.Setenv("BOT_CMD_AUTODELETE_SEC", "30")
+	t.Setenv("BOT_ANNOUNCE_TTL", "10m")
+	got := UnrecognizedBotVars()
+	joined := strings.Join(got, ",")
+	if !strings.Contains(joined, "BOT_CMD_AUTODELETE_SEC") || !strings.Contains(joined, "BOT_ANNOUNCE_TTL") {
+		t.Errorf("absorbed knobs must be unrecognized after the amend8 merge: %v", got)
 	}
 }
 
@@ -166,7 +193,6 @@ func TestLoadEnv(t *testing.T) {
 	t.Setenv("BOT_STORE", "file")
 	t.Setenv("BOT_RETENTION", "24h")
 	t.Setenv("BOT_RETENTION_SUSPECT", "6h")
-	t.Setenv("BOT_CMD_AUTODELETE_SEC", "10")
 	c := Load()
 	if c.Token != "123:abc" {
 		t.Errorf("Token = %q", c.Token)
@@ -192,8 +218,8 @@ func TestLoadEnv(t *testing.T) {
 	if c.RetentionSuspect != 6*time.Hour {
 		t.Errorf("RetentionSuspect = %s", c.RetentionSuspect)
 	}
-	if c.CmdAutodeleteSec != 10 {
-		t.Errorf("CmdAutodeleteSec = %d", c.CmdAutodeleteSec)
+	if c.MsgTTL != 60*time.Second {
+		t.Errorf("MsgTTL default = %s, want 60s", c.MsgTTL)
 	}
 	t.Setenv("BOT_NOTIFY_ON_PUNISH", "false")
 	t.Setenv("BOT_NOTIFY_ON_ERROR", "false")

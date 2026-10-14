@@ -176,16 +176,18 @@ func main() {
 	b.Notifier = notifier
 	notifier.Start(context.Background())
 
-	// Kick announcement (amend7): after a successful disposal the bot posts a
-	// 1–2 sentence AI-generated notice into the same group (own goroutine per
-	// disposal — never a judgment-pool slot, never blocking the punishment
-	// chain; AI failure falls back to the local template pool; dry-run sends
-	// nothing; one announcement per chat+uid+messageID). Wired after the
-	// notifier so send failures reach the existing error-push channel.
+	// Kick announcement (amend7, amend8 merge): after a successful disposal
+	// the bot posts a 1–2 sentence AI-generated notice into the same group
+	// (own goroutine per disposal — never a judgment-pool slot, never blocking
+	// the punishment chain; AI failure falls back to the local template pool;
+	// dry-run sends nothing; one announcement per chat+uid+messageID). The
+	// send rides the amend8 unified TTL path (BOT_MSG_TTL): the announcement
+	// self-deletes like every other bot chat message. Wired after the notifier
+	// so send failures reach the existing error-push channel.
 	primary.SetAnnounceTimeout(cfg.AnnounceTimeout)
 	b.Announcer = bot.NewAnnouncer(tg, primary, cfg.AnnounceKickEnabled,
-		cfg.AnnounceTimeout, cfg.AnnounceTTL, cfg.JudgeDrain,
-		log.WithComponent("announce"), notifier)
+		cfg.AnnounceTimeout, cfg.JudgeDrain,
+		log.WithComponent("announce"), notifier, b)
 
 	// Startup self-check (§4): getChat + getChatMember(bot) on the target;
 	// failure WARNS (never blocks) and surfaces as notify.target_ok=false.
@@ -225,6 +227,7 @@ func main() {
 		stopJudgePool()
 		b.StopJudgePool() // drains up to BOT_JUDGE_DRAIN, logs judge_pool_stopped
 		b.StopAnnouncer() // drains in-flight announcements (BOT_JUDGE_DRAIN magnitude)
+		b.StopMsgTTL()    // drains in-flight TTL deletions (BOT_JUDGE_DRAIN magnitude)
 		stopRetry()
 		retryQ.Stop()
 		janitorStop()

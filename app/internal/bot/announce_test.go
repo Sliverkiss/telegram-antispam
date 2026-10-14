@@ -12,7 +12,8 @@ package bot
 //  6. dry-run → nothing sent;
 //  7. same disposal twice → exactly one announcement;
 //  8. BOT_ANNOUNCE_KICK=false → nothing;
-//  9. BOT_ANNOUNCE_TTL>0 → deleted after expiry;
+//  9. BOT_MSG_TTL>0 → the announcement is deleted after expiry (amend8
+//     merge; BOT_ANNOUNCE_TTL is absorbed into BOT_MSG_TTL);
 // 10. slow AI (blocking) → the punishment chain latency < 100ms.
 
 import (
@@ -69,14 +70,23 @@ func (f *fakeAnnouncer) callCount() int {
 }
 
 // announceBot wires a bot with the Announcer attached to the fake TG.
+// ttl > 0 routes announcement sends through the bot's unified amend8 TTL
+// path (BOT_MSG_TTL); ttl = 0 leaves the plain send (no deletion).
 func announceBot(t *testing.T, tg *fakeTG, gen AnnounceGenerator, kickEnabled bool, ttl time.Duration) (*Bot, *fakeAnnouncer) {
 	t.Helper()
 	cfg := defaultCfg()
 	cfg.Action = "ban"
+	if ttl > 0 {
+		cfg.MsgTTL = ttl
+	}
 	b := testBot(t, tg, &fakeAI{verdict: fakeVerdict(true, "诈骗", 0.95)}, cfg)
 	fa, _ := gen.(*fakeAnnouncer)
-	b.Announcer = NewAnnouncer(tg, gen, kickEnabled, 2*time.Second, ttl, 2*time.Second,
-		logx.New(nil, logx.Error, "text", "announce"), nil)
+	var sender announceSender
+	if ttl > 0 {
+		sender = b
+	}
+	b.Announcer = NewAnnouncer(tg, gen, kickEnabled, 2*time.Second, 2*time.Second,
+		logx.New(nil, logx.Error, "text", "announce"), nil, sender)
 	return b, fa
 }
 
@@ -274,8 +284,8 @@ func TestAnnounceDryRunSendsNothing(t *testing.T) {
 	cfg := defaultCfg()
 	cfg.DryRun = true
 	b := testBot(t, tg, &fakeAI{verdict: fakeVerdict(true, "诈骗", 0.95)}, cfg)
-	b.Announcer = NewAnnouncer(tg, gen, true, 2*time.Second, 0, 2*time.Second,
-		logx.New(nil, logx.Error, "text", "announce"), nil)
+	b.Announcer = NewAnnouncer(tg, gen, true, 2*time.Second, 2*time.Second,
+		logx.New(nil, logx.Error, "text", "announce"), nil, nil)
 	ctx := context.Background()
 	b.Store.AddSuspect(ctx, store.Suspect{UID: 75, ChatID: -600})
 
@@ -348,11 +358,13 @@ func TestAnnounceDisabledSwitch(t *testing.T) {
 	}
 }
 
-// --- F.9: BOT_ANNOUNCE_TTL>0 → deleted after expiry --------------------------
+// --- F.9 (amend8 merge): BOT_MSG_TTL>0 → the announcement is deleted -----------
 
 func TestAnnounceTTLDeletesMessage(t *testing.T) {
 	tg := newFakeTG()
 	gen := &fakeAnnouncer{out: "🚪 TTL 已送出门外"}
+	// The amend8 unified TTL (BOT_MSG_TTL) now owns the announcement deletion
+	// (BOT_ANNOUNCE_TTL is gone). announceBot routes the send through b.
 	b, _ := announceBot(t, tg, gen, true, 80*time.Millisecond)
 	runKickDisposal(t, b, tg, 78, 98, "TTL")
 
@@ -374,6 +386,10 @@ func TestAnnounceTTLDeletesMessage(t *testing.T) {
 	}
 	if deletes[len(deletes)-1] != "1" {
 		t.Fatalf("the announcement message id must be deleted: %v", deletes)
+	}
+	// The unified TTL subsystem counted the scheduled deletion.
+	if _, deleted, _ := b.MsgTTLStats(); deleted != 1 {
+		t.Fatalf("msg_ttl_deleted_total = %d, want 1", deleted)
 	}
 }
 
@@ -426,8 +442,8 @@ func TestAnnounceFullChainRealClient(t *testing.T) {
 	cfg := defaultCfg()
 	cfg.Action = "ban"
 	b := testBot(t, tg, &fakeAI{verdict: fakeVerdict(true, "诈骗", 0.95)}, cfg)
-	b.Announcer = NewAnnouncer(tg, client, true, 2*time.Second, 0, 2*time.Second,
-		logx.New(nil, logx.Error, "text", "announce"), nil)
+	b.Announcer = NewAnnouncer(tg, client, true, 2*time.Second, 2*time.Second,
+		logx.New(nil, logx.Error, "text", "announce"), nil, nil)
 	ctx := context.Background()
 	b.Store.AddSuspect(ctx, store.Suspect{UID: 80, ChatID: -600})
 
@@ -454,8 +470,8 @@ func TestAnnounceSendFailureErrorPushNoRetry(t *testing.T) {
 	cfg.LogChat = 999
 	b := testBot(t, tg, &fakeAI{verdict: fakeVerdict(true, "诈骗", 0.95)}, cfg)
 	rec := wireTestNotifier(t, b, cfg)
-	b.Announcer = NewAnnouncer(tg, gen, true, 2*time.Second, 0, 2*time.Second,
-		logx.New(nil, logx.Error, "text", "announce"), b.Notifier)
+	b.Announcer = NewAnnouncer(tg, gen, true, 2*time.Second, 2*time.Second,
+		logx.New(nil, logx.Error, "text", "announce"), b.Notifier, nil)
 	ctx := context.Background()
 	b.Store.AddSuspect(ctx, store.Suspect{UID: 81, ChatID: -600})
 

@@ -72,3 +72,15 @@ func (b *Bot) AnnounceView() server.AnnounceView {
 		ErrorTotal:    errs,
 	}
 }
+
+// MsgTTLView adapts the amend8 chat-message-TTL gauges into the server's
+// plain view.
+func (b *Bot) MsgTTLView() server.MsgTTLView {
+	scheduled, deleted, errs := b.MsgTTLStats()
+	return server.MsgTTLView{
+		TTL:            b.MsgTTLConfig().String(),
+		ScheduledTotal: scheduled,
+		DeletedTotal:   deleted,
+		ErrorTotal:     errs,
+	}
+}

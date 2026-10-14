@@ -139,7 +139,7 @@ go run . -prompteval -prompteval.models=mimo-v2.6-pro
 | | `BOT_IGNORE_ADMINS` | `true` | 跳过群主/管理员 |
 | | `BOT_DELETE_JOIN_MSG` | `false` | 删除广告号入群系统消息 |
 | | `BOT_LOG_CHAT` | `0` | 处置通知目标 chat id（0=关） |
-| | `BOT_CMD_AUTODELETE_SEC` | `0` | 命令回复自动删除秒数（0=不删） |
+| | `BOT_MSG_TTL` | `60s` | bot 聊天消息（命令回复/退群提示/送客公告）延迟自动删除；`0` = 永不删（amend8，吸收 `BOT_CMD_AUTODELETE_SEC`/`BOT_ANNOUNCE_TTL`）。**通知频道推送不受影响，永久保留** |
 | 存储 | `BOT_STORE` | `memory` | `memory` / `redis` / `file` / `auto` |
 | | `BOT_REDIS_URL` | 空 | redis 后端连接串 |
 | | `BOT_REDIS_INSECURE_TLS` | `false` | 跳过 TLS 校验（仅开发） |
@@ -168,9 +168,8 @@ go run . -prompteval -prompteval.models=mimo-v2.6-pro
 | 判定池 | `BOT_JUDGE_ASYNC` | `true` | 判定异步池总开关（false = 旧行内同步，一行回滚） |
 | | `BOT_JUDGE_QUEUE` / `BOT_AI_CONCURRENCY` | `500` / `8` | 有界提交队列 / 判定并发（同 uid 串行） |
 | | `BOT_JUDGE_DRAIN` / `BOT_UPDATE_WORKERS` | `10s` / `16` | 优雅关闭排空预算 / 库层 update worker 数（1..128） |
-| 公告 | `BOT_ANNOUNCE_KICK` | `true` | 处置成功后在群内发 AI 生成的可爱送客短公告（异步不阻塞处置链；AI 失败走本地模板池） |
+| 公告 | `BOT_ANNOUNCE_KICK` | `true` | 处置成功后在群内发 AI 生成的可爱送客短公告（异步不阻塞处置链；AI 失败走本地模板池；发送后按 `BOT_MSG_TTL` 自动删除） |
 | | `BOT_ANNOUNCE_TIMEOUT` | `8s` | 公告生成独立短超时（clamp 1s~20s，不重试） |
-| | `BOT_ANNOUNCE_TTL` | `0` | 公告延迟删除（如 `10m`）；`0` = 永久保留 |
 | | `BOT_LOG_LEVEL` / `BOT_LOG_FORMAT` | `info` / `text` | 日志 |
 | | `BOT_ADMIN_TOKEN` | 空 | 非空开放 `/admin/*` |
 | | `BOT_VERSION` | `dev` | 构建注入 |
@@ -187,7 +186,8 @@ go run . -prompteval -prompteval.models=mimo-v2.6-pro
   以及 amend3 项：`ai_models` / `ai_model_stats`（逐模型 calls/oks）、`ai_fallbacks`、
   `ai_verify_rounds` / `ai_verify_flipped`、`local_fallback_count`、
   `simhash_hits`、`pending_queue`、`prompt_version`、`last_sweep` / `next_sweep_in`
-  （janitor 跑过才出现）
+  （janitor 跑过才出现），以及 amend8 项：`msg_ttl`（当前配置值）、
+  `msg_ttl_scheduled_total`、`msg_ttl_deleted_total`、`msg_ttl_error_total`
 - `/admin/signatures` → 需要 `BOT_ADMIN_TOKEN`（`Authorization: Bearer`），
   `GET`/`POST`/`DELETE` 维护 bio/msg 签名库
 
@@ -220,7 +220,7 @@ belmo 用 **Nixpacks** 构建，且部署引擎固定扫描仓库的 **`app/` �
 | `BOT_DRY_RUN` | 建议 | 首次部署填 `true`（只判定不处置），观察日志确认无误后改 `false` |
 | `BOT_ACTION` | 可选 | `kick`（默认，封后即解=踢出）/ `ban`（永久） |
 
-其余变量都有合理默认值，完整清单见 `app/.env.example`（73 个变量与代码契约一一对应）。
+其余变量都有合理默认值，完整清单见 `app/.env.example`（72 个变量与代码契约一一对应）。
 
 **部署后自检：**
 
@@ -273,6 +273,11 @@ cd app && go build ./... && go vet ./... && go test ./... -race -count=1
 
 ## 已知限制
 
+- **bot 聊天消息 TTL（amend8）**：bot 发进群/私聊的消息按 `BOT_MSG_TTL`（默认 60s，
+  `0`=永不删）自动删除——命令回复、退群提示、送客公告统一走它；**通知频道
+  （`BOT_LOG_CHAT`）的推送永久保留，绝不删**。删除任务只存内存：**进程重启会丢失
+  尚未到期的删除任务，那几条消息不会被删**（已知代价，不做兜底）。删除失败
+  （已被人手删/超 48h 返回 400）只 WARN。
 - **file 后端明确不实现**：内存模式是最终选择（belmo 文件系统疑似只读）；配置 `file`
   会打 WARN 并回落内存，**重启丢观察名单/签名库/统计**属预期行为（封禁在 Telegram
   服务端生效不受影响）。

@@ -37,11 +37,15 @@ type Config struct {
 	DryRun          bool
 
 	// Behavior ----------------------------------------------------------------
-	Action           string // "ban" or "kick"
-	IgnoreAdmins     bool
-	DeleteJoinMsg    bool
-	LogChat          int64 // 0 = disabled
-	CmdAutodeleteSec int
+	Action        string // "ban" or "kick"
+	IgnoreAdmins  bool
+	DeleteJoinMsg bool
+	LogChat       int64 // 0 = disabled
+	// MsgTTL (amend8 BOT_MSG_TTL): every bot-sent chat message (command
+	// replies, leave notices, kick announcements) is auto-deleted after this
+	// delay. 0 = never delete; clamped to 24h. The notification channel
+	// (BOT_LOG_CHAT) is NOT covered — its pushes are permanent by design.
+	MsgTTL time.Duration
 
 	// Store & retention -------------------------------------------------------
 	Store            string // memory (default) | redis | file | auto
@@ -116,7 +120,6 @@ type Config struct {
 	// Kick announcement (amend7) ------------------------------------------------
 	AnnounceKickEnabled bool          // BOT_ANNOUNCE_KICK
 	AnnounceTimeout     time.Duration // BOT_ANNOUNCE_TIMEOUT (clamped 1s..20s)
-	AnnounceTTL         time.Duration // BOT_ANNOUNCE_TTL (0 = keep forever)
 }
 
 // Load reads the environment into a Config with defaults applied. It is pure
@@ -132,10 +135,12 @@ func Load() Config {
 		LeaveNotice:     boolEnv("BOT_LEAVE_NOTICE", true),
 		DryRun:          boolEnv("BOT_DRY_RUN", false),
 
-		Action:           envOr("BOT_ACTION", "kick"),
-		IgnoreAdmins:     boolEnv("BOT_IGNORE_ADMINS", true),
-		DeleteJoinMsg:    boolEnv("BOT_DELETE_JOIN_MSG", false),
-		CmdAutodeleteSec: intEnv("BOT_CMD_AUTODELETE_SEC", 0),
+		Action:        envOr("BOT_ACTION", "kick"),
+		IgnoreAdmins:  boolEnv("BOT_IGNORE_ADMINS", true),
+		DeleteJoinMsg: boolEnv("BOT_DELETE_JOIN_MSG", false),
+		// amend8: the unified chat-message TTL (0 or 0s..24h; 0 = never delete).
+		// BOT_CMD_AUTODELETE_SEC and BOT_ANNOUNCE_TTL are absorbed here.
+		MsgTTL: clampDurationOptionalZero(durationEnv("BOT_MSG_TTL", 60*time.Second), 24*time.Hour),
 
 		Store:            envOr("BOT_STORE", "memory"),
 		RedisURL:         os.Getenv("BOT_REDIS_URL"),
@@ -203,10 +208,9 @@ func Load() Config {
 
 		// amend7: kick announcement knobs. The timeout is clamped 1s..20s
 		// (announcement generation is decorative — it must never wait like a
-		// judgment); TTL 0 = the announcement stays in the group forever.
+		// judgment). The announcement TTL is the unified BOT_MSG_TTL (amend8).
 		AnnounceKickEnabled: boolEnv("BOT_ANNOUNCE_KICK", true),
 		AnnounceTimeout:     clampDuration(durationEnv("BOT_ANNOUNCE_TIMEOUT", 8*time.Second), 1*time.Second, 20*time.Second),
-		AnnounceTTL:         durationEnv("BOT_ANNOUNCE_TTL", 0),
 	}
 	c.Token = os.Getenv("BOT_TOKEN")
 	c.ChatsSet = os.Getenv("BOT_CHATS") != ""
@@ -319,8 +323,7 @@ func (c Config) Redacted() map[string]string {
 		// amend7 announcement contract
 		"BOT_ANNOUNCE_KICK":         strconv.FormatBool(c.AnnounceKickEnabled),
 		"BOT_ANNOUNCE_TIMEOUT":      c.AnnounceTimeout.String(),
-		"BOT_ANNOUNCE_TTL":          c.AnnounceTTL.String(),
-		"BOT_CMD_AUTODELETE_SEC":    strconv.Itoa(c.CmdAutodeleteSec),
+		"BOT_MSG_TTL":               c.MsgTTL.String(),
 		"BOT_STORE":                 c.Store,
 		"BOT_REDIS_URL":             redactURL(c.RedisURL),
 		"BOT_REDIS_INSECURE_TLS":    strconv.FormatBool(c.RedisInsecureTLS),
@@ -422,7 +425,7 @@ func UnrecognizedBotVars() []string {
 		"BOT_LEAVE_OTHER_CHATS": true, "BOT_LEAVE_NOTICE": true,
 		"BOT_ADMIN_USERS": true, "BOT_DRY_RUN": true, "BOT_ACTION": true,
 		"BOT_IGNORE_ADMINS": true, "BOT_DELETE_JOIN_MSG": true,
-		"BOT_LOG_CHAT": true, "BOT_CMD_AUTODELETE_SEC": true,
+		"BOT_LOG_CHAT": true, "BOT_MSG_TTL": true,
 		"BOT_STORE": true, "BOT_REDIS_URL": true,
 		"BOT_REDIS_INSECURE_TLS": true, "BOT_DB_PATH": true,
 		"BOT_DB_FSYNC": true, "BOT_RETENTION": true,
@@ -454,9 +457,8 @@ func UnrecognizedBotVars() []string {
 		"BOT_NOTIFY_MAX_LEN": true, "BOT_NOTIFY_TEXT_LEN": true,
 		"BOT_NOTIFY_INCLUDE_TEXT": true, "BOT_NOTIFY_DRAIN": true,
 		"BOT_ADMIN_CACHE_TTL": true, "BOT_ADMIN_CACHE_MAX": true,
-		// amend7 (kick announcement)
+		// amend7 (kick announcement; the TTL is the amend8 BOT_MSG_TTL)
 		"BOT_ANNOUNCE_KICK": true, "BOT_ANNOUNCE_TIMEOUT": true,
-		"BOT_ANNOUNCE_TTL": true,
 	}
 	var out []string
 	for _, kv := range os.Environ() {
@@ -514,6 +516,20 @@ func clampInt(v, lo, hi int) int {
 func clampDuration(v, lo, hi time.Duration) time.Duration {
 	if v < lo {
 		return lo
+	}
+	if v > hi {
+		return hi
+	}
+	return v
+}
+
+// clampDurationOptionalZero bounds a duration into (0 or 0s..hi] (amend8
+// BOT_MSG_TTL): 0/negative means "never delete" and must survive, while a
+// runaway positive value (e.g. 720h) clamps to hi. Unparsable input already
+// fell back to the default in durationEnv.
+func clampDurationOptionalZero(v, hi time.Duration) time.Duration {
+	if v <= 0 {
+		return 0
 	}
 	if v > hi {
 		return hi

@@ -105,6 +105,12 @@ type Bot struct {
 	// announcements (tests default).
 	Announcer *Announcer
 
+	// msgTTL (amend8) auto-deletes every bot-sent chat message (command
+	// replies, leave notices, kick announcements) after BOT_MSG_TTL. The
+	// notification channel (BOT_LOG_CHAT via Notifier) is NOT covered — its
+	// pushes are permanent by design. Built in New from the config.
+	msgTTL *msgDeleter
+
 	startedAt time.Time
 
 	// Stats (atomic for /statusz while the poll loop is running).
@@ -141,6 +147,10 @@ func New(st store.Store, tg TelegramClient, classify AIClassifier, verify Verifi
 		startedAt:  time.Now(),
 	}
 	b.judgePool = newJudgePool(b, cfg)
+	// amend8: unified chat-message TTL (BOT_MSG_TTL; 0 = never delete). The
+	// command replies, the leave notice, and the announcement sends all go
+	// through it. Drain budget rides the BOT_JUDGE_DRAIN magnitude.
+	b.msgTTL = newMsgDeleter(tg, cfg.MsgTTL, cfg.JudgeDrain, log)
 	return b
 }
 
@@ -187,6 +197,24 @@ func (b *Bot) AnnounceStats() (enabled bool, sent, fallback, errs int64) {
 // StopAnnouncer drains in-flight announcements (shutdown; BOT_JUDGE_DRAIN
 // magnitude budget, same as the judge pool). Idempotent, nil-safe.
 func (b *Bot) StopAnnouncer() { b.Announcer.Stop() }
+
+// MsgTTLStats returns the amend8 /statusz counters: (scheduled, deleted,
+// errors). The nil receiver means the subsystem is unwired.
+func (b *Bot) MsgTTLStats() (scheduled, deleted, errs int64) {
+	return b.msgTTL.Stats()
+}
+
+// MsgTTLConfig returns the current BOT_MSG_TTL value (for /statusz).
+func (b *Bot) MsgTTLConfig() time.Duration {
+	if b.msgTTL == nil {
+		return 0
+	}
+	return b.msgTTL.ttl
+}
+
+// StopMsgTTL drains in-flight TTL deletions (shutdown; BOT_JUDGE_DRAIN
+// magnitude budget). Idempotent, nil-safe.
+func (b *Bot) StopMsgTTL() { b.msgTTL.Stop() }
 
 // Stats returns a snapshot for /statusz.
 func (b *Bot) Stats() (poll, punished, aiCalls, aiFails int64) {
@@ -325,7 +353,8 @@ func (b *Bot) handleMyChatMember(ctx context.Context, cm *telegram.ChatMemberUpd
 		"from_user", cm.From.ID,
 		"status", newStatus)
 	if b.Cfg.LeaveNotice {
-		if _, err := b.TG.SendMessage(ctx, cm.Chat.ID, "本机器人只服务于指定群组，即将退出"); err != nil {
+		// amend8: the leave notice also self-deletes after BOT_MSG_TTL.
+		if _, err := b.sendChat(ctx, cm.Chat.ID, "本机器人只服务于指定群组，即将退出"); err != nil {
 			b.Log.Warn("leave_notice_error", "chat", cm.Chat.ID, "err", err.Error())
 		}
 	}
@@ -1078,22 +1107,25 @@ func formatChain(res ai.ClassifyResult) string {
 	return strings.Join(parts, ",")
 }
 
+// reply sends a command reply through the unified TTL sender (amend8): the
+// message is auto-deleted after BOT_MSG_TTL (0 = kept forever). Scheduling is
+// off the reply path — a slow TTL never delays the command handling.
 func (b *Bot) reply(ctx context.Context, m telegram.Message, text string) {
-	msgID, err := b.TG.SendMessage(ctx, m.Chat.ID, text)
-	if err != nil {
+	if _, err := b.sendChat(ctx, m.Chat.ID, text); err != nil {
 		b.Log.Error("cmd_reply_error", "chat", m.Chat.ID, "err", err.Error())
-		return
 	}
-	if b.Cfg.CmdAutodeleteSec > 0 {
-		go func() {
-			time.Sleep(time.Duration(b.Cfg.CmdAutodeleteSec) * time.Second)
-			ctxd, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-			defer cancel()
-			if err := b.TG.DeleteMessage(ctxd, m.Chat.ID, msgID); err != nil {
-				b.Log.Debug("cmd_autodelete_error", "err", err.Error())
-			}
-		}()
-	}
+}
+
+// sendChat is the single chat-send helper every deletable bot message goes
+// through: SendMessage + (async) delayed self-delete per BOT_MSG_TTL.
+func (b *Bot) sendChat(ctx context.Context, chatID int64, text string) (int64, error) {
+	return b.msgTTL.SendChat(ctx, chatID, text)
+}
+
+// SendChat is the exported form of sendChat (main wires it into the
+// Announcer so announcement sends ride the same amend8 TTL path).
+func (b *Bot) SendChat(ctx context.Context, chatID int64, text string) (int64, error) {
+	return b.sendChat(ctx, chatID, text)
 }
 
 func (b *Bot) replyHelpful(ctx context.Context, m telegram.Message, text string) {

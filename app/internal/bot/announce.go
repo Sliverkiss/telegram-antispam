@@ -2,12 +2,15 @@
 //
 // After a SUCCESSFUL kick/ban disposal, the bot posts one 1–2 sentence cute
 // AI-generated notice into the SAME group saying who was shown the door.
-// Contract (TASK_antispam_amend7.md C+D):
+// Contract (TASK_antispam_amend7.md C+D, amend8 merge):
 //   - The announcement NEVER occupies judgment pool slots and never runs
 //     inline on the punishment path: each disposal spawns its own goroutine
-//     (amendAnnouncer), which does the AI call → send → optional TTL delete
-//     on its own schedule. The punishment chain measures its own latency —
-//     tests assert < 100ms — and is unaffected by a slow/hanging AI.
+//     (amendAnnouncer), which does the AI call → send on its own schedule.
+//     The punishment chain measures its own latency — tests assert < 100ms —
+//     and is unaffected by a slow/hanging AI.
+//   - The send goes through the amend8 unified TTL sender (BOT_MSG_TTL): the
+//     announcement self-deletes like every other bot chat message. The
+//     amend7-private BOT_ANNOUNCE_TTL knob is gone.
 //   - AI failure / timeout / non-compliant output → the local template pool
 //     (never a drop, never a retry storm).
 //   - dry-run sends NOTHING (announce_dry_run log only), matching every
@@ -17,7 +20,8 @@
 //   - Send failure → announce_error log + the existing notifier error push;
 //     no re-send loop.
 //   - Shutdown: StopAnnouncer drains up to BOT_JUDGE_DRAIN's budget (the
-//     "with the BOT_JUDGE_DRAIN magnitude" clause of the task).
+//     "with the BOT_JUDGE_DRAIN magnitude" clause of the task). The TTL
+//     deletion goroutines belong to the msgTTL subsystem and drain with it.
 package bot
 
 import (
@@ -45,7 +49,9 @@ type Announcer struct {
 	notify  *notify.Notifier
 	dedupe  *dedupeCache
 	timeout time.Duration
-	ttl     time.Duration
+	// sender is the amend8 unified TTL path: send + delayed self-delete
+	// (BOT_MSG_TTL). nil → plain SendMessage (tests / disabled TTL).
+	sender  announceSender
 	enabled bool
 
 	wg      sync.WaitGroup
@@ -63,6 +69,11 @@ type Announcer struct {
 // tests). error → template fallback.
 type AnnounceGenerator interface {
 	Announce(ctx context.Context, subject, category string) (string, error)
+}
+
+// announceSender is the amend8 unified send surface the announcement uses.
+type announceSender interface {
+	SendChat(ctx context.Context, chatID int64, text string) (int64, error)
 }
 
 // announceConfig carries the BOT_ANNOUNCE_* knobs.
@@ -103,7 +114,10 @@ func renderTemplate(subject string) string {
 }
 
 // NewAnnouncer builds the subsystem; nil tg / nil generator → disabled.
-func NewAnnouncer(tg TelegramClient, gen AnnounceGenerator, kickEnabled bool, timeout, ttl, drain time.Duration, log *logx.Logger, n *notify.Notifier) *Announcer {
+// sender is the amend8 unified TTL path (bot.sendChat) — nil keeps the plain
+// SendMessage behavior (legacy tests); the ttl parameter of amend7 is gone
+// (BOT_MSG_TTL owns the deletion now).
+func NewAnnouncer(tg TelegramClient, gen AnnounceGenerator, kickEnabled bool, timeout, drain time.Duration, log *logx.Logger, n *notify.Notifier, sender announceSender) *Announcer {
 	if log == nil {
 		log = logx.New(nil, logx.Error, "text", "announce")
 	}
@@ -121,7 +135,7 @@ func NewAnnouncer(tg TelegramClient, gen AnnounceGenerator, kickEnabled bool, ti
 		notify:  n,
 		dedupe:  newDedupeCache(time.Hour),
 		timeout: timeout,
-		ttl:     ttl,
+		sender:  sender,
 		drainV:  drain,
 		enabled: tg != nil && gen != nil && kickEnabled,
 		stopped: make(chan struct{}),
@@ -190,8 +204,10 @@ func (a *Announcer) Announce(ctx context.Context, chatID, uid, messageID int64, 
 	}()
 }
 
-// run performs generate → send → optional TTL delete on the announcement
-// goroutine. Every failure path is terminal (no retry storm).
+// run performs generate → send on the announcement goroutine. Every failure
+// path is terminal (no retry storm). The send goes through the amend8
+// unified TTL path when wired: the delayed self-delete (BOT_MSG_TTL) is the
+// msgTTL subsystem's business, not this one's.
 func (a *Announcer) run(ctx context.Context, chatID, uid int64, username, firstName, category string) {
 	_ = ctx
 	subject := announceSubject(username, firstName, uid)
@@ -218,7 +234,13 @@ func (a *Announcer) run(ctx context.Context, chatID, uid int64, username, firstN
 		text = renderTemplate(subject)
 	}
 
-	msgID, err := a.tg.SendMessage(context.Background(), chatID, text)
+	send := func(ctx context.Context, chatID int64, text string) (int64, error) {
+		return a.tg.SendMessage(ctx, chatID, text)
+	}
+	if a.sender != nil {
+		send = a.sender.SendChat
+	}
+	msgID, err := send(context.Background(), chatID, text)
 	if err != nil {
 		a.errorTotal.Add(1)
 		a.log.Error("announce_error",
@@ -242,23 +264,6 @@ func (a *Announcer) run(ctx context.Context, chatID, uid int64, username, firstN
 		"ms", time.Since(start).Milliseconds(),
 		"source", source)
 	a.log.Info("announce_sent", "chat", chatID, "uid", uid)
-
-	if a.ttl > 0 && msgID > 0 {
-		a.wg.Add(1)
-		go func() {
-			defer a.wg.Done()
-			select {
-			case <-time.After(a.ttl):
-			case <-a.stopped:
-				return
-			}
-			ctxD, cancelD := context.WithTimeout(context.Background(), 10*time.Second)
-			defer cancelD()
-			if err := a.tg.DeleteMessage(ctxD, chatID, msgID); err != nil {
-				a.log.Debug("announce_ttl_delete_error", "chat", chatID, "message_id", msgID, "err", err.Error())
-			}
-		}()
-	}
 }
 
 // dedupeCache is a bounded TTL map for announcement idempotency: one

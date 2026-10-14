@@ -19,7 +19,7 @@ services:
       - BOT_IGNORE_ADMINS=${BOT_IGNORE_ADMINS:-true}
       - BOT_DELETE_JOIN_MSG=${BOT_DELETE_JOIN_MSG:-false}
       - BOT_LOG_CHAT=${BOT_LOG_CHAT:-0}
-      - BOT_CMD_AUTODELETE_SEC=${BOT_CMD_AUTODELETE_SEC:-0}
+      - BOT_MSG_TTL=${BOT_MSG_TTL:-60s}
       - BOT_STORE=${BOT_STORE:-memory}
       - BOT_REDIS_URL=${BOT_REDIS_URL:-}
       - BOT_REDIS_INSECURE_TLS=${BOT_REDIS_INSECURE_TLS:-false}
@@ -77,9 +77,8 @@ services:
       - BOT_UPDATE_WORKERS=${BOT_UPDATE_WORKERS:-16}
       - BOT_ADMIN_CACHE_TTL=${BOT_ADMIN_CACHE_TTL:-5m}
       - BOT_ADMIN_CACHE_MAX=${BOT_ADMIN_CACHE_MAX:-5000}
-      # amend7: kick announcement
+      # amend7: kick announcement (TTL is the amend8 unified BOT_MSG_TTL)
       - BOT_ANNOUNCE_KICK=${BOT_ANNOUNCE_KICK:-true}
       - BOT_ANNOUNCE_TIMEOUT=${BOT_ANNOUNCE_TIMEOUT:-8s}
-      - BOT_ANNOUNCE_TTL=${BOT_ANNOUNCE_TTL:-0}
       - BOT_ADMIN_TOKEN=${BOT_ADMIN_TOKEN:-}
       - BOT_VERSION=${BOT_VERSION:-dev}

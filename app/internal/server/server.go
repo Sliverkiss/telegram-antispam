@@ -33,6 +33,18 @@ type Inspector interface {
 	// Amend7: kick-announcement counters (nil-safe zero view when the
 	// subsystem is unwired).
 	AnnounceView() AnnounceView
+	// Amend8: chat-message TTL gauges (msg_ttl / msg_ttl_scheduled_total /
+	// msg_ttl_deleted_total / msg_ttl_error_total).
+	MsgTTLView() MsgTTLView
+}
+
+// MsgTTLView is the amend8 chat-message-TTL gauges the server renders (plain
+// data so server does not import bot).
+type MsgTTLView struct {
+	TTL            string
+	ScheduledTotal int64
+	DeletedTotal   int64
+	ErrorTotal     int64
 }
 
 // AnnounceView is the amend7 announcement counters the server renders (plain
@@ -258,6 +270,14 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	body["announce_sent_total"] = av.SentTotal
 	body["announce_fallback_total"] = av.FallbackTotal
 	body["announce_error_total"] = av.ErrorTotal
+
+	// amend8: bot chat-message TTL gauges (notification-channel pushes are
+	// deliberately absent — they are permanent, never deleted).
+	mv := s.Bot.MsgTTLView()
+	body["msg_ttl"] = mv.TTL
+	body["msg_ttl_scheduled_total"] = mv.ScheduledTotal
+	body["msg_ttl_deleted_total"] = mv.DeletedTotal
+	body["msg_ttl_error_total"] = mv.ErrorTotal
 	// The sweeper block only appears when the janitor has run at least once.
 	if s.Sweeper != nil {
 		at, next, droppedSus, droppedSigs, remaining, ran := s.Sweeper.SweepSnapshot()
