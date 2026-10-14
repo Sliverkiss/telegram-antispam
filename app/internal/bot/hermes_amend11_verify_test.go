@@ -22,7 +22,8 @@ import (
 func welcomeCount(tg *fakeTG) int {
 	n := 0
 	for _, s := range tg.sendsSnapshot() {
-		if strings.Contains(s, "欢迎") {
+		// 严格 needle：真正的欢迎文案（别被公告里的“欢迎”字样骗到）
+		if strings.Contains(s, "发一个贴纸") {
 			n++
 		}
 	}
