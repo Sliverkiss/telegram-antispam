@@ -65,6 +65,9 @@ func (s *stubBot) JoinVerifyView() JoinVerifyView {
 func (s *stubBot) CommentBioView() CommentBioView {
 	return CommentBioView{Enabled: true, TriggeredTotal: 11, FlashHitsTotal: 4, FlashCachedTotal: 2, FlashTTL: "30m0s"}
 }
+func (s *stubBot) Amend13View() Amend13View {
+	return Amend13View{MinPunishScore: 85, BelowScoreReleasesTotal: 6}
+}
 
 // fakeSweep reports a fixed (already-run) sweep for /statusz rendering.
 type fakeSweep struct{}
@@ -430,5 +433,21 @@ func TestStatuszJoinVerifyBlock(t *testing.T) {
 	}
 	if body["join_verify_skipped_total"] != float64(7) {
 		t.Errorf("join_verify_skipped_total = %v", body["join_verify_skipped_total"])
+	}
+}
+
+// TestStatuszAmend13Block pins the amend13 disposal-floor gauges
+// (ai_min_punish_score / ai_below_score_releases_total).
+func TestStatuszAmend13Block(t *testing.T) {
+	_, ts := newTestServer(t, "")
+	resp := get(t, ts.URL+"/statusz")
+	defer resp.Body.Close()
+	var body map[string]any
+	json.NewDecoder(resp.Body).Decode(&body)
+	if body["ai_min_punish_score"] != float64(85) {
+		t.Errorf("ai_min_punish_score = %v", body["ai_min_punish_score"])
+	}
+	if body["ai_below_score_releases_total"] != float64(6) {
+		t.Errorf("ai_below_score_releases_total = %v", body["ai_below_score_releases_total"])
 	}
 }

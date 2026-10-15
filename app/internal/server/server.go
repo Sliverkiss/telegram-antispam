@@ -49,6 +49,9 @@ type Inspector interface {
 	// comment_bio_flash_hits_total / comment_bio_flash_cached /
 	// comment_bio_flash_ttl).
 	CommentBioView() CommentBioView
+	// Amend13: disposal-floor gauges (ai_min_punish_score /
+	// ai_below_score_releases_total).
+	Amend13View() Amend13View
 }
 
 // MsgTTLView is the amend8 chat-message-TTL gauges the server renders (plain
@@ -85,6 +88,14 @@ type CommentBioView struct {
 	FlashHitsTotal   int64
 	FlashCachedTotal int64 // live 防刷 cache entries (post-TTL-prune)
 	FlashTTL         string
+}
+
+// Amend13View is the disposal-floor gauges the server renders (plain data so
+// server does not import bot): BOT_AI_MIN_PUNISH_SCORE and the count of
+// AI-lane ad verdicts released below it.
+type Amend13View struct {
+	MinPunishScore          int
+	BelowScoreReleasesTotal int64
 }
 
 // AnnounceView is the amend7 announcement counters the server renders (plain
@@ -339,6 +350,12 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	body["comment_bio_flash_hits_total"] = cbv.FlashHitsTotal
 	body["comment_bio_flash_cached"] = cbv.FlashCachedTotal
 	body["comment_bio_flash_ttl"] = cbv.FlashTTL
+
+	// amend13: disposal-floor gauges (BOT_AI_MIN_PUNISH_SCORE + below-floor
+	// AI-lane releases).
+	a13 := s.Bot.Amend13View()
+	body["ai_min_punish_score"] = a13.MinPunishScore
+	body["ai_below_score_releases_total"] = a13.BelowScoreReleasesTotal
 	// The sweeper block only appears when the janitor has run at least once.
 	if s.Sweeper != nil {
 		at, next, droppedSus, droppedSigs, remaining, ran := s.Sweeper.SweepSnapshot()

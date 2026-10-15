@@ -111,8 +111,12 @@
 3. **图片多模态**：带图消息取最大尺寸图 + caption 一起判定，图片冲突时以图为准；
    同一 `file_unique_id` 判定结果缓存（文件 hash 去重）。
 4. **置信度不足 → 三路并发复核**：`is_ad=true` 但 `confidence < BOT_AI_MIN_CONFIDENCE` 时
-   在复核模型上并发投票，≥`BOT_AI_VERIFY_MAJORITY` 票才处置；失败/超时路**弃权**；
-   平票/不足 → 进重试队列再判一轮。
+   在复核模型上并发投票，失败/超时路**弃权**；平票/不足 → 进重试队列再判一轮。
+   复核投出「广告」时最终分取**判广告复核路的平均置信度**，仍受下面的处置门限约束。
+4a. **处置门限（85 分以上才踢）**：AI 判广告但最终分（百分制）< `BOT_AI_MIN_PUNISH_SCORE`
+   （默认 85）时**放过**（不踢不删，日志 `amend13_below_score_release` + `/statusz` 计数
+   `ai_below_score_releases_total`）。门限只约束 AI 判定通道（主判定 / 复核 / 重试轮）；
+   签名库、裸号必杀、入群验证超时、防刷缓存、本地规则兜底、上游敏感拦截不受影响。
 5. **失败重试**：固定 10s 间隔、最多 5 次、不退避不熔断，队列容量 `BOT_AI_RETRY_QUEUE`
    （满则淘汰最旧并打 ERROR）。5 次用尽后**本地规则引擎自动兜底**（≥阈值处置，否则继续观察）。
 6. **SimHash 防改字**：签名库同时建 64 位字符 trigram simhash 索引，海明距离 ≤
@@ -178,7 +182,8 @@ go run . -prompteval -prompteval.models=mimo-v2.6-pro
 | | `BOT_AI_REASONING_EFFORT` | `none` | 关思考（网关校验过；绝不发 `max_tokens`） |
 | | `BOT_AI_PROMPT_FILE` | 空 | 覆盖内嵌提示词（调优不发版） |
 | | `BOT_AI_RETRY_INTERVAL` / `_MAX_ATTEMPTS` / `_QUEUE` | `10s` / `5` / `500` | 固定间隔重试（不退避、不熔断） |
-| | `BOT_AI_MIN_CONFIDENCE` | `0.85` | 置信度阈值，不足触发复核 |
+| | `BOT_AI_MIN_CONFIDENCE` | `0.85` | 置信度阈值，不足触发复核（管「何时复核」） |
+| | `BOT_AI_MIN_PUNISH_SCORE` | `85` | 处置门限：AI 判广告但分数 < 85 放过不踢（管「多高分才踢」；复核投 ad 时取判广告复核路平均分；0 = 关闭；签名/裸号/入群验证/防刷/兜底/上游敏感不受影响） |
 | | `BOT_AI_VERIFY_VOTES` / `_MODELS` / `_MAJORITY` / `_TIMEOUT` | `3` / `mimo-v2.6-flash` / `2` / `45s` | 并发复核（单路超时，失败路弃权） |
 | | `BOT_AI_FALLBACK_BASE_URL` / `_API_KEY` / `_MODELS` | 空 | 备用 provider（可选） |
 | | `BOT_SIMHASH_DISTANCE` | `3` | 相似度匹配（防改字绕过） |

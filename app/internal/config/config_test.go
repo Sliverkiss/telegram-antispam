@@ -667,3 +667,42 @@ func TestCommentBioEnvOverrides(t *testing.T) {
 		}
 	}
 }
+
+// TestMinPunishScoreDefault (amend13): the disposal floor defaults to 85
+// ("85分以上才踢出去"); a typo'd value falls back to the default; a negative
+// value is clamped back to 85; over 100 clamps to 100; an explicit 0 = off.
+func TestMinPunishScoreDefault(t *testing.T) {
+	clearBOT(t)
+	c := Load()
+	if c.MinPunishScore != 85 {
+		t.Errorf("MinPunishScore default = %d, want 85", c.MinPunishScore)
+	}
+	if r := c.Redacted()["BOT_AI_MIN_PUNISH_SCORE"]; r != "85" {
+		t.Errorf("Redacted BOT_AI_MIN_PUNISH_SCORE = %q, want \"85\"", r)
+	}
+
+	t.Setenv("BOT_AI_MIN_PUNISH_SCORE", "70")
+	if c := Load(); c.MinPunishScore != 70 {
+		t.Errorf("MinPunishScore = %d, want 70", c.MinPunishScore)
+	}
+
+	t.Setenv("BOT_AI_MIN_PUNISH_SCORE", "abc")
+	if c := Load(); c.MinPunishScore != 85 {
+		t.Errorf("typo → %d, want 85", c.MinPunishScore)
+	}
+
+	t.Setenv("BOT_AI_MIN_PUNISH_SCORE", "-5")
+	if c := Load(); c.MinPunishScore != 85 {
+		t.Errorf("negative → %d, want 85", c.MinPunishScore)
+	}
+
+	t.Setenv("BOT_AI_MIN_PUNISH_SCORE", "120")
+	if c := Load(); c.MinPunishScore != 100 {
+		t.Errorf("over-100 → %d, want 100", c.MinPunishScore)
+	}
+
+	t.Setenv("BOT_AI_MIN_PUNISH_SCORE", "0")
+	if c := Load(); c.MinPunishScore != 0 {
+		t.Errorf("explicit 0 = floor off, got %d", c.MinPunishScore)
+	}
+}

@@ -141,6 +141,9 @@ type Bot struct {
 	joinRuleHits     atomic.Int64 // amend9 裸号必杀 direct disposals (dry-run excluded)
 	commentTriggered atomic.Int64 // amend12 comment bio screens entered
 	commentFlashHits atomic.Int64 // amend12 防刷 direct kicks (zero-AI, dry-run excluded)
+	// belowScoreReleases counts amend13 below-floor AI-lane releases: verdicts
+	// that said ad but scored under BOT_AI_MIN_PUNISH_SCORE and were let go.
+	belowScoreReleases atomic.Int64
 }
 
 // New builds a Bot with defaults filled in.
@@ -318,6 +321,14 @@ func (b *Bot) CommentBioFlashConfig() time.Duration {
 		return 0
 	}
 	return b.commentFlash.ttl
+}
+
+// Amend13Stats returns the disposal-floor gauges for /statusz and /status:
+// (BOT_AI_MIN_PUNISH_SCORE, ai_below_score_releases_total). Releases count
+// every AI-lane ad verdict let go below the floor (dry-run included: the
+// decision, not the write, is what the counter observes).
+func (b *Bot) Amend13Stats() (floor int, releases int64) {
+	return b.Cfg.MinPunishScore, b.belowScoreReleases.Load()
 }
 
 // NotifySnapshotRaw is kept (see serverstats.go); the public NotifySnapshot
@@ -1005,12 +1016,13 @@ func (b *Bot) finishJudgment(ctx context.Context, in judgmentInput, verdict ai.V
 		return
 	}
 
-	// Confidence gate: ≥ threshold → punish; below → concurrent vote round.
+	// Confidence gate: ≥ threshold → straight to commitAd (which now enforces
+	// the amend13 disposal floor); below → concurrent vote round.
 	if verdict.Confidence >= b.Cfg.MinConfidence || b.Verify == nil {
 		if b.Verify == nil && verdict.Confidence < b.Cfg.MinConfidence {
 			// No verifier wired (tests): treat low-confidence as needing the
-			// vote path but with none available — punish anyway per the
-			// "漏杀是严重错误" orientation.
+			// vote path but with none available — hand to commitAd, where the
+			// amend13 disposal floor (not the old "punish anyway") decides.
 			b.Log.Warn("verify_unavailable", "uid", in.uid, "confidence", verdict.Confidence)
 		}
 		b.commitAd(ctx, in, verdict, elapsed, in.retries)
@@ -1035,7 +1047,18 @@ func (b *Bot) finishJudgment(ctx context.Context, in judgmentInput, verdict ai.V
 	switch res.Final {
 	case "ad":
 		b.AIStats.NoteVerify(false)
-		b.commitAd(ctx, in, verdict, elapsed, in.retries)
+		// amend13: the vote CONFIRMED ad, so the primary verdict stands — but
+		// its final score is the vote consensus (the ad-voting lanes' average
+		// confidence), NOT the original low-confidence verdict. The old code
+		// reused the primary verdict verbatim, producing the self-contradictory
+		// "已踢出 · 80分" disposals this amendment exists to remove. The
+		// consensus verdict then flows through commitAd, whose disposal floor
+		// decides kick vs release — the vote lane is neither dead code nor a
+		// gate bypass: a confirmed verdict with consensus ≥ floor punishes,
+		// below the floor it is released with a log + counter (the miss-kill
+		// correction wins by explicit user demand).
+		consensus := voteConsensusVerdict(res, verdict)
+		b.commitAd(ctx, in, consensus, elapsed, in.retries)
 	case "not_ad":
 		b.AIStats.NoteVerify(true) // vote overrode the primary verdict
 		// amend11: a join verdict overridden to not_ad is ALSO a final
@@ -1054,12 +1077,75 @@ func (b *Bot) finishJudgment(ctx context.Context, in judgmentInput, verdict ai.V
 	}
 }
 
-// commitAd punishes the ad verdict (delete the triggering message → ban/kick
-// → signature write → watchlist removal → record + notify).
-// amend12: a COMMENT ad verdict (condemned bio) additionally enters the 防刷
-// flash cache — a repeat of that bio inside the window is kicked directly
-// with zero AI calls (dry-run writes nothing).
+// voteConsensusVerdict is the amend13 vote-confirmation score: the average
+// confidence of the lanes that voted AD (the verdict the vote just affirmed),
+// carried on the primary verdict's category/reason shape. Degenerate lane
+// data (no ad lanes carry a confidence, or zero ad lanes — the vote said ad
+// but lanes are unshaped) falls back to the primary confidence, so the score
+// is never structurally missing; the floor check in commitAd still runs.
+func voteConsensusVerdict(res ai.VerifyResult, primary ai.Verdict) ai.Verdict {
+	v := primary
+	var sum float64
+	var n int
+	for _, lane := range res.Lanes {
+		if lane.Err == "" && lane.IsAd && lane.Confidence > 0 {
+			sum += lane.Confidence
+			n++
+		}
+	}
+	if n > 0 {
+		v.Confidence = sum / float64(n)
+	}
+	return v
+}
+
+// commitAd is the SINGLE disposal exit of the AI judgment lanes (primary
+// high-confidence, vote-confirmed, and every retry round of both) — and since
+// amend13 it also owns the disposal floor BOT_AI_MIN_PUNISH_SCORE: an ad
+// verdict whose final score (notify.ConfidenceScore of the verdict confidence)
+// is below the floor is RELEASED (no kick, no delete, no signature write, no
+// flash-cache write, no record, no notification) with an
+// amend13_below_score_release log + counter. ≥ floor → the pre-amend13
+// punishAndClear chain, byte-for-byte unchanged.
+//
+// EXEMPT lanes (never pass through here, so their behavior is untouched):
+// signature hits (score 100 anyway), amend9 裸号必杀, amend10 join-verify
+// timeout (the deadline, not a score, decides), amend12 flash cache (a
+// re-judged ad verdict whose consensus cleared the floor at write time),
+// upstream sensitive interception (confidence 0.99 — above any sane floor),
+// and the local-rule fallback (its own threshold contract: "AI 全失败必须有人
+// 兜底、不能静默" — the floor would re-silence the lane the user demanded).
+//
+// amend12 (unchanged for above-floor verdicts): a COMMENT ad verdict
+// additionally enters the 防刷 flash cache — a repeat of that bio inside the
+// window is kicked directly with zero AI calls (dry-run writes nothing).
 func (b *Bot) commitAd(ctx context.Context, in judgmentInput, verdict ai.Verdict, elapsed time.Duration, retries int) {
+	score := notify.ConfidenceScore(verdict.Confidence)
+	if b.Cfg.MinPunishScore > 0 && score < b.Cfg.MinPunishScore {
+		// amend13 release lane: below the disposal floor →放过. The message
+		// stays (不踢不删是既定); the trace is the log below plus the
+		// /statusz + /status counter (belowScoreReleases). The join lane also
+		// funnels to the welcome exit: the judgment CONCLUDED non-disposably
+		// (idempotent via the woken map), exactly like a vote not_ad.
+		b.belowScoreReleases.Add(1)
+		b.Log.Info("amend13_below_score_release",
+			"key", in.key,
+			"chat", in.chatID,
+			"uid", in.uid,
+			"score", score,
+			"floor", b.Cfg.MinPunishScore,
+			"category", verdict.ControlledCategory(),
+			"basis", verdictSource(verdict),
+			"summary", "低于处置门限：放过（不踢不删，留痕计数）")
+		if in.kind == "join" {
+			b.joinVerify.onJoinVerdictNonAd(ctx, in.chatID, in.uid, in.username, in.firstName)
+		}
+		// One judgment = one consumption (amend5 D): the below-floor outcome is
+		// final for this message; the user leaves the watchlist (join/comment
+		// bio judgments never consumed the slot anyway, per D.2).
+		b.consumeWatchlist(ctx, in)
+		return
+	}
 	category := verdict.ControlledCategory()
 	if in.kind == "comment" {
 		b.commentBioFlashStore(in.text, category)
@@ -1074,7 +1160,7 @@ func (b *Bot) commitAd(ctx context.Context, in judgmentInput, verdict ai.Verdict
 		writeSig:  in.writeMsg || in.writeBio,
 		bioKind:   in.kind == "join" || in.kind == "comment",
 	}, b.Cfg.Action, category, verdict.Reason,
-		notifyDetails{source: verdictSource(verdict), score: notify.ConfidenceScore(verdict.Confidence), elapsed: elapsed, retries: retries})
+		notifyDetails{source: verdictSource(verdict), score: score, elapsed: elapsed, retries: retries})
 }
 
 // verdictSource maps an ad verdict to the disposition-notice source: the
@@ -1322,6 +1408,7 @@ func (b *Bot) cmdStatus(ctx context.Context, m telegram.Message) {
 	localFB, simHits := b.ExtraStats()
 	sn := b.AIStats.Snapshot()
 	pending := b.PendingQueueLen()
+	amend13Floor, amend13Releases := b.Amend13Stats()
 
 	var modelLines []string
 	for _, model := range sn.SortedModels() {
@@ -1332,7 +1419,8 @@ func (b *Bot) cmdStatus(ctx context.Context, m telegram.Message) {
 		"复核 %d 次（改判 %d）· 删除 %d（失败 %d）· 处置 %d\n"+
 		"AI 调用 %d / 失败 %d · 兜底 %d · SimHash 命中 %d · 待决队列 %d\n"+
 		"观察名单 %d · 签名库 bio %d / msg %d · 轮询 %d\n"+
-		"评论简介 触发 %d · 防刷命中 %d · 防刷窗口 %s\n模式 %s",
+		"评论简介 触发 %d · 防刷命中 %d · 防刷窗口 %s\n"+
+		"门限 %d分以上处置 · 低于门限放过 %d\n模式 %s",
 		b.Cfg.Version, b.Uptime().Round(time.Second).String(), ai.PromptVersion,
 		b.Cfg.Store, b.Cfg.Retention.String(), b.Cfg.RetentionSliding,
 		strings.Join(b.Cfg.AIEffectiveModels(), "→"),
@@ -1341,6 +1429,7 @@ func (b *Bot) cmdStatus(ctx context.Context, m telegram.Message) {
 		aiCalls, aiFails, localFB, simHits, pending,
 		suspects, bioSigs, msgSigs, poll,
 		b.commentTriggered.Load(), b.commentFlashHits.Load(), b.Cfg.CommentBioFlashTTL.String(),
+		amend13Floor, amend13Releases,
 		map[bool]string{true: "干跑", false: "正常"}[b.Cfg.DryRun])
 	b.reply(ctx, m, text)
 }

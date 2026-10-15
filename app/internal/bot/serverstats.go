@@ -121,3 +121,10 @@ func (b *Bot) CommentBioView() server.CommentBioView {
 		FlashTTL:         b.CommentBioFlashConfig().String(),
 	}
 }
+
+// Amend13View adapts the disposal-floor gauges into the server's plain view
+// (BOT_AI_MIN_PUNISH_SCORE, ai_below_score_releases_total).
+func (b *Bot) Amend13View() server.Amend13View {
+	floor, releases := b.Amend13Stats()
+	return server.Amend13View{MinPunishScore: floor, BelowScoreReleasesTotal: releases}
+}

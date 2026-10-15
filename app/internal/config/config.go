@@ -63,19 +63,26 @@ type Config struct {
 	MaxSignatures      int
 
 	// AI ----------------------------------------------------------------------
-	AIBaseURL          string
-	AIKey              string
-	AIModels           []string // model fallback chain (BOT_AI_MODELS)
-	AIModel            string   // single-model compat (BOT_AI_MODEL)
-	AIModelSet         bool     // BOT_AI_MODEL was explicitly set in the env
-	AITimeout          time.Duration
-	AIJudgeTimeout     time.Duration // whole-chain budget for ONE judgment (BOT_AI_JUDGE_TIMEOUT)
-	AIReasoningEffort  string        // "none" default; overrides the thinking-off field
-	AIPromptFile       string        // BOT_AI_PROMPT_FILE: override the embedded judge prompt
-	RetryInterval      time.Duration
-	RetryMax           int
-	RetryQueue         int
-	MinConfidence      float64
+	AIBaseURL         string
+	AIKey             string
+	AIModels          []string // model fallback chain (BOT_AI_MODELS)
+	AIModel           string   // single-model compat (BOT_AI_MODEL)
+	AIModelSet        bool     // BOT_AI_MODEL was explicitly set in the env
+	AITimeout         time.Duration
+	AIJudgeTimeout    time.Duration // whole-chain budget for ONE judgment (BOT_AI_JUDGE_TIMEOUT)
+	AIReasoningEffort string        // "none" default; overrides the thinking-off field
+	AIPromptFile      string        // BOT_AI_PROMPT_FILE: override the embedded judge prompt
+	RetryInterval     time.Duration
+	RetryMax          int
+	RetryQueue        int
+	MinConfidence     float64
+	// MinPunishScore (amend13, BOT_AI_MIN_PUNISH_SCORE) is the disposal floor:
+	// an AI-lane ad verdict whose final score (primary confidence ×100, or the
+	// vote consensus on the vote-confirmed lane) is below this is RELEASED,
+	// never punished. MinConfidence stays the vote TRIGGER; this is the
+	// disposal GATE. 1..100; 0/negative/unparsable fall back to 85 — the gate
+	// must never be silently disabled by an empty or typo'd value.
+	MinPunishScore     int
 	VerifyVotes        int
 	VerifyModels       []string
 	VerifyMajority     int
@@ -188,19 +195,24 @@ func Load() Config {
 		MaxSuspects:      intEnv("BOT_MAX_SUSPECTS", 50000),
 		MaxSignatures:    intEnv("BOT_MAX_SIGNATURES", 50000),
 
-		AIBaseURL:          envOr("BOT_AI_BASE_URL", "https://api.your-gateway.invalid/v1"),
-		AIKey:              os.Getenv("BOT_AI_API_KEY"),
-		AIModels:           models,
-		AIModel:            envOr("BOT_AI_MODEL", "mimo-v2.6-pro-ultraspeed-studio"),
-		AIModelSet:         os.Getenv("BOT_AI_MODEL") != "",
-		AITimeout:          durationEnv("BOT_AI_TIMEOUT", 90*time.Second),
-		AIJudgeTimeout:     durationEnv("BOT_AI_JUDGE_TIMEOUT", 150*time.Second),
-		AIReasoningEffort:  envOr("BOT_AI_REASONING_EFFORT", "none"),
-		AIPromptFile:       os.Getenv("BOT_AI_PROMPT_FILE"),
-		RetryInterval:      durationEnv("BOT_AI_RETRY_INTERVAL", 10*time.Second),
-		RetryMax:           intEnv("BOT_AI_RETRY_MAX_ATTEMPTS", 5),
-		RetryQueue:         intEnv("BOT_AI_RETRY_QUEUE", 500),
-		MinConfidence:      floatEnv("BOT_AI_MIN_CONFIDENCE", 0.85),
+		AIBaseURL:         envOr("BOT_AI_BASE_URL", "https://api.your-gateway.invalid/v1"),
+		AIKey:             os.Getenv("BOT_AI_API_KEY"),
+		AIModels:          models,
+		AIModel:           envOr("BOT_AI_MODEL", "mimo-v2.6-pro-ultraspeed-studio"),
+		AIModelSet:        os.Getenv("BOT_AI_MODEL") != "",
+		AITimeout:         durationEnv("BOT_AI_TIMEOUT", 90*time.Second),
+		AIJudgeTimeout:    durationEnv("BOT_AI_JUDGE_TIMEOUT", 150*time.Second),
+		AIReasoningEffort: envOr("BOT_AI_REASONING_EFFORT", "none"),
+		AIPromptFile:      os.Getenv("BOT_AI_PROMPT_FILE"),
+		RetryInterval:     durationEnv("BOT_AI_RETRY_INTERVAL", 10*time.Second),
+		RetryMax:          intEnv("BOT_AI_RETRY_MAX_ATTEMPTS", 5),
+		RetryQueue:        intEnv("BOT_AI_RETRY_QUEUE", 500),
+		MinConfidence:     floatEnv("BOT_AI_MIN_CONFIDENCE", 0.85),
+		// amend13: disposal gate default 85 — the miss-kill correction
+		// ("85分以上才踢出去"). intEnv rejects negative/typo'd values to the
+		// default; 0 is a legitimate "no floor" only via an explicit 0, which
+		// intEnv returns as-is (documented in .env.example).
+		MinPunishScore:     intEnv("BOT_AI_MIN_PUNISH_SCORE", 85),
 		VerifyVotes:        intEnv("BOT_AI_VERIFY_VOTES", 3),
 		VerifyModels:       csvList(envOr("BOT_AI_VERIFY_MODELS", "mimo-v2.6-flash")),
 		VerifyMajority:     intEnv("BOT_AI_VERIFY_MAJORITY", 2),
@@ -305,6 +317,14 @@ func Load() Config {
 	// every condemned-bio entry, i.e. disable 防刷 entirely).
 	if c.CommentBioFlashMax < 1 {
 		c.CommentBioFlashMax = 5000
+	}
+	// amend13: a NEGATIVE disposal floor is a typo, never a "disable" request
+	// — restore the default 85 (an explicit 0 = floor off is legal and kept).
+	if c.MinPunishScore < 0 {
+		c.MinPunishScore = 85
+	}
+	if c.MinPunishScore > 100 {
+		c.MinPunishScore = 100
 	}
 	return c
 }
@@ -426,6 +446,7 @@ func (c Config) Redacted() map[string]string {
 		"BOT_AI_RETRY_MAX_ATTEMPTS": strconv.Itoa(c.RetryMax),
 		"BOT_AI_RETRY_QUEUE":        strconv.Itoa(c.RetryQueue),
 		"BOT_AI_MIN_CONFIDENCE":     strconv.FormatFloat(c.MinConfidence, 'f', 2, 64),
+		"BOT_AI_MIN_PUNISH_SCORE":   strconv.Itoa(c.MinPunishScore),
 		"BOT_AI_VERIFY_VOTES":       strconv.Itoa(c.VerifyVotes),
 		"BOT_AI_VERIFY_MODELS":      strings.Join(c.VerifyModels, ","),
 		"BOT_AI_VERIFY_MAJORITY":    strconv.Itoa(c.VerifyMajority),
@@ -516,7 +537,8 @@ func UnrecognizedBotVars() []string {
 		"BOT_AI_REASONING_EFFORT": true, "BOT_AI_PROMPT_FILE": true,
 		"BOT_AI_RETRY_INTERVAL": true, "BOT_AI_RETRY_MAX_ATTEMPTS": true,
 		"BOT_AI_RETRY_QUEUE": true, "BOT_AI_MIN_CONFIDENCE": true,
-		"BOT_AI_VERIFY_VOTES": true, "BOT_AI_VERIFY_MODELS": true,
+		"BOT_AI_MIN_PUNISH_SCORE": true,
+		"BOT_AI_VERIFY_VOTES":     true, "BOT_AI_VERIFY_MODELS": true,
 		"BOT_AI_VERIFY_MAJORITY": true, "BOT_AI_VERIFY_TIMEOUT": true,
 		"BOT_AI_FALLBACK_BASE_URL": true, "BOT_AI_FALLBACK_API_KEY": true,
 		"BOT_AI_FALLBACK_MODELS": true, "BOT_SIMHASH_DISTANCE": true,
