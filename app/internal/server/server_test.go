@@ -60,7 +60,7 @@ func (s *stubBot) JoinRuleView() JoinRuleView {
 	return JoinRuleView{Enabled: true, Hits: 4}
 }
 func (s *stubBot) JoinVerifyView() JoinVerifyView {
-	return JoinVerifyView{Enabled: true, Pending: 2, PassedTotal: 9, TimeoutTotal: 3, SkippedTotal: 7}
+	return JoinVerifyView{Enabled: true, Pending: 2, PassedTotal: 9, TimeoutTotal: 3, SkippedTotal: 7, LatePassedTotal: 5}
 }
 func (s *stubBot) CommentBioView() CommentBioView {
 	return CommentBioView{Enabled: true, TriggeredTotal: 11, FlashHitsTotal: 4, FlashCachedTotal: 2, FlashTTL: "30m0s"}
@@ -433,6 +433,10 @@ func TestStatuszJoinVerifyBlock(t *testing.T) {
 	}
 	if body["join_verify_skipped_total"] != float64(7) {
 		t.Errorf("join_verify_skipped_total = %v", body["join_verify_skipped_total"])
+	}
+	// amend14: the race-rescue probe (贴纸在到期处置落地前赶到).
+	if body["join_verify_late_pass_total"] != float64(5) {
+		t.Errorf("join_verify_late_pass_total = %v", body["join_verify_late_pass_total"])
 	}
 }
 

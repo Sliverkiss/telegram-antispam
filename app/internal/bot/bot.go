@@ -283,6 +283,18 @@ func (b *Bot) JoinVerifySkippedTotal() int64 {
 	return skipped
 }
 
+// JoinVerifyLatePassedTotal returns join_verify_late_pass_total (amend14):
+// stickers that arrived past the deadline but BEFORE the disposal chain
+// claimed the entry — the race rescue. The direct observability probe for
+// the reported "发了贴纸仍被踢" incident: nonzero on a fresh deploy means the
+// race window was being hit in production.
+func (b *Bot) JoinVerifyLatePassedTotal() int64 {
+	if b.joinVerify == nil {
+		return 0
+	}
+	return b.joinVerify.latePassed()
+}
+
 // Stats returns a snapshot for /statusz.
 func (b *Bot) Stats() (poll, punished, aiCalls, aiFails int64) {
 	return b.pollCount.Load(), b.punishCount.Load(), b.aiCalls.Load(), b.aiFails.Load()

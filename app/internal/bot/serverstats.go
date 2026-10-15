@@ -92,18 +92,20 @@ func (b *Bot) JoinRuleView() server.JoinRuleView {
 	return server.JoinRuleView{Enabled: enabled, Hits: hits}
 }
 
-// JoinVerifyView adapts the amend10/amend11 join-verification gauges into
-// the server's plain view: (BOT_JOIN_VERIFY, join_verify_pending,
-// join_verify_passed_total, join_verify_timeout_total,
-// join_verify_skipped_total).
+// JoinVerifyView adapts the amend10/amend11/amend14 join-verification
+// gauges into the server's plain view: (BOT_JOIN_VERIFY,
+// join_verify_pending, join_verify_passed_total,
+// join_verify_timeout_total, join_verify_skipped_total,
+// join_verify_late_pass_total).
 func (b *Bot) JoinVerifyView() server.JoinVerifyView {
 	enabled, pending, passed, timeouts := b.JoinVerifyStats()
 	return server.JoinVerifyView{
-		Enabled:      enabled,
-		Pending:      pending,
-		PassedTotal:  passed,
-		TimeoutTotal: timeouts,
-		SkippedTotal: b.JoinVerifySkippedTotal(),
+		Enabled:         enabled,
+		Pending:         pending,
+		PassedTotal:     passed,
+		TimeoutTotal:    timeouts,
+		SkippedTotal:    b.JoinVerifySkippedTotal(),
+		LatePassedTotal: b.JoinVerifyLatePassedTotal(),
 	}
 }
 

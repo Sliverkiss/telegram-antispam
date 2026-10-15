@@ -101,6 +101,13 @@ type joinVerifier struct {
 
 	mu      sync.Mutex
 	pending map[int64]*pendingVerify // uid → entry (one group at a time)
+	// expiring (amend14): entries whose deadline has crossed and whose
+	// disposal chain is IN FLIGHT. scanDeadlines moves them here instead of
+	// dropping them on the floor: until expireOne claims the entry, a sticker
+	// from the joiner still rescues them (join_verify_late_pass). This closes
+	// the amend14 race — a sticker landing between the scan tick and the
+	// ban used to be silently ignored ("发了贴纸仍被踢").
+	expiring map[int64]*pendingVerify // uid → entry (disposal in flight)
 	// woken pins the idempotent welcome: uid → the gate already got its
 	// final non-ad conclusion (welcome sent, refused, or skipped). Set the
 	// FIRST time onJoinVerdictNonAd fires for the user; every later round
@@ -120,6 +127,12 @@ type joinVerifier struct {
 	// stats (atomic, /statusz)
 	passedTotal  atomic.Int64
 	timeoutTotal atomic.Int64
+	// latePassedTotal counts the amend14 race rescues: stickers that arrived
+	// past the deadline but BEFORE the disposal chain took the entry
+	// (join_verify_late_pass_total on /statusz — the direct "发了贴纸仍被踢"
+	// observability probe; a post-deploy nonzero value there = the bug was
+	// live on the old build).
+	latePassedTotal atomic.Int64
 	// skippedTotal counts every timeout that did NOT dispose (gone /
 	// unable_to_verify) plus welcome-time skips (join_verify_skipped_total).
 	skippedTotal atomic.Int64
@@ -141,6 +154,7 @@ func newJoinVerifier(b *Bot, cfg joinVerifyConfig) *joinVerifier {
 		b:          b,
 		maxPending: max,
 		pending:    map[int64]*pendingVerify{},
+		expiring:   map[int64]*pendingVerify{},
 		woken:      map[int64]bool{},
 		stopped:    make(chan struct{}),
 	}
@@ -161,19 +175,33 @@ func (v *joinVerifier) setScanClock(f func() time.Time) { v.scanNow.Store(f) }
 
 // Stats returns the /statusz gauges: pending count, passed total, timeout
 // total, skipped total. Timeout counts real disposals only — dry-run and
-// skipped outcomes are excluded.
+// skipped outcomes are excluded. expiring entries still count into pending
+// (join_verify_pending is "awaiting a verdict": the disposal has NOT yet
+// landed, and a late sticker can still rescue them).
 func (v *joinVerifier) Stats() (pending, passed, timeouts, skipped int64) {
 	v.mu.Lock()
-	n := int64(len(v.pending))
+	n := int64(len(v.pending) + len(v.expiring))
 	v.mu.Unlock()
 	return n, v.passedTotal.Load(), v.timeoutTotal.Load(), v.skippedTotal.Load()
 }
 
-// isPending reports whether uid is awaiting verification.
+// latePassed returns join_verify_late_pass_total (amend14): stickers that
+// arrived past the deadline but before the disposal claimed the entry.
+func (v *joinVerifier) latePassed() int64 { return v.latePassedTotal.Load() }
+
+// isPending reports whether uid is awaiting verification — including entries
+// past their deadline whose disposal is still in flight (amend14: the
+// message-gate must keep holding the user's messages until the timeout
+// outcome actually lands, so a sticker in the race window is judged instead
+// of silently falling through).
 func (v *joinVerifier) isPending(uid int64) bool {
 	v.mu.Lock()
 	defer v.mu.Unlock()
 	_, ok := v.pending[uid]
+	if ok {
+		return true
+	}
+	_, ok = v.expiring[uid]
 	return ok
 }
 
@@ -223,6 +251,15 @@ func (v *joinVerifier) scanLoop() {
 // scanDeadlines disposes every entry past its deadline. It runs on the
 // ticker goroutine. The chain is local (never an AI round), so there is no
 // pool-parallelism to preserve and no handler to unblock.
+//
+// amend14: due entries move pending → expiring (NOT a hard delete). The
+// entries stay rescuable until expireOne claims them: a sticker that lands
+// in the window between this scan tick and the disposal chain's ban call
+// still passes (handleStickerMessage consults expiring too) — the old code
+// dropped the entry on the floor here, so the sticker hit
+// isPending()==false, fell through the ordinary flow (a sticker is not
+// judgeable → ignored), and the user was banned anyway: exactly the
+// observed "发了贴纸仍被踢".
 func (v *joinVerifier) scanDeadlines() {
 	now := v.now()
 	var due []*pendingVerify
@@ -232,6 +269,7 @@ func (v *joinVerifier) scanDeadlines() {
 			due = append(due, p)
 			delete(v.pending, uid)
 			delete(v.woken, uid)
+			v.expiring[uid] = p
 		}
 	}
 	v.mu.Unlock()
@@ -242,11 +280,47 @@ func (v *joinVerifier) scanDeadlines() {
 
 // expireOne runs the amend11 C timeout decision for one timed-out joiner:
 // re-check getChatMember first (notifications get lost — never trust only
-// chat_member), then dispose / clear-only accordingly. The entry is ALREADY
-// off the pending map when this runs (the deadline, not this function,
-// removed it) — every path below only cleans up the welcome message and the
-// counters.
+// chat_member), then dispose / clear-only accordingly. The entry moved to
+// the expiring map by scanDeadlines — every path below FIRST tries to claim
+// it back (claimExpiring; a late sticker may have rescued the joiner while
+// the getChatMember re-check was retrying), then only cleans up the welcome
+// message and the counters. A disposal API error (USER_NOT_PARTICIPANT /
+// not found / permission) is non-fatal: WARN + the entry still leaves the
+// expiring map (no retry storm, no crash).
 func (v *joinVerifier) expireOne(p *pendingVerify) {
+	if !v.claimExpiring(p) {
+		// Rescued between the scan tick and here (join_verify_late_pass in
+		// handleStickerMessage): the sticker already passed the joiner,
+		// deleted the welcome and cleared the maps. Do NOTHING — the ban
+		// must not fire.
+		v.b.Log.Info("join_verify_late_pass_ack",
+			"chat", p.chatID,
+			"uid", p.uid,
+			"summary", "到期处置前贴纸已通过：放弃本次处置（amend14 竞态修复）")
+		return
+	}
+	v.expireOneClaimed(p)
+}
+
+// claimExpiring atomically takes the entry out of the expiring map. It
+// returns false when the entry is already gone — i.e. a sticker passed it
+// after scanDeadlines marked it expiring but before expireOne got here (the
+// handleStickerMessage rescue deleted it from both maps). True means the
+// timeout outcome now owns the entry and may dispose.
+func (v *joinVerifier) claimExpiring(p *pendingVerify) bool {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	cur, ok := v.expiring[p.uid]
+	if !ok || cur != p {
+		return false
+	}
+	delete(v.expiring, p.uid)
+	return true
+}
+
+// expireOneClaimed is expireOne after the entry has been claimed for the
+// timeout outcome (no late sticker can rescue it from here on).
+func (v *joinVerifier) expireOneClaimed(p *pendingVerify) {
 	if v.b.Cfg.DryRun {
 		v.b.Log.Info("join_verify_dry_run",
 			"chat", p.chatID,
@@ -376,6 +450,15 @@ func (v *joinVerifier) register(ctx context.Context, chatID, uid int64, username
 	// welcome) is superseded — delete its welcome and re-register fresh.
 	if old, ok := v.pending[uid]; ok {
 		delete(v.pending, uid)
+		delete(v.expiring, uid) // amend14: a stale expiring twin must not linger
+		v.mu.Unlock()
+		v.deleteWelcome(old)
+	} else if old, ok := v.expiring[uid]; ok {
+		// Re-join while the OLD episode's disposal is in flight: the re-join
+		// proves the user is back, so the in-flight timeout outcome would
+		// ban a member who just re-joined. Drop the expiring entry (the
+		// claim in expireOne will fail → no ban) and re-register fresh.
+		delete(v.expiring, uid)
 		v.mu.Unlock()
 		v.deleteWelcome(old)
 	} else {
@@ -436,6 +519,16 @@ func joinVerifyLabel(username, firstName string) string {
 // when the message was CONSUMED by the verification (the caller must NOT
 // continue toward the AI screening) and false when the message is irrelevant
 // (no sticker, unknown uid, or cross-group).
+//
+// amend14: a pending entry AND an expiring entry both match. The expiring
+// case is the race rescue — the deadline scan already moved the joiner to
+// expiring but expireOne has not claimed them yet (the getChatMember
+// re-check retries 2×1s, and the delete+ban round-trips follow: a multi-
+// second window per joiner). A sticker arriving in that window PASSES: the
+// entry leaves both maps, so claimExpiring in expireOne returns false and
+// the ban never fires. The rescue is counted in latePassedTotal
+// (join_verify_late_pass_total) — the direct probe for the reported
+// "发了贴纸仍被踢" incident.
 func (v *joinVerifier) handleStickerMessage(m telegram.Message) bool {
 	if m.Sticker == nil {
 		return false
@@ -446,14 +539,18 @@ func (v *joinVerifier) handleStickerMessage(m telegram.Message) bool {
 	uid := m.From.ID
 	v.mu.Lock()
 	p, ok := v.pending[uid]
+	if !ok {
+		p, ok = v.expiring[uid]
+	}
 	if ok && p.chatID != m.Chat.ID {
-		// Cross-group sticker: does NOT verify (chatID guard). The pending
-		// entry stays; the message is not consumed.
+		// Cross-group sticker: does NOT verify (chatID guard). The pending/
+		// expiring entry stays; the message is not consumed.
 		v.mu.Unlock()
 		return false
 	}
 	if ok {
 		delete(v.pending, uid)
+		delete(v.expiring, uid)
 		delete(v.woken, uid)
 	}
 	v.mu.Unlock()
@@ -461,10 +558,19 @@ func (v *joinVerifier) handleStickerMessage(m telegram.Message) bool {
 		return false
 	}
 	v.passedTotal.Add(1)
-	v.b.Log.Info("join_verify_passed",
-		"chat", p.chatID,
-		"uid", uid,
-		"ms", v.now().Sub(p.registeredAt).Milliseconds())
+	if p.deadline.Before(v.now()) {
+		v.latePassedTotal.Add(1)
+		v.b.Log.Info("join_verify_late_pass",
+			"chat", p.chatID,
+			"uid", uid,
+			"deadline", p.deadline.Format(time.RFC3339),
+			"summary", "贴纸在到期处置落地前赶到：按通过处理，绝不处置（amend14）")
+	} else {
+		v.b.Log.Info("join_verify_passed",
+			"chat", p.chatID,
+			"uid", uid,
+			"ms", v.now().Sub(p.registeredAt).Milliseconds())
+	}
 	v.deleteWelcome(p)
 	return true
 }
@@ -477,10 +583,21 @@ func (v *joinVerifier) clearOnLeft(uid int64) {
 	v.mu.Lock()
 	p, ok := v.pending[uid]
 	if !ok {
-		v.mu.Unlock()
-		return
+		// amend14: also clear an expiring twin — the user left/got removed
+		// while OUR timeout chain was walking. Dropping it here fails the
+		// expireOne claim, so the in-flight disposal stops short of the ban
+		// (the 300s deadline must never ban someone who is already out; the
+		// 零处置 principle wins over the already-started chain).
+		p, ok = v.expiring[uid]
+		if !ok {
+			v.mu.Unlock()
+			return
+		}
+		delete(v.expiring, uid)
+	} else {
+		delete(v.pending, uid)
+		delete(v.expiring, uid)
 	}
-	delete(v.pending, uid)
 	delete(v.woken, uid)
 	v.mu.Unlock()
 	v.b.Log.Info("join_verify_cleared",
@@ -503,10 +620,20 @@ func (v *joinVerifier) clearDisposedUid(uid int64) {
 	v.mu.Lock()
 	p, ok := v.pending[uid]
 	if !ok {
-		v.mu.Unlock()
-		return
+		// amend14: also clear an expiring twin — OUR OWN chain just disposed
+		// the user (e.g. the join-bio verdict concluded ad after the deadline
+		// scan had already marked them expiring). Dropping it here fails the
+		// expireOne claim → no double disposal from the timeout chain.
+		p, ok = v.expiring[uid]
+		if !ok {
+			v.mu.Unlock()
+			return
+		}
+		delete(v.expiring, uid)
+	} else {
+		delete(v.pending, uid)
+		delete(v.expiring, uid)
 	}
-	delete(v.pending, uid)
 	delete(v.woken, uid)
 	v.mu.Unlock()
 	v.b.Log.Info("join_verify_cleared",

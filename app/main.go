@@ -140,8 +140,16 @@ func main() {
 	// BOT_UPDATE_WORKERS (default 16, clamped 1..128) replaces the library's
 	// single update worker — without it ONE slow handler parks the whole
 	// update stream (measured: a 66s AI chain blocked every other update).
+	// AllowedUpdates (amend14): go-telegram/bot only sends allowed_updates
+	// when configured, and the Bot API DEFAULT (field omitted / empty list)
+	// EXCLUDES chat_member — so the amend11 B.1 leave-cleanup (清 pending +
+	// 删欢迎 + 零处置 when anyone removes a pending joiner) never fired in
+	// production. my_chat_member is in the default set but is listed
+	// explicitly so the contract doesn't depend on the API default. The
+	// explicit list keeps the previous message/edited_message delivery intact.
 	tg, err := telegram.NewClientWithOptions(cfg.Token, telegram.Options{
-		UpdateWorkers: cfg.UpdateWorkers,
+		UpdateWorkers:  cfg.UpdateWorkers,
+		AllowedUpdates: telegram.RequiredUpdates(),
 	})
 	if err != nil {
 		log.Error("telegram_init_error", "err", err.Error())

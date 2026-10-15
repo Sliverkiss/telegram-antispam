@@ -70,14 +70,17 @@ type JoinRuleView struct {
 	Hits    int64
 }
 
-// JoinVerifyView is the amend10/amend11 join-verification gauges the server
-// renders (plain data so server does not import bot).
+// JoinVerifyView is the amend10/amend11/amend14 join-verification gauges the
+// server renders (plain data so server does not import bot).
 type JoinVerifyView struct {
 	Enabled      bool
 	Pending      int64
 	PassedTotal  int64
 	TimeoutTotal int64
 	SkippedTotal int64
+	// LatePassedTotal is join_verify_late_pass_total (amend14): stickers
+	// rescued from the expiry-disposal race window.
+	LatePassedTotal int64
 }
 
 // CommentBioView is the amend12 channel-post comment bio screen gauges the
@@ -342,6 +345,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	body["join_verify_passed_total"] = jvv.PassedTotal
 	body["join_verify_timeout_total"] = jvv.TimeoutTotal
 	body["join_verify_skipped_total"] = jvv.SkippedTotal
+	body["join_verify_late_pass_total"] = jvv.LatePassedTotal
 
 	// amend12: channel-post comment bio screen gauges.
 	cbv := s.Bot.CommentBioView()

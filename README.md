@@ -195,7 +195,7 @@ go run . -prompteval -prompteval.models=mimo-v2.6-pro
 | 公告 | `BOT_ANNOUNCE_KICK` | `true` | 处置成功后在群内发 AI 生成的可爱送客短公告（异步不阻塞处置链；AI 失败走本地模板池；发送后按 `BOT_MSG_TTL` 自动删除） |
 | | `BOT_ANNOUNCE_TIMEOUT` | `8s` | 公告生成独立短超时（clamp 1s~20s，不重试） |
 | 裸号 | `BOT_JOIN_NAKED_PREMIUM` | `true` | 入群「裸号」必杀：Premium 会员 + 英文名 + 无简介 + 无头像，四条件 AND 全中直接处置（不经 AI；`is_premium` 入群时补一次 `getChatMember` 再核） |
-| 入群验证 | `BOT_JOIN_VERIFY` | `true` | 300 秒贴纸门，**顺序：过了简介判定（结论非广告）才发欢迎**。判为广告 → 直接处置，**不发欢迎、不登记验证**；判定失败 → 走重试队列（重试期间**不欢迎、不登记**），等最终结论（含本地规则兜底）落地：非广告才欢迎+起倒计时 / 广告则处置。无简介者直接欢迎+起倒计时。须在时限内发**贴纸**（只认 `message.sticker`；纯 emoji 文本/文字/图片一律不算，**无放宽开关**）才恢复原流程；期间该用户消息**绝不送 AI**；**到期处置前二次 `getChatMember` 确认**：人已不在 → 只清理不处置，被限制发言 → 只清理不处置，查询失败重试 2 次后仍处置；我们自己处置过或别人踢的 → 立即撒手、**绝不二次处置**。pending 只存内存，重启丢失 |
+| 入群验证 | `BOT_JOIN_VERIFY` | `true` | 300 秒贴纸门，**顺序：过了简介判定（结论非广告）才发欢迎**。判为广告 → 直接处置，**不发欢迎、不登记验证**；判定失败 → 走重试队列（重试期间**不欢迎、不登记**），等最终结论（含本地规则兜底）落地：非广告才欢迎+起倒计时 / 广告则处置。无简介者直接欢迎+起倒计时。须在时限内发**贴纸**（只认 `message.sticker`；纯 emoji 文本/文字/图片一律不算，**无放宽开关**）才恢复原流程；期间该用户消息**绝不送 AI**（**每条消息**都过贴纸判定，不是只看第一条）；**到期处置前二次 `getChatMember` 确认**：人已不在 → 只清理不处置，被限制发言 → 只清理不处置，查询失败重试 2 次后仍处置；我们自己处置过或别人踢的 → 立即撒手、**绝不二次处置**。amend14：**贴纸在到期扫描之后、处置落地之前赶到 → 仍算通过**（`join_verify_late_pass`），处置落地后才到的贴纸不再翻案。pending 只存内存，重启丢失 |
 | | `BOT_JOIN_VERIFY_TIMEOUT` | `300s` | 验证时限（clamp 1s~24h） |
 | | `BOT_JOIN_VERIFY_SCAN` | `5s` | 超时扫描间隔（单 ticker 随进程关闭；clamp 100ms~1m） |
 | | `BOT_JOIN_VERIFY_ACTION` | `ban` | 超时处置：`ban`（默认，**真封禁**）/ `kick` |
@@ -224,7 +224,9 @@ go run . -prompteval -prompteval.models=mimo-v2.6-pro
   `msg_ttl_scheduled_total`、`msg_ttl_deleted_total`、`msg_ttl_error_total`，
   amend9 项：`join_rule_enabled` / `join_rule_hits_total`，amend10 项：
   `join_verify_enabled` / `join_verify_pending` / `join_verify_passed_total` /
-  `join_verify_timeout_total`，amend12 项：`comment_bio_screen_enabled` /
+  `join_verify_timeout_total` / `join_verify_skipped_total` /
+  `join_verify_late_pass_total`（amend14 竞态救援计数：贴纸在到期处置
+  落地前赶到），amend12 项：`comment_bio_screen_enabled` /
   `comment_bio_triggered_total` / `comment_bio_flash_hits_total` /
   `comment_bio_flash_cached` / `comment_bio_flash_ttl`
 - `/admin/signatures` → 需要 `BOT_ADMIN_TOKEN`（`Authorization: Bearer`），
@@ -308,7 +310,9 @@ cd app && go build ./... && go vet ./... && go test ./... -race -count=1
 
 - 把 Bot 加进目标群并设为**管理员**，务必勾选 **删除消息（Delete messages）** 权限，
   否则无法删除他人消息；`banChatMember` 也要求 Bot 有管理员身份。
-- 轮询由库 `WithAllowedUpdates`（`message` + `chat_member` + `my_chat_member`）驱动。
+- 轮询由库 `WithAllowedUpdates`（`message` + `edited_message` + `chat_member`
+  + `my_chat_member`，amend14 起显式订阅——Bot API 缺省不含 `chat_member`，
+  不配置则被他人踢/自己退的清理逻辑永远收不到通知）驱动。
 
 ## 已知限制
 

@@ -353,6 +353,26 @@ type Options struct {
 	ErrorsHandler  func(error)
 }
 
+// RequiredUpdates is the amend14 explicit allowed_updates list: the four
+// update types this bot actually handles. getUpdates sends allowed_updates
+// ONLY when non-nil; go-telegram/bot leaves it nil unless WithAllowedUpdates
+// is configured, and the Bot API's field-omitted (or empty-list) default
+// EXCLUDES chat_member, message_reaction and message_reaction_count.
+// So in production chat_member never arrived and the amend11 B.1
+// leave-cleanup (clearOnLeft: 别人踢/自己退 → 清 pending + 删欢迎 + 零处置)
+// could never fire. my_chat_member IS part of the default set (the foreign-chat
+// auto-leave did work), and it is listed here explicitly so the contract does
+// not depend on the API's default set changing. message / edited_message stay
+// first so plain-message delivery is byte-identical to the previous default.
+func RequiredUpdates() []string {
+	return []string{
+		"message",
+		"edited_message",
+		"chat_member",
+		"my_chat_member",
+	}
+}
+
 // NewClient builds a client for the given token using default opts (real
 // api.telegram.org endpoint, getMe checked at init). The library default of a
 // single update worker stays in effect here; main passes BOT_UPDATE_WORKERS
