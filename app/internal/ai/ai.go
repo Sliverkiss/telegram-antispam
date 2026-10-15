@@ -42,11 +42,20 @@ import (
 )
 
 // PromptVersion identifies the embedded prompt revision. Bump it whenever
-// prompts/judge_v2.txt changes so misjudgments can be traced to a prompt
+// prompts/judge_v3.txt changes so misjudgments can be traced to a prompt
 // version in the logs and /status.
-const PromptVersion = "judge_v2"
+//
+// v3 (the bio-resolve round): the defining inversion the user demanded — the
+// ONLY conviction path is the category hit (灰黑产/擦边品类清单 + 群发商业广
+// 告), 引流动作 downgraded from a stand-alone judgment-b) crime to a
+// corroborating clue, and the single pass-listed exemption is the
+// personal-use account annotation ("私聊机器人：@xxx_bot 个人频道：@xxx" /
+// "我推: @x 京东车: @y_bot" — personal pointers pass; everything that runs a
+// business / recruits / trades / is grey-industry dies). The prompt's own
+// examples reproduce the user's five ground-truth rows verbatim.
+const PromptVersion = "judge_v3"
 
-//go:embed prompts/judge_v2.txt
+//go:embed prompts/judge_v3.txt
 var promptJudge string
 
 //go:embed prompts/judge_v1_bio.txt

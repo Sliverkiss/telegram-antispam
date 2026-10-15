@@ -21,14 +21,18 @@ import (
 // Item is one pending judgment: a message, or a join (bio), with everything
 // the retry round needs.
 type Item struct {
-	Key         string // dedup key ("chat:msg" / "join:uid")
-	Kind        string // "message" | "join"
-	ChatID      int64
-	MessageID   int64 // triggering message to delete (0 for join/bio)
-	UID         int64
-	Username    string // notification identity (amend4 👤 line)
-	FirstName   string
-	Text        string
+	Key       string // dedup key ("chat:msg" / "join:uid")
+	Kind      string // "message" | "join"
+	ChatID    int64
+	MessageID int64 // triggering message to delete (0 for join/bio)
+	UID       int64
+	Username  string // notification identity (amend4 👤 line)
+	FirstName string
+	Text      string
+	// SigText is the bio lanes' ORIGINAL bio (the signature/flash/notice
+	// text) when bio-resolve enriched Text with 【相关简介】 blocks; empty =
+	// use Text (message lane). bio-resolve round.
+	SigText     string
 	Mode        string // ai prompt mode: "message" or "bio"
 	ImageURL    string // data URL when the message carried a judged image
 	Attempts    int    // retry rounds already consumed (round 1 = the initial call)

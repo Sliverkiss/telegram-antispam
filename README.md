@@ -124,10 +124,22 @@
 
 ## 提示词工程
 
-- 提示词是独立文件 `app/internal/ai/prompts/judge_v2.txt`（+ `judge_v1_bio.txt` 简介
+- 提示词是独立文件 `app/internal/ai/prompts/judge_v3.txt`（+ `judge_v1_bio.txt` 简介
   追加段），go:embed 编译进二进制；`BOT_AI_PROMPT_FILE` 可用磁盘文件覆盖（调优不发版）。
-- 版本号 `PromptVersion=judge_v2` 打进**每次判定日志**与 `/status`、`/statusz`。
-- 只写「必杀特征清单」不写反例（防模型学到 false 范式）；输出契约严格 JSON
+- 版本号 `PromptVersion=judge_v3` 打进**每次判定日志**与 `/status`、`/statusz`。
+- v3 判据（bio-resolve 轮重写）：**唯一定罪标准是品类命中**——不定义"什么是正常"去
+  放行，而是锁定"不放过"的清单（色情/儿童/擦边、赌博、诈骗黑产话术含接单收钱跑分、
+  违禁品、办证、招人收钱话术、暗语变形、**群发商业广告**：拉群/卖货/二手撮合）。
+  引流动作（@/联系方式/链接）降级为佐证而非罪名——普通人也会留联系方式。
+  唯一放行豁免是**个人自用账号标注**（"私聊机器人：@xxx_bot 个人频道：@xxx"、
+  "我推: @x 京东车: @y_bot" 这类身份指路）。提示词内嵌需求方 5 条真值作为示例。
+- **简介 @ 解析（bio-resolve）**：简介带 @ 送审前，先抓每个 @ 对应 t.me 目标的
+  简介（用户 bio / 频道 description，getChat by username），以【相关简介】块附在
+  送审文本后一并判定——@ 指向灰黑产频道则引用者同罪，指向个人自用则放行。
+  解析失败按原简介判定（不重试）；签名库/防刷/通知证据仍用**原始简介**。
+  `BOT_BIO_RESOLVE` 开关（默认开）、`_MAX`（默认 3 个 @）、`_TIMEOUT`（默认 10s）。
+  送审触发门限（是否有 @/链接）**不变**——本轮只改 AI 判据。
+- 只写「不放过清单」不写反例范式（防模型学到 false 范式）；输出契约严格 JSON
   （`is_ad`/`category`/`confidence`/`reason`）；解析宽容但契约违例=失败走重试。
 - `category` 使用受控词表（办证｜色情｜儿童性内容｜赌博｜诈骗｜金融｜兼职｜引流｜违禁品｜
   账号交易｜其他），但解析**从不**枚举校验（输出漂移不丢判定）。
@@ -204,6 +216,9 @@ go run . -prompteval -prompteval.models=mimo-v2.6-pro
 | 评论简介 | `BOT_COMMENT_BIO_SCREEN` | `true` | amend12：群里回复**关联频道帖子**（reply 目标 `is_automatic_forward=true`）的消息触发评论者简介检查——简介带链接或 `@` → 送 AI 审简介（`mode=bio` 复用入群提示词）；判广告 → 标准处置链（punish + 通知频道 + 群内公告 + 写 bio 签名库）；判非广告 → 零处置、不消费观察名额；简介空/无链接无 `@`/非评论消息 → 原流程零变化 |
 | | `BOT_COMMENT_BIO_FLASH_TTL` | `30m` | **防刷窗口**（不是限流）：审核未过（判广告）的简介进缓存；窗口内遇到**重复**（normalized sha1 精确匹配）简介的直接踢、**零 AI 调用**；窗口过期重新送审（clamp：0=不自动过期 或 ≤24h） |
 | | `BOT_COMMENT_BIO_FLASH_MAX` | `5000` | 防刷缓存容量；超限最旧淘汰。只存内存，重启丢失 |
+| 简介@解析 | `BOT_BIO_RESOLVE` | `true` | 简介带 @ 送审前抓取 @ 目标（t.me）的简介，以【相关简介】块附判——@ 指向灰黑产频道则同罪，个人自用标注则放行；解析失败按原简介判定；签名/防刷/通知证据仍用原始简介；送审触发门限不变 |
+| | `BOT_BIO_RESOLVE_MAX` | `3` | 每条简介最多解析的 @ 数；超出跳过并 WARN（clamp ≥1） |
+| | `BOT_BIO_RESOLVE_TIMEOUT` | `10s` | 整组 @ 查询总时限；`0` = 不设独立上限 |
 | | `BOT_LOG_LEVEL` / `BOT_LOG_FORMAT` | `info` / `text` | 日志 |
 | | `BOT_ADMIN_TOKEN` | 空 | 非空开放 `/admin/*` |
 | | `BOT_VERSION` | `dev` | 构建注入 |
@@ -228,7 +243,9 @@ go run . -prompteval -prompteval.models=mimo-v2.6-pro
   `join_verify_late_pass_total`（amend14 竞态救援计数：贴纸在到期处置
   落地前赶到），amend12 项：`comment_bio_screen_enabled` /
   `comment_bio_triggered_total` / `comment_bio_flash_hits_total` /
-  `comment_bio_flash_cached` / `comment_bio_flash_ttl`
+  `comment_bio_flash_cached` / `comment_bio_flash_ttl`，
+  bio-resolve 项：`bio_resolve_enabled` / `bio_resolve_max` /
+  `bio_resolve_timeout`
 - `/admin/signatures` → 需要 `BOT_ADMIN_TOKEN`（`Authorization: Bearer`），
   `GET`/`POST`/`DELETE` 维护 bio/msg 签名库
 

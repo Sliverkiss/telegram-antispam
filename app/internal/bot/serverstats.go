@@ -130,3 +130,16 @@ func (b *Bot) Amend13View() server.Amend13View {
 	floor, releases := b.Amend13Stats()
 	return server.Amend13View{MinPunishScore: floor, BelowScoreReleasesTotal: releases}
 }
+
+// BioResolveView adapts the bio-resolve config into the server's plain view
+// (bio_resolve_enabled / bio_resolve_max / bio_resolve_timeout). SeamLive
+// reports whether the resolver seam is actually wired (nil seam → lookups
+// never happen even with the flag on).
+func (b *Bot) BioResolveView() server.BioResolveView {
+	return server.BioResolveView{
+		Enabled:  b.Cfg.BioResolve,
+		Max:      b.Cfg.BioResolveMax,
+		Timeout:  b.Cfg.BioResolveTimeout.String(),
+		SeamLive: b.BioTarget != nil,
+	}
+}

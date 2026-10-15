@@ -127,6 +127,13 @@ type Bot struct {
 	// exist for /statusz.
 	commentFlash *commentBioFlash
 
+	// BioTarget (bio-resolve round) resolves a @handle from someone's bio to
+	// the target's own bio/description (getChat by username). It is the
+	// injectable seam: the real telegram client in production (wired in main
+	// alongside the TG client), a fake in tests (零真实网络). nil or
+	// BOT_BIO_RESOLVE=false → bio-resolve is off and bios are judged as-is.
+	BioTarget BioResolver
+
 	startedAt time.Time
 
 	// Stats (atomic for /statusz while the poll loop is running).
@@ -630,7 +637,9 @@ func (b *Bot) screenNewMember(ctx context.Context, chatID int64, u telegram.User
 // submitJoinBio sends the join-bio AI judgment (bio mode) when the bio is
 // non-empty. The verifier is NOT consulted here — the welcome waits for the
 // final non-ad conclusion (onJoinVerdictNonAd, fired by finishJudgment /
-// localFallback).
+// localFallback). bio-resolve (用户原话"简介有@的…提取对应简介喂给bot") enriches
+// the judged text with the @ targets' own bios as 【相关简介】 blocks before
+// submission; the signature/flash/notice text stays the original bio (sigText).
 func (b *Bot) submitJoinBio(ctx context.Context, chatID, joinMsgID int64, u telegram.User, bio string) {
 	if strings.TrimSpace(bio) == "" {
 		return
@@ -643,7 +652,8 @@ func (b *Bot) submitJoinBio(ctx context.Context, chatID, joinMsgID int64, u tele
 		uid:        u.ID,
 		username:   u.Username,
 		firstName:  u.FirstName,
-		text:       bio,
+		text:       b.resolveBioText(ctx, bio),
+		sigText:    bio,
 		mode:       "bio",
 		punish:     true,
 		writeBio:   true,
@@ -873,9 +883,15 @@ type judgmentInput struct {
 	messageID int64 // the triggering message to delete
 	uid       int64
 	// username/firstName feed the 👤 line of the disposition notice.
-	username     string
-	firstName    string
-	text         string
+	username  string
+	firstName string
+	text      string
+	// sigText is the SIGNATURE evidence text: the original bio for the bio
+	// lanes (bio-resolve enriches in.text with 【相关简介】 blocks for the AI,
+	// but the signature library / 防刷 key / notice evidence must stay keyed
+	// on what the user actually wrote — a resolved target's bio changing must
+	// never corrupt our signature library). Empty = use in.text (message lane).
+	sigText      string
 	imageFileID  string // when set, the image is downloaded and judged multimodally
 	fileUniqueID string
 	mode         string // prompt mode: message | bio
@@ -886,6 +902,16 @@ type judgmentInput struct {
 	// enqueuedAt stamps the submitJudge handoff (judge_dequeued wait_ms).
 	// zero on the legacy/retry paths — judgepool treats zero as "now".
 	enqueuedAt time.Time
+}
+
+// signatureText returns the text the signature library / flash cache /
+// disposition notice must use: the ORIGINAL bio for bio lanes, the judged
+// text for the message lane.
+func (in judgmentInput) signatureText() string {
+	if in.sigText != "" {
+		return in.sigText
+	}
+	return in.text
 }
 
 func msgKey(chatID, messageID int64) string {
@@ -1160,7 +1186,7 @@ func (b *Bot) commitAd(ctx context.Context, in judgmentInput, verdict ai.Verdict
 	}
 	category := verdict.ControlledCategory()
 	if in.kind == "comment" {
-		b.commentBioFlashStore(in.text, category)
+		b.commentBioFlashStore(in.signatureText(), category)
 	}
 	b.punishAndClear(ctx, punishInfo{
 		chatID:    in.chatID,
@@ -1168,7 +1194,7 @@ func (b *Bot) commitAd(ctx context.Context, in judgmentInput, verdict ai.Verdict
 		username:  in.username,
 		firstName: in.firstName,
 		msgID:     in.messageID,
-		text:      in.text,
+		text:      in.signatureText(),
 		writeSig:  in.writeMsg || in.writeBio,
 		bioKind:   in.kind == "join" || in.kind == "comment",
 	}, b.Cfg.Action, category, verdict.Reason,
@@ -1200,6 +1226,7 @@ func (b *Bot) enqueueRetry(in judgmentInput, reason string) {
 		Username:  in.username,
 		FirstName: in.firstName,
 		Text:      in.text,
+		SigText:   in.sigText,
 		Mode:      in.mode,
 		Attempts:  0,
 		Reason:    reason,
@@ -1219,10 +1246,11 @@ func (b *Bot) RetryRound(ctx context.Context, it retryq.Item) (bool, string) {
 		username:  it.Username,
 		firstName: it.FirstName,
 		text:      it.Text,
+		sigText:   it.SigText,
 		mode:      it.Mode,
 		punish:    true,
 		writeMsg:  it.Kind == "message",
-		writeBio:  it.Kind == "join",
+		writeBio:  it.Kind == "join" || it.Kind == "comment",
 		retries:   it.Attempts,
 	}
 	verdict, model, ok, _ := b.runAI(ctx, in)
@@ -1304,7 +1332,7 @@ func (b *Bot) localFallback(ctx context.Context, in judgmentInput, lastErr strin
 		if in.kind == "comment" {
 			// amend12: a condemned comment bio concluded by the local-rule
 			// fallback enters the 防刷 cache too (every ad conclusion does).
-			b.commentBioFlashStore(in.text, "其他")
+			b.commentBioFlashStore(in.signatureText(), "其他")
 		}
 		b.punishAndClear(ctx, punishInfo{
 			chatID:    in.chatID,
@@ -1312,7 +1340,7 @@ func (b *Bot) localFallback(ctx context.Context, in judgmentInput, lastErr strin
 			username:  in.username,
 			firstName: in.firstName,
 			msgID:     in.messageID,
-			text:      in.text,
+			text:      in.signatureText(),
 			writeSig:  in.writeMsg || in.writeBio,
 			bioKind:   in.kind == "join" || in.kind == "comment",
 		}, b.Cfg.Action, "其他", "本地规则兜底命中",

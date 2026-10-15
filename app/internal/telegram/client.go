@@ -165,6 +165,10 @@ type ChatInfo struct {
 	LastName  string
 	Username  string
 	Bio       string
+	// Description is the chat/channel description (the channel's "bio"):
+	// getChat exposes it for channel/supergroup targets — the bio-resolve
+	// round reads it when a @handle resolves to a channel. Empty for users.
+	Description string
 	// HasPhoto is getChat's photo being non-empty (amend9; the profile-photo
 	// leg of the join rule — preferred over getUserProfilePhotos because it
 	// rides the bio call we already make).
@@ -487,7 +491,27 @@ func (c *Client) GetChat(ctx context.Context, chatID int64) (ChatInfo, error) {
 	if info == nil {
 		return ChatInfo{}, nil
 	}
-	return ChatInfo{ID: info.ID, FirstName: info.FirstName, LastName: info.LastName, Username: info.Username, Bio: info.Bio, HasPhoto: info.Photo != nil}, nil
+	return ChatInfo{ID: info.ID, FirstName: info.FirstName, LastName: info.LastName, Username: info.Username, Bio: info.Bio, Description: info.Description, HasPhoto: info.Photo != nil}, nil
+}
+
+// GetChatByUsername resolves a @handle (or bare username) to its ChatInfo via
+// getChat — the Bot API accepts "@username" as chat_id. The bio-resolve round
+// uses this to read the bio/description of a t.me target referenced from
+// someone's bio (用户原话：提取链接对应东西的简介喂给 bot 判断). A user target
+// carries Bio; a channel/supergroup target carries Description.
+func (c *Client) GetChatByUsername(ctx context.Context, username string) (ChatInfo, error) {
+	handle := strings.TrimPrefix(strings.TrimSpace(username), "@")
+	if handle == "" {
+		return ChatInfo{}, &APIError{Code: 400, Description: "empty username", Method: "getChat"}
+	}
+	info, err := c.b.GetChat(ctx, &tgbot.GetChatParams{ChatID: "@" + handle})
+	if err != nil {
+		return ChatInfo{}, c.toAPIError("getChat", err)
+	}
+	if info == nil {
+		return ChatInfo{}, nil
+	}
+	return ChatInfo{ID: info.ID, FirstName: info.FirstName, LastName: info.LastName, Username: info.Username, Bio: info.Bio, Description: info.Description, HasPhoto: info.Photo != nil}, nil
 }
 
 // GetChatMember returns the member state of userID in chatID.

@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"adbot/internal/ai"
 	"adbot/internal/config"
 	"adbot/internal/logx"
 	"adbot/internal/store"
@@ -67,6 +68,9 @@ func (s *stubBot) CommentBioView() CommentBioView {
 }
 func (s *stubBot) Amend13View() Amend13View {
 	return Amend13View{MinPunishScore: 85, BelowScoreReleasesTotal: 6}
+}
+func (s *stubBot) BioResolveView() BioResolveView {
+	return BioResolveView{Enabled: true, Max: 3, Timeout: "10s", SeamLive: true}
 }
 
 // fakeSweep reports a fixed (already-run) sweep for /statusz rendering.
@@ -159,8 +163,8 @@ func TestStatuszAmend3Fields(t *testing.T) {
 	defer resp.Body.Close()
 	var body map[string]any
 	json.NewDecoder(resp.Body).Decode(&body)
-	if body["prompt_version"] != "judge_v2" {
-		t.Errorf("prompt_version = %v", body["prompt_version"])
+	if ai.PromptVersion != "judge_v3" || body["prompt_version"] != ai.PromptVersion {
+		t.Errorf("prompt_version = %v (PromptVersion %q)", body["prompt_version"], ai.PromptVersion)
 	}
 	if body["ai_fallbacks"] != float64(2) {
 		t.Errorf("ai_fallbacks = %v", body["ai_fallbacks"])
@@ -453,5 +457,25 @@ func TestStatuszAmend13Block(t *testing.T) {
 	}
 	if body["ai_below_score_releases_total"] != float64(6) {
 		t.Errorf("ai_below_score_releases_total = %v", body["ai_below_score_releases_total"])
+	}
+}
+
+// TestStatuszBioResolveBlock pins the bio-resolve round's /statusz gauges:
+// bio_resolve_enabled (flag AND wired seam), bio_resolve_max,
+// bio_resolve_timeout.
+func TestStatuszBioResolveBlock(t *testing.T) {
+	_, ts := newTestServer(t, "")
+	resp := get(t, ts.URL+"/statusz")
+	defer resp.Body.Close()
+	var body map[string]any
+	json.NewDecoder(resp.Body).Decode(&body)
+	if body["bio_resolve_enabled"] != true {
+		t.Errorf("bio_resolve_enabled = %v (stub: enabled && seam live)", body["bio_resolve_enabled"])
+	}
+	if body["bio_resolve_max"] != float64(3) {
+		t.Errorf("bio_resolve_max = %v", body["bio_resolve_max"])
+	}
+	if body["bio_resolve_timeout"] != "10s" {
+		t.Errorf("bio_resolve_timeout = %v", body["bio_resolve_timeout"])
 	}
 }

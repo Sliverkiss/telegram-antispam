@@ -706,3 +706,57 @@ func TestMinPunishScoreDefault(t *testing.T) {
 		t.Errorf("explicit 0 = floor off, got %d", c.MinPunishScore)
 	}
 }
+
+// TestBioResolveDefaults (bio-resolve round): BOT_BIO_RESOLVE defaults true,
+// max 3, timeout 10s; a runaway max clamps back to 3; Redacted carries all
+// three names.
+func TestBioResolveDefaults(t *testing.T) {
+	clearBOT(t)
+	c := Load()
+	if !c.BioResolve {
+		t.Error("BioResolve default should be true")
+	}
+	if c.BioResolveMax != 3 {
+		t.Errorf("BioResolveMax = %d, want 3", c.BioResolveMax)
+	}
+	if c.BioResolveTimeout != 10*time.Second {
+		t.Errorf("BioResolveTimeout = %s, want 10s", c.BioResolveTimeout)
+	}
+	r := c.Redacted()
+	for _, k := range []string{"BOT_BIO_RESOLVE", "BOT_BIO_RESOLVE_MAX", "BOT_BIO_RESOLVE_TIMEOUT"} {
+		if _, ok := r[k]; !ok {
+			t.Errorf("Redacted missing %s", k)
+		}
+	}
+}
+
+// TestBioResolveEnvOverrides: disable + verbatim overrides + clamp.
+func TestBioResolveEnvOverrides(t *testing.T) {
+	clearBOT(t)
+	t.Setenv("BOT_BIO_RESOLVE", "false")
+	t.Setenv("BOT_BIO_RESOLVE_MAX", "0") // invalid → 3
+	t.Setenv("BOT_BIO_RESOLVE_TIMEOUT", "5s")
+	c := Load()
+	if c.BioResolve {
+		t.Error("BOT_BIO_RESOLVE=false must disable")
+	}
+	if c.BioResolveMax != 3 {
+		t.Errorf("clamped max = %d, want 3", c.BioResolveMax)
+	}
+	if c.BioResolveTimeout != 5*time.Second {
+		t.Errorf("timeout = %s, want 5s", c.BioResolveTimeout)
+	}
+	// Verbatim overrides.
+	t.Setenv("BOT_BIO_RESOLVE", "true")
+	t.Setenv("BOT_BIO_RESOLVE_MAX", "5")
+	t.Setenv("BOT_BIO_RESOLVE_TIMEOUT", "30s")
+	c = Load()
+	if !c.BioResolve || c.BioResolveMax != 5 || c.BioResolveTimeout != 30*time.Second {
+		t.Fatalf("verbatim overrides: %+v", c)
+	}
+	// 0 timeout = no dedicated fan bound (legal, like CommentBioFlashTTL).
+	t.Setenv("BOT_BIO_RESOLVE_TIMEOUT", "0")
+	if c = Load(); c.BioResolveTimeout != 0 {
+		t.Errorf("zero timeout = %s, want 0", c.BioResolveTimeout)
+	}
+}

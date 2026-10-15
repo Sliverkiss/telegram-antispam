@@ -244,13 +244,17 @@ func (p *judgePool) runKey(key string) {
 		}
 		in := q[0]
 		p.queues[key] = q[1:]
+		// Dequeue accounting (queued-- and inflight++) is one atomic step
+		// under p.mu: the admission bound reads queued+inflight, and a
+		// window where BOTH counters have stepped down (dequeued, not yet
+		// inflight) let one extra submission past the cap under race.
+		p.queued.Add(-1)
+		p.inflight.Add(1)
 		p.mu.Unlock()
 
-		p.queued.Add(-1)
 		waitMS := time.Since(in.enqueuedAt).Milliseconds()
 		p.b.Log.Info("judge_dequeued",
 			"key", key, "kind", in.kind, "uid", in.uid, "wait_ms", waitMS)
-		p.inflight.Add(1)
 		p.runBounded(in)
 		p.inflight.Add(-1)
 	}

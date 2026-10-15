@@ -539,3 +539,49 @@ func TestAutomaticForwardItselfMaps(t *testing.T) {
 		t.Errorf("sender_chat = %+v", m.SenderChat)
 	}
 }
+
+// TestGetChatByUsername (bio-resolve round): resolving a "@handle" must issue
+// a getChat whose form carries the "@handle" string as chat_id (the Bot API
+// accepts usernames there), and the response's bio / description must map into
+// ChatInfo — a user target fills Bio, a channel target fills Description.
+func TestGetChatByUsername(t *testing.T) {
+	var reqBody string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasSuffix(r.URL.Path, "/getChat") {
+			t.Errorf("path = %s", r.URL.Path)
+		}
+		b, _ := io.ReadAll(r.Body)
+		reqBody = string(b)
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"ok":true,"result":{"id":777,"username":"target_user","bio":"目标用户的简介","description":"目标频道描述"}}`))
+	}))
+	defer srv.Close()
+	c, err := NewClientWithOptions("123:TEST", Options{ServerURL: srv.URL, SkipGetMe: true})
+	if err != nil {
+		t.Fatalf("NewClientWithOptions: %v", err)
+	}
+	info, err := c.GetChatByUsername(context.Background(), "@target_user")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(reqBody, "@target_user") {
+		t.Fatalf("getChat chat_id must carry the @username:\n%s", reqBody)
+	}
+	if info.Username != "target_user" || info.Bio != "目标用户的简介" || info.Description != "目标频道描述" {
+		t.Errorf("ChatInfo = %+v", info)
+	}
+
+	// A bare username (no @) resolves the same target; "@user" form is sent.
+	info2, err := c.GetChatByUsername(context.Background(), " target_user ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info2.Username != "target_user" {
+		t.Errorf("bare-username resolution = %+v", info2)
+	}
+
+	// Empty username → 400 APIError, no HTTP call needed.
+	if _, err := c.GetChatByUsername(context.Background(), "  @  "); err == nil {
+		t.Error("empty username must fail")
+	}
+}

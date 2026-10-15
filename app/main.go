@@ -157,6 +157,10 @@ func main() {
 	}
 
 	b := bot.New(st, tg, chain, verify, cfg, log.WithComponent("bot"))
+	// bio-resolve round: the @-resolution seam. The real client implements
+	// GetChatByUsername (getChat with "@username"); BOT_BIO_RESOLVE=false or
+	// a nil seam turns the enrichment off and bios are judged as-is.
+	b.BioTarget = tg
 
 	// Async judgement pool (amend6 A): update handlers return in milliseconds;
 	// AI chains run on pool chain runners (same-uid serial, cross-uid

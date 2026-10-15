@@ -161,6 +161,23 @@ type Config struct {
 	// cap; in-memory only — restart loses it, same semantics as join-verify
 	// pending). Default 5000.
 	CommentBioFlashMax int // BOT_COMMENT_BIO_FLASH_MAX
+
+	// Bio @ resolution (bio-resolve round) -------------------------------------
+	// BioResolve arms the bio @-resolution: before a bio is sent to the AI,
+	// every @handle in it is fetched via getChat (the t.me target of the
+	// mention) and the target's own bio/description is appended to the judged
+	// text as a 【相关简介】 block — "更稳一点" per the user's exact wording.
+	// Handles inside emails/links are excluded; non-@ links are untouched.
+	// false = judge the bio as-is (zero extra getChat calls).
+	BioResolve bool // BOT_BIO_RESOLVE
+	// BioResolveMax caps the @handles resolved per bio (the rest are skipped
+	// and logged; a link-farm bio cannot fan out into unbounded lookups).
+	// Default 3; clamped ≥1.
+	BioResolveMax int // BOT_BIO_RESOLVE_MAX
+	// BioResolveTimeout bounds the whole resolution fan (all lookups) per bio.
+	// 0 = no dedicated bound (each getChat still rides the caller's ctx).
+	// Default 10s.
+	BioResolveTimeout time.Duration // BOT_BIO_RESOLVE_TIMEOUT
 }
 
 // Load reads the environment into a Config with defaults applied. It is pure
@@ -275,6 +292,12 @@ func Load() Config {
 		CommentBioScreen:   boolEnv("BOT_COMMENT_BIO_SCREEN", true),
 		CommentBioFlashTTL: clampDurationOptionalZero(durationEnv("BOT_COMMENT_BIO_FLASH_TTL", 30*time.Minute), 24*time.Hour),
 		CommentBioFlashMax: intEnv("BOT_COMMENT_BIO_FLASH_MAX", 5000),
+
+		// bio-resolve: default ON (the user asked for the resolution, not an
+		// option), max 3 handles per bio, 10s whole-fan bound.
+		BioResolve:        boolEnv("BOT_BIO_RESOLVE", true),
+		BioResolveMax:     intEnv("BOT_BIO_RESOLVE_MAX", 3),
+		BioResolveTimeout: durationEnv("BOT_BIO_RESOLVE_TIMEOUT", 10*time.Second),
 	}
 	c.Token = os.Getenv("BOT_TOKEN")
 	c.ChatsSet = os.Getenv("BOT_CHATS") != ""
@@ -317,6 +340,11 @@ func Load() Config {
 	// every condemned-bio entry, i.e. disable 防刷 entirely).
 	if c.CommentBioFlashMax < 1 {
 		c.CommentBioFlashMax = 5000
+	}
+	// bio-resolve: the handle cap must stay ≥1 (0 would resolve nothing — a
+	// silent disable, not a legitimate setting); timeout may be 0 (no bound).
+	if c.BioResolveMax < 1 {
+		c.BioResolveMax = 3
 	}
 	// amend13: a NEGATIVE disposal floor is a typo, never a "disable" request
 	// — restore the default 85 (an explicit 0 = floor off is legal and kept).
@@ -422,6 +450,10 @@ func (c Config) Redacted() map[string]string {
 		"BOT_COMMENT_BIO_SCREEN":    strconv.FormatBool(c.CommentBioScreen),
 		"BOT_COMMENT_BIO_FLASH_TTL": c.CommentBioFlashTTL.String(),
 		"BOT_COMMENT_BIO_FLASH_MAX": strconv.Itoa(c.CommentBioFlashMax),
+		// bio-resolve contract
+		"BOT_BIO_RESOLVE":           strconv.FormatBool(c.BioResolve),
+		"BOT_BIO_RESOLVE_MAX":       strconv.Itoa(c.BioResolveMax),
+		"BOT_BIO_RESOLVE_TIMEOUT":   c.BioResolveTimeout.String(),
 		"BOT_MSG_TTL":               c.MsgTTL.String(),
 		"BOT_STORE":                 c.Store,
 		"BOT_REDIS_URL":             redactURL(c.RedisURL),
@@ -569,6 +601,9 @@ func UnrecognizedBotVars() []string {
 		// amend12 (channel-post comment bio screen)
 		"BOT_COMMENT_BIO_SCREEN": true, "BOT_COMMENT_BIO_FLASH_TTL": true,
 		"BOT_COMMENT_BIO_FLASH_MAX": true,
+		// bio-resolve (bio @ resolution)
+		"BOT_BIO_RESOLVE": true, "BOT_BIO_RESOLVE_MAX": true,
+		"BOT_BIO_RESOLVE_TIMEOUT": true,
 	}
 	var out []string
 	for _, kv := range os.Environ() {

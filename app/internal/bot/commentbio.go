@@ -349,7 +349,11 @@ func (b *Bot) screenChannelPostComment(ctx context.Context, m telegram.Message) 
 
 	// Fresh condemned-bio candidate → the AI bio review (mode="bio", same
 	// prompt channel as the join path; prompts/ untouched). Async: per-uid
-	// serial via the judge pool ("连续消息进队列一个个处理").
+	// serial via the judge pool ("连续消息进队列一个个处理"). bio-resolve
+	// (用户原话"简介有@的…提取对应简介喂给bot") enriches the judged text with
+	// the @ targets' own bios as 【相关简介】 blocks; the flash-cache key and
+	// signature text stay the ORIGINAL bio (sigText) — the 防刷 "重复" match
+	// must never depend on a third party's channel bio.
 	b.submitJudge(ctx, judgmentInput{
 		key:        commentKey(uid, m.MessageID),
 		kind:       "comment",
@@ -358,7 +362,8 @@ func (b *Bot) screenChannelPostComment(ctx context.Context, m telegram.Message) 
 		uid:        uid,
 		username:   m.From.Username,
 		firstName:  m.From.FirstName,
-		text:       bio,
+		text:       b.resolveBioText(ctx, bio),
+		sigText:    bio,
 		mode:       "bio",
 		punish:     true,
 		writeBio:   true,

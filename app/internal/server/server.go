@@ -52,6 +52,9 @@ type Inspector interface {
 	// Amend13: disposal-floor gauges (ai_min_punish_score /
 	// ai_below_score_releases_total).
 	Amend13View() Amend13View
+	// BioResolveView: the bio-resolve config view
+	// (bio_resolve_enabled / bio_resolve_max / bio_resolve_timeout).
+	BioResolveView() BioResolveView
 }
 
 // MsgTTLView is the amend8 chat-message-TTL gauges the server renders (plain
@@ -99,6 +102,15 @@ type CommentBioView struct {
 type Amend13View struct {
 	MinPunishScore          int
 	BelowScoreReleasesTotal int64
+}
+
+// BioResolveView is the bio-resolve config the server renders (plain data so
+// server does not import bot): BOT_BIO_RESOLVE plus its knobs.
+type BioResolveView struct {
+	Enabled  bool
+	Max      int
+	Timeout  string
+	SeamLive bool // the resolver seam is wired (lookups can actually happen)
 }
 
 // AnnounceView is the amend7 announcement counters the server renders (plain
@@ -360,6 +372,13 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	a13 := s.Bot.Amend13View()
 	body["ai_min_punish_score"] = a13.MinPunishScore
 	body["ai_below_score_releases_total"] = a13.BelowScoreReleasesTotal
+
+	// bio-resolve: the @-resolution config (seam wired = lookups will happen;
+	// the per-handle lookups themselves are logged, not counted).
+	br := s.Bot.BioResolveView()
+	body["bio_resolve_enabled"] = br.Enabled && br.SeamLive
+	body["bio_resolve_max"] = br.Max
+	body["bio_resolve_timeout"] = br.Timeout
 	// The sweeper block only appears when the janitor has run at least once.
 	if s.Sweeper != nil {
 		at, next, droppedSus, droppedSigs, remaining, ran := s.Sweeper.SweepSnapshot()
