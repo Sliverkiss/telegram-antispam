@@ -28,7 +28,7 @@
                                      ▼
                       ┌──────────────────────────────┐
                       │        bot（决策逻辑）          │
-                      │  命令 / 入群 / 成员变更 / 发言    │
+                      │  /start / 入群 / 成员变更 / 发言  │
                       │  白名单门 → 签名库 → AI → 投票    │
                       │     → 重试队列 → 本地规则兜底     │
                       └──────┬──────────────┬────────┘
@@ -95,11 +95,8 @@
 | 命令 | 可用范围 | 说明 |
 |---|---|---|
 | `/start` | 任何聊天 | 中文状态卡：`🟢 在线` + 版本 + 运行时长 + 存储后端 + 该聊天是否在保护范围 |
-| `/help` | 任何聊天 | 命令与行为说明 |
-| `/status` | 仅管理员 | 模型链与逐模型成功/总数、回退、复核（含改判）、删除（含失败）、本地兜底、SimHash 命中、待决队列、观察名单 / 签名库 / 处置 / 轮询 / 存储与 TTL / 提示词版本 |
-| `/check <文本>` | 仅管理员 | 文本直送 AI 并回显 JSON（`is_ad/category/confidence/reason`）+ 耗时，**不触发处置** |
 
-「仅管理员」= `BOT_ADMIN_USERS` 白名单用户或群主/管理员。私聊（DM）命令始终可用。
+其余命令（`/help` `/status` `/check`，及更早的 `/report` `/ban` `/unban`）均已移除；发送未注册命令只在 debug 日志留痕，不回复。
 
 ## AI 判定链路（amend2/amend3）
 
@@ -126,7 +123,7 @@
 
 - 提示词是独立文件 `app/internal/ai/prompts/judge_v3.txt`（+ `judge_v1_bio.txt` 简介
   追加段），go:embed 编译进二进制；`BOT_AI_PROMPT_FILE` 可用磁盘文件覆盖（调优不发版）。
-- 版本号 `PromptVersion=judge_v3` 打进**每次判定日志**与 `/status`、`/statusz`。
+- 版本号 `PromptVersion=judge_v3` 打进**每次判定日志**与 `/statusz`。
 - v3 判据（bio-resolve 轮重写）：**唯一定罪标准是品类命中**——不定义"什么是正常"去
   放行，而是锁定"不放过"的清单（色情/儿童/擦边、赌博、诈骗黑产话术含接单收钱跑分、
   违禁品、办证、招人收钱话术、暗语变形、**群发商业广告**：拉群/卖货/二手撮合）。
@@ -168,7 +165,7 @@ go run . -prompteval -prompteval.models=mimo-v2.6-pro
 | | `BOT_CHATS` | 空 | 授权群白名单（逗号分隔）；空 = 不授权任何群，所有群被退出 |
 | | `BOT_LEAVE_OTHER_CHATS` | `true` | 被拉进非白名单群立即 `leaveChat` |
 | | `BOT_LEAVE_NOTICE` | `true` | 退出前先发一句说明 |
-| | `BOT_ADMIN_USERS` | 空 | 管理员 uid；消息永不判定，可用 `/status`、`/check` |
+| | `BOT_ADMIN_USERS` | 空 | 管理员 uid；这些用户的消息永不判定、跳过入群验证清理 |
 | | `BOT_DRY_RUN` | `false` | `true` 只判定+打日志，不处置 |
 | 行为 | `BOT_ACTION` | `kick` | `kick` 封后即解 / `ban` 永久 |
 | | `BOT_IGNORE_ADMINS` | `true` | 跳过群主/管理员 |
@@ -273,7 +270,7 @@ belmo 用 **Nixpacks** 构建，且部署引擎固定扫描仓库的 **`app/` �
 | `BOT_CHATS` | ✅ | 授权群 id（`-100` 开头），多个逗号分隔；留空等于不保护任何群 |
 | `BOT_AI_BASE_URL` | ✅ | 你的 OpenAI 兼容网关地址，形如 `https://your-gateway.example.com/v1` |
 | `BOT_AI_API_KEY` | ✅ | 上面网关的 key |
-| `BOT_ADMIN_USERS` | 建议 | 你的 Telegram user id，可用 `/status`、`/check` |
+| `BOT_ADMIN_USERS` | 建议 | 你的 Telegram user id（消息永不判定）|
 | `BOT_LOG_CHAT` | 可选 | 处置/报错通知的频道 id，`0` = 关闭；启动时会自检可达性与发帖权限 |
 | `BOT_DRY_RUN` | 建议 | 首次部署填 `true`（只判定不处置），观察日志确认无误后改 `false` |
 | `BOT_ACTION` | 可选 | `kick`（默认，封后即解=踢出）/ `ban`（永久） |
@@ -283,7 +280,7 @@ belmo 用 **Nixpacks** 构建，且部署引擎固定扫描仓库的 **`app/` �
 **部署后自检：**
 
 - `GET /statusz` → 看 `store_backend`、`prompt_version`、`ai_models`、`notify.target_ok`、`dry_run`
-- 群里发一句广告文本（或用管理员的 `/check <文本>`）验证 AI 链路
+- 群里发一句广告文本验证 AI 链路
 - `BOT_DRY_RUN=false` 后，处置会推到 `BOT_LOG_CHAT`（⏱️/💬/👤/✅ 四行模板）
 
 **注意：`BOT_STORE` 保持默认 `memory`** —— belmo 容器文件系统只读、平台 Redis 外网不通，
@@ -372,13 +369,13 @@ cd app && go build ./... && go vet ./... && go test ./... -race -count=1
     ├── testdata/           # prompt_eval.jsonl（29 条标注样本）
     └── internal/
         ├── ai/             # go-openai 判定：回退链/投票/多模态/prompts(judge_v2)
-        ├── bot/            # 决策核心：命令/入群/发言/AI/签名命中/处置/白名单
+        ├── bot/            # 决策核心：/start/入群/发言/AI/签名命中/处置/白名单
         ├── config/         # 环境变量加载、脱敏、未识别变量告警
         ├── logx/           # 结构化日志（text/json）
         ├── localrules/    # 本地规则兜底引擎（AI 不可达时的终局决策）
         ├── normalize/      # 归一化 + sha1 签名 + SimHash
         ├── retryq/         # 10s×5 固定重试队列 + 后台 worker
-        ├── server/         # HTTP :3000（health/ready/status/admin）
+        ├── server/         # HTTP :3000（health/ready/statusz/admin）
         ├── store/          # Store 接口 + Memory/Redis + SimHash 索引 + Sweeper
         └── telegram/       # go-telegram/bot 薄封装（领域类型 + 错误映射）
 ```

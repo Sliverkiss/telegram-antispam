@@ -3,7 +3,7 @@
 // direct hits (sha1 exact + simhash near-duplicate), AI chain classification
 // with confidence-triggered concurrent vote verification, the fixed-interval
 // background retry queue, the local rule engine terminal fallback, group
-// whitelisting + auto-leave, the slash commands, and the shared punishment
+// whitelisting + auto-leave, the /start command, and the shared punishment
 // flow (delete only the triggering message → ban/kick → record → notify).
 //
 // Hardening contract (amend3 B): every update is dispatched under a recover
@@ -127,6 +127,11 @@ type Bot struct {
 	// exist for /statusz.
 	commentFlash *commentBioFlash
 
+	// joinGate collapses the twin join updates (new_chat_members service
+	// message + chat_member left→member) into ONE screening per physical
+	// join — the root fix for the "一次清理推送两条频道通知" incident.
+	joinGate *joinScreenGate
+
 	// BioTarget (bio-resolve round) resolves a @handle from someone's bio to
 	// the target's own bio/description (getChat by username). It is the
 	// injectable seam: the real telegram client in production (wired in main
@@ -187,6 +192,8 @@ func New(st store.Store, tg TelegramClient, classify AIClassifier, verify Verifi
 	// amend12: the 防刷 cache of AI-condemned comment bios (always built so
 	// the /statusz counters exist; the screen itself checks the switch).
 	b.commentFlash = newCommentBioFlash(cfg.CommentBioFlashTTL, cfg.CommentBioFlashMax)
+	// Join-episode gate: one physical join (twin updates) → one screening.
+	b.joinGate = newJoinScreenGate()
 	return b
 }
 
@@ -342,7 +349,7 @@ func (b *Bot) CommentBioFlashConfig() time.Duration {
 	return b.commentFlash.ttl
 }
 
-// Amend13Stats returns the disposal-floor gauges for /statusz and /status:
+// Amend13Stats returns the disposal-floor gauges for /statusz:
 // (BOT_AI_MIN_PUNISH_SCORE, ai_below_score_releases_total). Releases count
 // every AI-lane ad verdict let go below the floor (dry-run included: the
 // decision, not the write, is what the counter observes).
@@ -446,12 +453,23 @@ func (b *Bot) handleChatMember(ctx context.Context, cm *telegram.ChatMemberUpdat
 	// bot) is cleared with zero disposal: pending removed, welcome deleted,
 	// the 300s deadline can no longer reach them. Idempotent.
 	if newStatus == "left" || newStatus == "kicked" || newStatus == "restricted" {
+		b.joinGate.noteLeft(cm.Chat.ID, cm.NewChatMember.User.ID)
 		if !b.Cfg.IsAdminUser(cm.NewChatMember.User.ID) {
 			b.joinVerify.clearOnLeft(cm.NewChatMember.User.ID)
 		}
 	}
+	// The join side of chat_member is DELIBERATELY not screened: Telegram
+	// delivers one physical join as the new_chat_members service message AND
+	// this left→member transition — screening both ran the whole disposal
+	// chain twice (two channel pushes, two announcements, the second usually
+	// re-hitting the signature the first chain had just written). The
+	// service message is the screening source of truth; this transition only
+	// feeds the join gate (noteLeft above re-arms a genuine re-join).
 	if (oldStatus == "left" || oldStatus == "") && newStatus == "member" {
-		b.HandleNewMembers(ctx, cm.Chat.ID, []telegram.User{cm.NewChatMember.User}, 0)
+		b.Log.Debug("chat_member_join_not_screened",
+			"chat", cm.Chat.ID,
+			"uid", cm.NewChatMember.User.ID,
+			"summary", "入群筛查以服务消息为准：chat_member 孪生事件不再触发筛查")
 	}
 }
 
@@ -512,6 +530,21 @@ func (b *Bot) HandleNewMembers(ctx context.Context, chatID int64, members []tele
 }
 
 func (b *Bot) screenNewMember(ctx context.Context, chatID int64, u telegram.User, joinMsgID int64) {
+	// Join-episode gate: one physical join arrives as BOTH the
+	// new_chat_members service message and a chat_member left→member
+	// transition (and replays of either). The first twin to arrive screens;
+	// the second is the same join and must not re-run the chain (it used to:
+	// two disposals, two channel pushes, the second re-hitting the signature
+	// the first chain had just written). A genuine re-join re-screens — the
+	// chat_member left/kicked/restricted transition re-armed the gate, and
+	// TTL is the backstop when that update is lost.
+	if !b.joinGate.admit(chatID, u.ID) {
+		b.Log.Debug("join_screen_dedup",
+			"chat", chatID,
+			"uid", u.ID,
+			"summary", "同一入群事件（孪生/重放更新）只筛查一次")
+		return
+	}
 	// Bio comes from getChat (Bot API only exposes bio there). Empty/err is
 	// non-fatal — we keep the watchlist record and move on.
 	bio := ""
@@ -925,8 +958,6 @@ func joinKey(uid int64) string {
 // submitJudge is the ONLY judgment entry point from update handlers (amend6
 // A.3): async (enqueue, milliseconds) when the pool is on, inline legacy
 // otherwise (escape hatch / tests that never started the pool).
-// EXCEPTION: the /check admin command stays fully synchronous by design — a
-// human asked for a verdict and is waiting for the reply (cmdCheck).
 func (b *Bot) submitJudge(ctx context.Context, in judgmentInput) bool {
 	if b.judgePool == nil {
 		b.judge(ctx, in) // unwired (tests): legacy inline behavior
@@ -1386,31 +1417,15 @@ func parseCommand(text string) (cmd string, args string, ok bool) {
 	return head, args, true
 }
 
-// HandleCommand routes a slash command.
+// HandleCommand routes a slash command. /start is the only command; anything
+// else is logged at debug and ignored (still exempt from ad screening — the
+// dispatch in handleUpdate already diverted it).
 func (b *Bot) HandleCommand(ctx context.Context, m telegram.Message, cmd, args string) {
-	uid := m.From.ID
-	// /start and /help are available to everyone, in any chat.
-	switch cmd {
-	case "/start":
-		b.cmdStart(ctx, m)
-		return
-	case "/help":
-		b.cmdHelp(ctx, m)
-		return
-	}
-	// /status and /check are admin-only (BOT_ADMIN_USERS or a group owner/admin).
-	if !b.Cfg.IsAdminUser(uid) && !b.isAdmin(ctx, m.Chat.ID, uid) {
-		b.replyHelpful(ctx, m, "此命令仅管理员可用")
-		return
-	}
-	switch cmd {
-	case "/status":
-		b.cmdStatus(ctx, m)
-	case "/check":
-		b.cmdCheck(ctx, m, args)
-	default:
+	if cmd != "/start" {
 		b.Log.Debug("unknown_command", "chat", m.Chat.ID, "cmd", cmd)
+		return
 	}
+	b.cmdStart(ctx, m)
 }
 
 func (b *Bot) cmdStart(ctx context.Context, m telegram.Message) {
@@ -1431,101 +1446,6 @@ func (b *Bot) cmdStart(ctx context.Context, m telegram.Message) {
 	b.reply(ctx, m, text)
 }
 
-func (b *Bot) cmdHelp(ctx context.Context, m telegram.Message) {
-	text := "/start 查看状态 · /help 帮助 · /status 管理状态 · /check <文本> AI 判定测试\n" +
-		"本机器人只服务白名单群，检测广告号（简介/发言/图片）并删除触发消息、封禁/踢出。"
-	b.reply(ctx, m, text)
-}
-
-func (b *Bot) cmdStatus(ctx context.Context, m telegram.Message) {
-	ctxb := context.Background()
-	suspects, _ := b.Store.SuspectCount(ctxb)
-	bioSigs, _ := b.Store.BioSigCount(ctxb)
-	msgSigs, _ := b.Store.MsgSigCount(ctxb)
-	punished, _ := b.Store.Punished(ctxb)
-	poll, _, aiCalls, aiFails := b.Stats()
-	deleted, deleteFails := b.DeleteStats()
-	localFB, simHits := b.ExtraStats()
-	sn := b.AIStats.Snapshot()
-	pending := b.PendingQueueLen()
-	amend13Floor, amend13Releases := b.Amend13Stats()
-
-	var modelLines []string
-	for _, model := range sn.SortedModels() {
-		modelLines = append(modelLines, fmt.Sprintf("%s %d/%d", model, sn.ModelOKs[model], sn.ModelCalls[model]))
-	}
-	text := fmt.Sprintf("📊 状态\n版本 %s · 运行 %s · 提示词 %s\n后端 %s · TTL %s（滑窗 %v）\n"+
-		"模型链 %s\n模型调用 %s（成功/总）· 回退 %d\n"+
-		"复核 %d 次（改判 %d）· 删除 %d（失败 %d）· 处置 %d\n"+
-		"AI 调用 %d / 失败 %d · 兜底 %d · SimHash 命中 %d · 待决队列 %d\n"+
-		"观察名单 %d · 签名库 bio %d / msg %d · 轮询 %d\n"+
-		"评论简介 触发 %d · 防刷命中 %d · 防刷窗口 %s\n"+
-		"门限 %d分以上处置 · 低于门限放过 %d\n模式 %s",
-		b.Cfg.Version, b.Uptime().Round(time.Second).String(), ai.PromptVersion,
-		b.Cfg.Store, b.Cfg.Retention.String(), b.Cfg.RetentionSliding,
-		strings.Join(b.Cfg.AIEffectiveModels(), "→"),
-		strings.Join(modelLines, " · "), sn.Fallbacks,
-		sn.VerifyRounds, sn.VerifyFlipped, deleted, deleteFails, punished,
-		aiCalls, aiFails, localFB, simHits, pending,
-		suspects, bioSigs, msgSigs, poll,
-		b.commentTriggered.Load(), b.commentFlashHits.Load(), b.Cfg.CommentBioFlashTTL.String(),
-		amend13Floor, amend13Releases,
-		map[bool]string{true: "干跑", false: "正常"}[b.Cfg.DryRun])
-	b.reply(ctx, m, text)
-}
-
-func (b *Bot) cmdCheck(ctx context.Context, m telegram.Message, args string) {
-	if strings.TrimSpace(args) == "" {
-		b.replyHelpful(ctx, m, "用法：/check <文本>")
-		return
-	}
-	b.aiCalls.Add(1)
-	start := time.Now()
-	res, ok := b.AI.Classify(ctx, ai.Content{Text: args}, "message")
-	elapsed := time.Since(start)
-	if !ok {
-		b.aiFails.Add(1)
-		b.replyHelpful(ctx, m, "AI 判定失败（整条模型链不可达或输出违反契约），未触发任何处置")
-		return
-	}
-	var voteNote string
-	v := res.Verdict
-	finalVerdict := v
-	if v.IsAd && v.Confidence < b.Cfg.MinConfidence && b.Verify != nil {
-		b.aiCalls.Add(1)
-		vres := b.Verify(ctx, ai.Content{Text: args})
-		b.AIStats.NoteVerify(false)
-		voteNote = "\n复核：" + vres.Format()
-		switch vres.Final {
-		case "ad":
-			finalVerdict = v
-		case "not_ad":
-			finalVerdict = ai.Verdict{IsAd: false, Category: "无", Confidence: 0, Reason: "复核否决"}
-		}
-	}
-	out, _ := json.Marshal(map[string]any{
-		"is_ad":          finalVerdict.IsAd,
-		"category":       finalVerdict.ControlledCategory(),
-		"confidence":     finalVerdict.Confidence,
-		"reason":         finalVerdict.Reason,
-		"model":          res.Model,
-		"fallback":       res.Fallback,
-		"attempts":       fmt.Sprintf("%s", formatChain(res)),
-		"elapsed_ms":     elapsed.Milliseconds(),
-		"prompt_version": ai.PromptVersion,
-	})
-	b.reply(ctx, m, string(out)+voteNote)
-}
-
-func formatChain(res ai.ClassifyResult) string {
-	var parts []string
-	for _, a := range res.Attempts {
-		parts = append(parts, fmt.Sprintf("%s/%s", a.Model, a.Status))
-	}
-	return strings.Join(parts, ",")
-}
-
-// reply sends a command reply through the unified TTL sender (amend8): the
 // message is auto-deleted after BOT_MSG_TTL (0 = kept forever). Scheduling is
 // off the reply path — a slow TTL never delays the command handling.
 func (b *Bot) reply(ctx context.Context, m telegram.Message, text string) {
@@ -1562,10 +1482,6 @@ func (b *Bot) verifyTimeout() time.Duration {
 		return DefaultJoinVerifyTimeout
 	}
 	return b.Cfg.JoinVerifyTimeout
-}
-
-func (b *Bot) replyHelpful(ctx context.Context, m telegram.Message, text string) {
-	b.reply(ctx, m, text)
 }
 
 // ---------------------------------------------------------------------------
@@ -1606,8 +1522,8 @@ func (b *Bot) endJudge(start time.Time) time.Duration {
 // messages no longer hit the AI (the signature library still screens
 // everyone). Join-bio (amend5 D.2) and comment-bio (amend12, same D.2
 // semantics: bio is an independent screen) judgments never consume the slot.
-// It is a no-op when the user is not on the watchlist (e.g. the /check
-// command or a second message after removal).
+// It is a no-op when the user is not on the watchlist (e.g. a second
+// message after removal).
 func (b *Bot) consumeWatchlist(ctx context.Context, in judgmentInput) {
 	if in.kind != "message" {
 		return

@@ -3,7 +3,7 @@ package bot
 // amend8 bot-chat-message TTL tests: everything offline via fakeTG; the TTL
 // is a tiny duration (80ms) so expiry is observable without a clock stub.
 // The 8 assertions of TASK_antispam_amend8.md §测试:
-//  1. command replies (/start /help /status /check) expire → DeleteMessage
+//  1. command replies (/start) expire → DeleteMessage
 //     with the right chat/message id;
 //  2. BOT_MSG_TTL=0 → zero deletes;
 //  3. notification-channel pushes NEVER trigger a delete (critical: the
@@ -135,12 +135,12 @@ func waitForTTLDeletes(t *testing.T, tg *fakeTTLTG, n int, what string) {
 // --- 1. command replies expire → DeleteMessage with the right ids ------------
 
 func TestMsgTTLCommandRepliesDeleted(t *testing.T) {
-	for _, cmd := range []string{"/start", "/help", "/status", "/check 文本"} {
+	for _, cmd := range []string{"/start"} {
 		t.Run(cmd, func(t *testing.T) {
 			tg := newFakeTTLTG()
 			cfg := defaultCfg()
 			cfg.MsgTTL = 80 * time.Millisecond
-			cfg.AdminUsers = map[int64]bool{42: true} // /status /check admin
+			cfg.AdminUsers = map[int64]bool{42: true} // admin user (BOT_ADMIN_USERS)
 			b := testBot(t, tg, &fakeAI{}, cfg)
 			ctx := context.Background()
 
@@ -275,7 +275,7 @@ func TestMsgTTLDeleteFailureWarnOnly(t *testing.T) {
 	b := ttlBot(t, tg, 60*time.Millisecond)
 	ctx := context.Background()
 	b.HandleUpdate(ctx, cmdUpdate(adMsg(-500, 42, 1, "/start")))
-	b.HandleUpdate(ctx, cmdUpdate(adMsg(-500, 42, 2, "/help")))
+	b.HandleUpdate(ctx, cmdUpdate(adMsg(-500, 42, 2, "/start")))
 
 	// Two replies sent; both TTL deletions failed (WARN only) — no panic,
 	// no retry storm, stats count the errors, sends unaffected.
@@ -285,7 +285,7 @@ func TestMsgTTLDeleteFailureWarnOnly(t *testing.T) {
 		t.Fatalf("exactly one delete attempt per message, got %d", tg.deleteCalls)
 	}
 	// A later message still flows normally.
-	b.HandleUpdate(ctx, cmdUpdate(adMsg(-500, 42, 3, "/status")))
+	b.HandleUpdate(ctx, cmdUpdate(adMsg(-500, 42, 3, "/start")))
 	waitFor(t, func() bool { return len(tg.sends) == 3 }, "third reply unaffected")
 }
 

@@ -118,7 +118,6 @@ func TestSetMyCommands(t *testing.T) {
 	}, true)
 	if err := c.SetMyCommands(context.Background(), []BotCommand{
 		{Command: "start", Description: "开始"},
-		{Command: "help", Description: "帮助"},
 	}); err != nil {
 		t.Fatal(err)
 	}

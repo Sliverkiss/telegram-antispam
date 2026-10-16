@@ -552,6 +552,9 @@ func (v *joinVerifier) handleStickerMessage(m telegram.Message) bool {
 		delete(v.pending, uid)
 		delete(v.expiring, uid)
 		delete(v.woken, uid)
+		// The episode ended in a pass: a later join screening is a fresh
+		// episode (the join gate must not swallow it inside the TTL).
+		v.b.joinGate.clear(m.Chat.ID, uid)
 	}
 	v.mu.Unlock()
 	if !ok {

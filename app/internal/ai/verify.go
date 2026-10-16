@@ -116,7 +116,7 @@ func Verify(ctx context.Context, primary *Client, cfg VerifyConfig, stats *Stats
 	return result
 }
 
-// Format renders a vote round for logs and /check.
+// Format renders a vote round for logs.
 func (r VerifyResult) Format() string {
 	var parts []string
 	for _, lane := range r.Lanes {

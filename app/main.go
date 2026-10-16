@@ -392,15 +392,12 @@ func openStore(cfg config.Config, log *logx.Logger) (store.Store, string, error)
 	}
 }
 
-// registerCommands registers /start /help /status /check with Telegram.
+// registerCommands registers /start with Telegram (the only command).
 func registerCommands(tg *telegram.Client, log *logx.Logger) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	cmds := []telegram.BotCommand{
 		{Command: "start", Description: "查看在线状态与运行信息"},
-		{Command: "help", Description: "命令与行为说明"},
-		{Command: "status", Description: "管理状态（仅管理员）"},
-		{Command: "check", Description: "AI 判定测试（仅管理员）"},
 	}
 	return tg.SetMyCommands(ctx, cmds)
 }

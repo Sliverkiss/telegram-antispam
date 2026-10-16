@@ -113,8 +113,8 @@ type attempt struct {
 	MS     int64
 }
 
-// ClassifyResult carries the verdict plus chain diagnostics for /check, logs,
-// and /status counters.
+// ClassifyResult carries the verdict plus chain diagnostics for logs,
+// and the status counters.
 type ClassifyResult struct {
 	Verdict  Verdict
 	Model    string

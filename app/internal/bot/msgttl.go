@@ -1,8 +1,8 @@
 // The amend8 bot-chat-message TTL subsystem.
 //
-// Every message the bot sends INTO A CHAT (command replies /start /help
-// /status /check incl. replyHelpful, the leave notice for non-whitelisted
-// groups, and the amend7 kick announcement) is auto-deleted BOT_MSG_TTL
+// Every message the bot sends INTO A CHAT (the /start command reply, the
+// leave notice for non-whitelisted groups, and the amend7 kick announcement)
+// is auto-deleted BOT_MSG_TTL
 // (default 60s, 0 = never) after it was sent. It absorbs the amend7
 // BOT_ANNOUNCE_TTL and the legacy BOT_CMD_AUTODELETE_SEC knobs.
 //

@@ -1169,55 +1169,6 @@ func TestStartCommandReplies(t *testing.T) {
 	}
 }
 
-func TestStatusAdminOnly(t *testing.T) {
-	tg := newFakeTG()
-	b := testBot(t, tg, &fakeAI{}, defaultCfg())
-	b.HandleUpdate(context.Background(), cmdUpdate(adMsg(-500, 5, 1, "/status")))
-	if len(tg.sends) != 1 || !strings.Contains(tg.sends[0], "仅管理员") {
-		t.Fatalf("non-admin /status = %v", tg.sends)
-	}
-}
-
-func TestStatusAdminUserAllowedShowsExtendedStats(t *testing.T) {
-	tg := newFakeTG()
-	cfg := defaultCfg()
-	cfg.AdminUsers = map[int64]bool{42: true}
-	b := testBot(t, tg, &fakeAI{}, cfg)
-	b.HandleUpdate(context.Background(), cmdUpdate(adMsg(-500, 42, 1, "/status")))
-	if len(tg.sends) != 1 {
-		t.Fatalf("admin user /status = %v", tg.sends)
-	}
-	// Amend3 /status extensions: prompt version, model chain, queue
-	// (/report and its 举报 counter were removed in the amend5 round).
-	s := tg.sends[0]
-	for _, want := range []string{"提示词", "模型链", "待决队列", ai.PromptVersion} {
-		if !strings.Contains(s, want) {
-			t.Errorf("/status missing %q", want)
-		}
-	}
-}
-
-func TestCheckRunsAIOnlyNoDisposal(t *testing.T) {
-	tg := newFakeTG()
-	cfg := defaultCfg()
-	cfg.AdminUsers = map[int64]bool{42: true}
-	fa := &fakeAI{verdict: fakeVerdict(true, "诈骗", 0.9)}
-	b := testBot(t, tg, fa, cfg)
-	b.HandleUpdate(context.Background(), cmdUpdate(adMsg(-500, 42, 1, "/check 广告")))
-	if len(tg.bans) != 0 {
-		t.Fatalf("/check must not dispose: %v", tg.bans)
-	}
-	if fa.callCount() != 1 {
-		t.Fatalf("/check should run exactly one AI call: %d", fa.callCount())
-	}
-	if len(tg.sends) != 1 || !strings.Contains(tg.sends[0], "is_ad") {
-		t.Fatalf("/check reply = %v", tg.sends)
-	}
-	if !strings.Contains(tg.sends[0], ai.PromptVersion) {
-		t.Errorf("/check must report the prompt version")
-	}
-}
-
 func TestDryRunZeroWrites(t *testing.T) {
 	tg := newFakeTG()
 	cfg := defaultCfg()
